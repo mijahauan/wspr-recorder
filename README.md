@@ -15,7 +15,9 @@ wspr-recorder connects to a [ka9q-radio](https://github.com/ka9q/ka9q-radio) `ra
 - **Automatic cleanup**: Removes WAV files older than configurable age
 - **Resilient**: Auto-reconnects to radiod if connection is lost
 - **Status API**: File-based status reporting for monitoring
+- **IPC interface**: Unix socket API for wsprdaemon integration
 - **Rich metadata**: JSON sidecar with timing, RTP timestamps, and quality metrics
+- **wsprdaemon-compatible**: Band directory names match wsprdaemon conventions
 
 ## Installation
 
@@ -74,7 +76,7 @@ Each WAV has a JSON sidecar with comprehensive metadata:
 {
   "filename": "251210_012100Z_14095600_usb.wav",
   "frequency_hz": 14095600,
-  "band_name": "20m",
+  "band_name": "20",
   "sample_rate": 12000,
   "samples": 720000,
   "sample_format": "float32",
@@ -125,6 +127,55 @@ Quality tiers:
 │  recorder   │                    │ (JT format) │
 │ (UTC(NIST)) │                    └─────────────┘
 └─────────────┘
+```
+
+## IPC Interface
+
+wspr-recorder provides a Unix socket API for wsprdaemon and other tools to query status and control the recorder.
+
+### Configuration
+
+```toml
+[recorder]
+ipc_socket = "/run/wspr-recorder/control.sock"
+```
+
+### Command-line tool
+
+```bash
+wspr-ctl status          # Full status
+wspr-ctl health          # Quick health check (exit 0=healthy, 2=unhealthy)
+wspr-ctl timing          # Timing source information
+wspr-ctl bands           # List all bands with stats
+wspr-ctl band 20         # Status for specific band
+wspr-ctl config          # Configuration summary
+wspr-ctl -c status       # Compact JSON output
+```
+
+### Available IPC Methods
+
+| Method | Parameters | Description |
+|--------|------------|-------------|
+| `ping` | - | Check if recorder is running |
+| `status` | - | Full status (same as status.json) |
+| `health` | - | Quick health check with `healthy` boolean |
+| `timing` | - | Timing source info (chrony/grape/NTP) |
+| `bands` | - | List all configured bands with stats |
+| `band_status` | `{"band": "20"}` | Status for specific band |
+| `config` | - | Configuration summary |
+| `list_methods` | - | List available methods |
+
+### Protocol
+
+JSON-RPC style over Unix socket:
+
+```bash
+# Query from bash
+echo '{"method":"health"}' | nc -U /run/wspr-recorder/control.sock
+
+# From Python
+from wspr_recorder import ipc_query
+status = ipc_query("/run/wspr-recorder/control.sock", "health")
 ```
 
 ## License

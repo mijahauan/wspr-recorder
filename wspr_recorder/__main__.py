@@ -25,6 +25,7 @@ from .rtp_ingest import RTPIngest
 from .band_recorder import BandRecorder, GapEvent
 from .wav_writer import WavWriter
 from .timing_service import TimingService
+from .ipc_server import IPCServer
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ class WsprRecorder:
         self.rtp_ingest: Optional[RTPIngest] = None
         self.wav_writer: Optional[WavWriter] = None
         self.timing_service: Optional[TimingService] = None
+        self.ipc_server: Optional[IPCServer] = None
         self.band_recorders: Dict[int, BandRecorder] = {}  # ssrc -> BandRecorder
         
         # Thread pool for disk I/O
@@ -191,8 +193,8 @@ class WsprRecorder:
             except Exception as e:
                 logger.error(f"Health check error: {e}")
     
-    def _write_status(self, path: Path) -> None:
-        """Write status to JSON file."""
+    def _get_status_dict(self) -> Dict:
+        """Build status dictionary (used by both file and IPC)."""
         status = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "uptime_seconds": time.time() - self._start_time if self._start_time else 0,
@@ -219,11 +221,109 @@ class WsprRecorder:
             for ssrc, recorder in self.band_recorders.items()
         }
         
+        return status
+    
+    def _write_status(self, path: Path) -> None:
+        """Write status to JSON file."""
         try:
             with open(path, 'w') as f:
-                json.dump(status, f, indent=2)
+                json.dump(self._get_status_dict(), f, indent=2)
         except Exception as e:
             logger.error(f"Failed to write status: {e}")
+    
+    # -------------------------------------------------------------------------
+    # IPC Handlers
+    # -------------------------------------------------------------------------
+    
+    def _ipc_status(self, params: Optional[Dict]) -> Dict:
+        """IPC: Get full status."""
+        return self._get_status_dict()
+    
+    def _ipc_timing(self, params: Optional[Dict]) -> Dict:
+        """IPC: Get timing information."""
+        if not self.timing_service:
+            return {"error": "Timing service not initialized"}
+        return self.timing_service.get_status()
+    
+    def _ipc_bands(self, params: Optional[Dict]) -> Dict:
+        """IPC: Get configured bands and their status."""
+        bands = {}
+        for ssrc, recorder in self.band_recorders.items():
+            bands[recorder.band_name] = {
+                "frequency_hz": recorder.frequency_hz,
+                "ssrc": ssrc,
+                "synced": recorder._synced,
+                "buffer_samples": recorder._buffer.sample_count,
+                "packets_received": recorder.stats.packets_received,
+                "files_written": recorder.stats.files_written,
+            }
+        return {"bands": bands, "count": len(bands)}
+    
+    def _ipc_band_status(self, params: Optional[Dict]) -> Dict:
+        """IPC: Get status for a specific band."""
+        if not params or "band" not in params:
+            return {"error": "Missing 'band' parameter"}
+        
+        band_name = params["band"]
+        for ssrc, recorder in self.band_recorders.items():
+            if recorder.band_name == band_name:
+                return recorder.get_stats()
+        
+        return {"error": f"Band not found: {band_name}"}
+    
+    def _ipc_health(self, params: Optional[Dict]) -> Dict:
+        """IPC: Quick health check."""
+        healthy = True
+        issues = []
+        
+        if not self._running:
+            healthy = False
+            issues.append("Not running")
+        
+        if self.receiver_manager and not self.receiver_manager.check_health():
+            healthy = False
+            issues.append("No active channels")
+        
+        active_bands = sum(1 for r in self.band_recorders.values() if r._synced)
+        
+        return {
+            "healthy": healthy,
+            "issues": issues,
+            "active_bands": active_bands,
+            "total_bands": len(self.band_recorders),
+            "uptime_seconds": time.time() - self._start_time if self._start_time else 0,
+        }
+    
+    def _ipc_config(self, params: Optional[Dict]) -> Dict:
+        """IPC: Get configuration summary."""
+        return {
+            "output_dir": self.config.recorder.output_dir,
+            "sample_format": self.config.recorder.sample_format,
+            "sample_rate": self.config.channel_defaults.sample_rate,
+            "radiod_address": self.config.radiod.status_address,
+            "destination": self.config.radiod.destination,
+            "port": self.config.radiod.port,
+            "frequencies": self.config.frequencies,
+            "max_file_age_minutes": self.config.recorder.max_file_age_minutes,
+            "max_files_per_band": self.config.recorder.max_files_per_band,
+        }
+    
+    async def _setup_ipc_server(self) -> None:
+        """Initialize and start IPC server."""
+        self.ipc_server = IPCServer(
+            socket_path=self.config.recorder.ipc_socket,
+        )
+        
+        # Register handlers
+        self.ipc_server.register("status", self._ipc_status)
+        self.ipc_server.register("timing", self._ipc_timing)
+        self.ipc_server.register("bands", self._ipc_bands)
+        self.ipc_server.register("band_status", self._ipc_band_status)
+        self.ipc_server.register("health", self._ipc_health)
+        self.ipc_server.register("config", self._ipc_config)
+        
+        await self.ipc_server.start()
+        logger.info(f"IPC server started: {self.config.recorder.ipc_socket}")
     
     async def run(self) -> None:
         """
@@ -295,6 +395,9 @@ class WsprRecorder:
             logger.info("Starting RTP ingestion...")
             await self.rtp_ingest.start()
             
+            # Start IPC server
+            await self._setup_ipc_server()
+            
             # Start background tasks
             cleanup_task = asyncio.create_task(self._cleanup_loop())
             status_task = asyncio.create_task(self._status_loop())
@@ -329,6 +432,10 @@ class WsprRecorder:
                 recorder.flush()
             except Exception as e:
                 logger.error(f"Error flushing recorder: {e}")
+        
+        # Stop IPC server
+        if self.ipc_server:
+            await self.ipc_server.stop()
         
         # Stop RTP ingestion
         if self.rtp_ingest:

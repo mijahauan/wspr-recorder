@@ -11,6 +11,7 @@ from .config import Config, load_config
 from .receiver_manager import ReceiverManager
 from .band_recorder import BandRecorder
 from .wav_writer import WavWriter
+from .ipc_server import IPCServer, IPCClient, ipc_query
 
 __all__ = [
     "Config",
@@ -18,4 +19,7 @@ __all__ = [
     "ReceiverManager",
     "BandRecorder",
     "WavWriter",
+    "IPCServer",
+    "IPCClient",
+    "ipc_query",
 ]

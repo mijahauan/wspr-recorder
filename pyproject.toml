@@ -39,6 +39,7 @@ dev = [
 
 [project.scripts]
 wspr-recorder = "wspr_recorder.__main__:main"
+wspr-ctl = "wspr_recorder.wspr_ctl:main"
 
 [project.urls]
 Homepage = "https://github.com/mijahauan/wspr-recorder"

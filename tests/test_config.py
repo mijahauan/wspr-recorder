@@ -34,10 +34,14 @@ class TestFreqToBandName:
     """Tests for frequency to band name mapping."""
     
     def test_known_bands(self):
-        assert freq_to_band_name(14095600) == "20m"
-        assert freq_to_band_name(7038600) == "40m"
-        assert freq_to_band_name(3568600) == "80m"
-        assert freq_to_band_name(474200) == "630m"
+        assert freq_to_band_name(14095600) == "20"
+        assert freq_to_band_name(7038600) == "40"
+        assert freq_to_band_name(3568600) == "80"
+        assert freq_to_band_name(474200) == "630"
+    
+    def test_eu_bands(self):
+        assert freq_to_band_name(3592600) == "80eu"
+        assert freq_to_band_name(5364700) == "60eu"
     
     def test_unknown_frequency(self):
         assert freq_to_band_name(12345678) == "12345678Hz"

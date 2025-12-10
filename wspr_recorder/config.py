@@ -19,24 +19,24 @@ else:
 logger = logging.getLogger(__name__)
 
 
-# WSPR frequency bands with standard names
+# WSPR frequency bands with wsprdaemon-compatible directory names
 WSPR_BANDS = {
-    136000: "2200m",
-    474200: "630m",
-    1836600: "160m",
-    3568600: "80m",
-    3592600: "80meu",
-    5287200: "60m",
-    5364700: "60meu",
-    7038600: "40m",
-    10138700: "30m",
-    13553900: "22m",
-    14095600: "20m",
-    18104600: "17m",
-    21094600: "15m",
-    24924600: "12m",
-    28124600: "10m",
-    50293000: "6m",
+    136000: "2200",
+    474200: "630",
+    1836600: "160",
+    3568600: "80",
+    3592600: "80eu",
+    5287200: "60",
+    5364700: "60eu",
+    7038600: "40",
+    10138700: "30",
+    13553900: "22",
+    14095600: "20",
+    18104600: "17",
+    21094600: "15",
+    24924600: "12",
+    28124600: "10",
+    50293000: "6",
 }
 
 
@@ -129,6 +129,7 @@ class RecorderConfig:
     max_file_age_minutes: int = 35
     max_files_per_band: int = 35  # Max WAV files per band directory
     status_file: str = "status.json"
+    ipc_socket: str = "/run/wspr-recorder/control.sock"  # Unix socket for IPC
 
 
 @dataclass
