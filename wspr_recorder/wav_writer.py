@@ -57,12 +57,12 @@ class WavMetadata:
         return result
 
 
-def generate_jt_filename(frequency_hz: int, timestamp: datetime) -> str:
+def generate_wav_filename(frequency_hz: int, timestamp: datetime) -> str:
     """
-    Generate JT-format filename.
+    Generate WAV filename in ISO 8601 format.
     
-    Format: YYMMDD_HHMMZ_freq_usb.wav
-    Example: 241209_1400Z_14095600_usb.wav
+    Format: YYYYMMDDTHHMMSSz_freq_usb.wav
+    Example: 20251210T025000Z_18104600_usb.wav
     
     Args:
         frequency_hz: Frequency in Hz
@@ -71,14 +71,11 @@ def generate_jt_filename(frequency_hz: int, timestamp: datetime) -> str:
     Returns:
         Filename string (without path)
     """
-    # Format: YYMMDD_HHMMZ_freq_usb.wav
-    date_str = timestamp.strftime("%y%m%d")
-    time_str = timestamp.strftime("%H%M")
+    # Format: YYYYMMDDTHHMMSSz_freq_usb.wav
+    # Round seconds to 00 for minute boundary
+    time_str = timestamp.strftime("%Y%m%dT%H%M00Z")
     
-    # Round to nearest minute
-    minute_str = f"{time_str}00Z"
-    
-    return f"{date_str}_{minute_str}_{frequency_hz}_usb.wav"
+    return f"{time_str}_{frequency_hz}_usb.wav"
 
 
 def samples_to_int16(samples: np.ndarray) -> np.ndarray:
@@ -176,7 +173,7 @@ class WavWriter:
             band_name = freq_to_band_name(frequency_hz)
             
             # Generate filename
-            filename = generate_jt_filename(frequency_hz, start_time)
+            filename = generate_wav_filename(frequency_hz, start_time)
             wav_path = band_dir / filename
             tmp_path = band_dir / f".{filename}.tmp"
             json_path = band_dir / f"{filename[:-4]}.json"  # Replace .wav with .json

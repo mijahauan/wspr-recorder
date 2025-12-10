@@ -109,13 +109,13 @@ wspr-recorder -c config.toml -v  # verbose
 
 ## Output
 
-WAV files in JT format: `YYMMDD_HHMMZ_freq_usb.wav`
+WAV files with ISO 8601 timestamps: `YYYYMMDDTHHMMSSz_freq_usb.wav`
 
 Each WAV has a JSON sidecar with comprehensive metadata:
 
 ```json
 {
-  "filename": "251210_012100Z_14095600_usb.wav",
+  "filename": "20251210T012100Z_14095600_usb.wav",
   "frequency_hz": 14095600,
   "band_name": "20",
   "sample_rate": 12000,
