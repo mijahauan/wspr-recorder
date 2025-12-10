@@ -1,0 +1,81 @@
+# wspr-recorder configuration
+# Copy this file to config.toml and edit as needed
+
+[recorder]
+# Output directory for WAV files
+# wsprdaemon can override this to use its own tmp directory
+output_dir = "/tmp/wspr-recorder"
+
+# Sample format: "int16" (default, compatible with wsprd) or "float32"
+sample_format = "int16"
+
+# Maximum age of WAV files in minutes before automatic cleanup
+# wsprdaemon processes files within ~2 minutes, so 35 minutes is safe
+max_file_age_minutes = 35
+
+# Maximum WAV files per band directory
+# If wsprdaemon stops processing, oldest files are deleted to make room
+# This prevents filling up /dev/shm
+max_files_per_band = 35
+
+# Status file name (written to output_dir)
+status_file = "status.json"
+
+[radiod]
+# radiod status/control multicast address (mDNS name like xxx-status.local)
+# Example: bee1-hf-status.local, rx888-status.local
+status_address = "bee1-hf-status.local"
+
+# RTP multicast destination for all channels
+# Must be in 239.x.x.x range (multicast)
+destination = "239.1.2.3"
+
+# RTP port (all channels share this port, demuxed by SSRC)
+port = 5004
+
+[channel_defaults]
+# Sample rate in Hz (12000 is standard for WSPR)
+sample_rate = 12000
+
+# Demodulation mode
+mode = "usb"
+
+# Internal encoding (radiod uses float internally)
+encoding = "float"
+
+# AGC: false for WSPR (we want consistent levels)
+agc = false
+
+# Manual gain in dB (when AGC is off)
+gain = 0.0
+
+# Audio filter edges in Hz
+# WSPR signals are at 1400-1600 Hz in the audio passband
+# 1300-1700 Hz gives some margin
+low = 1300
+high = 1700
+
+[frequencies]
+# WSPR frequencies in Hz
+# Supports formats:
+#   - Plain Hz: "14095600"
+#   - MHz notation: "14m095600"
+#   - kHz notation: "474k200"
+bands = [
+    "136000",      # 2200m
+    "474200",      # 630m
+    "1836600",     # 160m
+    "3568600",     # 80m
+    "3592600",     # 80m EU
+    "5287200",     # 60m
+    "5364700",     # 60m EU
+    "7038600",     # 40m
+    "10138700",    # 30m
+    "13553900",    # 22m
+    "14095600",    # 20m
+    "18104600",    # 17m
+    "21094600",    # 15m
+    "24924600",    # 12m
+    "28124600",    # 10m
+    "50293000",    # 6m
+]

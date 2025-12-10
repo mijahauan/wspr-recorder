@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wspr-recorder"
+version = "0.1.0"
+description = "WSPR audio recorder using ka9q-radio RTP streams"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "MJH", email = "mjh@example.com"}
+]
+keywords = ["wspr", "sdr", "ka9q", "radio", "recording"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Ham Radio",
+]
+
+dependencies = [
+    "ka9q-python>=0.1.0",
+    "numpy>=1.20.0",
+    "tomli>=2.0.0;python_version<'3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.scripts]
+wspr-recorder = "wspr_recorder.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/mijahauan/wspr-recorder"
+Repository = "https://github.com/mijahauan/wspr-recorder"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["wspr_recorder*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
