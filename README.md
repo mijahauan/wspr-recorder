@@ -21,10 +21,51 @@ wspr-recorder connects to a [ka9q-radio](https://github.com/ka9q/ka9q-radio) `ra
 
 ## Installation
 
+### Quick Install (systemd service)
+
 ```bash
-# From source
 git clone https://github.com/mijahauan/wspr-recorder.git
 cd wspr-recorder
+sudo ./install.sh
+```
+
+This installs wspr-recorder as a systemd service with:
+- Application in `/opt/wspr-recorder` (with isolated venv)
+- Configuration in `/etc/wspr-recorder/config.toml`
+- IPC socket at `/run/wspr-recorder/control.sock`
+- WAV output in `/dev/shm/wspr-recorder/<band>/`
+
+After installation:
+```bash
+# Edit configuration (set radiod address, frequencies)
+sudo nano /etc/wspr-recorder/config.toml
+
+# Start the service
+sudo systemctl start wspr-recorder
+
+# Enable on boot
+sudo systemctl enable wspr-recorder
+
+# Check status
+sudo systemctl status wspr-recorder
+wspr-ctl health
+
+# View logs
+journalctl -u wspr-recorder -f
+```
+
+To uninstall:
+```bash
+sudo ./install.sh --uninstall
+```
+
+### Development Install
+
+```bash
+git clone https://github.com/mijahauan/wspr-recorder.git
+cd wspr-recorder
+python3 -m venv venv
+source venv/bin/activate
 pip install -e .
 ```
 

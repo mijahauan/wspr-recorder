@@ -1,10 +1,15 @@
 # wspr-recorder configuration
 # Copy this file to config.toml and edit as needed
+#
+# When installed as a systemd service:
+#   Config:     /etc/wspr-recorder/config.toml
+#   WAV output: /dev/shm/wspr-recorder/<band>/
+#   IPC socket: /run/wspr-recorder/control.sock
 
 [recorder]
 # Output directory for WAV files
-# wsprdaemon can override this to use its own tmp directory
-output_dir = "/tmp/wspr-recorder"
+# Using /dev/shm for in-memory storage (faster, no disk I/O)
+output_dir = "/dev/shm/wspr-recorder"
 
 # Sample format: "int16" (default, compatible with wsprd) or "float32"
 sample_format = "int16"
@@ -20,6 +25,9 @@ max_files_per_band = 35
 
 # Status file name (written to output_dir)
 status_file = "status.json"
+
+# IPC socket for wsprdaemon and other tools to query/control
+ipc_socket = "/run/wspr-recorder/control.sock"
 
 [radiod]
 # radiod status/control multicast address (mDNS name like xxx-status.local)
