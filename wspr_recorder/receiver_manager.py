@@ -47,7 +47,7 @@ class ReceiverManagerState:
     """Overall state of the receiver manager."""
     connected: bool = False
     radiod_address: str = ""
-    destination: str = ""
+    radiod_address: str = ""
     port: int = 5004
     channels: Dict[int, ChannelState] = field(default_factory=dict)  # ssrc -> ChannelState
     freq_to_ssrc: Dict[int, int] = field(default_factory=dict)  # freq_hz -> ssrc
@@ -59,7 +59,6 @@ class ReceiverManagerState:
         return {
             "connected": self.connected,
             "radiod_address": self.radiod_address,
-            "destination": self.destination,
             "port": self.port,
             "channel_count": len(self.channels),
             "active_channels": sum(1 for ch in self.channels.values() if ch.is_active),
@@ -104,7 +103,6 @@ class ReceiverManager:
         
         self.state = ReceiverManagerState(
             radiod_address=config.radiod.status_address,
-            destination=config.radiod.destination,
             port=config.radiod.port,
         )
         
@@ -192,8 +190,8 @@ class ReceiverManager:
                     self._register_channel(freq_hz, ssrc)
                     success_count += 1
             
-            # Store the multicast address for RTP ingest
-            self._multicast_addresses = {(self.config.radiod.destination, self.config.radiod.port)}
+            # Discover channels to get their assigned multicast addresses
+            self._discover_and_register_channels()
             
             logger.info(f"Created {success_count}/{len(self.config.frequencies)} channels")
             
@@ -259,7 +257,7 @@ class ReceiverManager:
                 sample_rate=defaults.sample_rate,
                 agc_enable=1 if defaults.agc else 0,
                 gain=defaults.gain,
-                destination=self.config.radiod.destination,  # Just IP, no port
+                # destination=None,  # Dynamic assignment
                 ssrc=None,  # Let radiod/ka9q-python assign SSRC
             )
             
@@ -438,7 +436,12 @@ class ReceiverManager:
         self.connect()
         return self
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        self.shutdown()
-        return False
+    async def _health_check_loop(self) -> None:
+        """
+        Periodically check health and reconnect if needed.
+        Note: ReceiverManager is synchronous, so we run checks in executor if needed,
+        but re-connection might block the main loop.
+        """
+        # This methodology belongs in WsprRecorder, not here, unless we start a thread.
+        # So I will check __main__.py first.
+        pass

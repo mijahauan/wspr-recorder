@@ -290,18 +290,19 @@ class WavWriter:
         with open(path, 'wb') as f:
             # RIFF header
             f.write(b'RIFF')
-            f.write(struct.pack('<I', 36 + data_size))  # File size - 8
+            f.write(struct.pack('<I', 38 + data_size))  # File size - 8 (Header is now 46 bytes)
             f.write(b'WAVE')
             
             # fmt chunk
             f.write(b'fmt ')
-            f.write(struct.pack('<I', 16))  # Chunk size
+            f.write(struct.pack('<I', 18))  # Chunk size: 18 for float32 (includes cbSize)
             f.write(struct.pack('<H', 3))   # Format: IEEE float
             f.write(struct.pack('<H', 1))   # Channels: mono
             f.write(struct.pack('<I', self.sample_rate))  # Sample rate
             f.write(struct.pack('<I', self.sample_rate * 4))  # Byte rate
             f.write(struct.pack('<H', 4))   # Block align
             f.write(struct.pack('<H', 32))  # Bits per sample
+            f.write(struct.pack('<H', 0))   # cbSize: 0 (no extension data)
             
             # data chunk
             f.write(b'data')

@@ -318,33 +318,39 @@ class RTPIngest:
                 self.stats.packets_received += 1
                 self.stats.bytes_received += len(data)
                 
-                # Parse RTP header
+                # Fast path only for known SSRCs
+                if len(data) >= 12:
+                    # Peek at SSRC (bytes 8-12)
+                    ssrc = struct.unpack('!L', data[8:12])[0]
+                    
+                    if ssrc not in self.ssrc_handlers:
+                         # Unregistered SSRC - skip full parsing
+                        self.stats.packets_unknown_ssrc += 1
+                        self._on_unknown_ssrc(ssrc)
+                        continue
+                
+                # Parse RTP header (now we know we want this packet)
                 header = parse_rtp_header(data)
                 if header is None:
                     self.stats.packets_invalid += 1
                     continue
                 
-                # Log first packet from each SSRC
+                # Log first packet from each SSRC (already filtered for known)
                 if header.ssrc not in ssrc_seen:
                     ssrc_seen.add(header.ssrc)
-                    has_handler = header.ssrc in self.ssrc_handlers
-                    logger.debug(f"First packet from SSRC {header.ssrc}: "
-                                f"handler={'YES' if has_handler else 'NO'}")
+                    # We know it has a handler because we filtered above
+                    logger.debug(f"First packet from SSRC {header.ssrc}: handler=YES")
                 
                 # Extract payload
                 payload = extract_payload(data, header)
                 
-                # Route by SSRC
-                handler = self.ssrc_handlers.get(header.ssrc)
-                if handler is not None:
-                    try:
-                        handler(header.ssrc, header, payload)
-                        self.stats.packets_routed += 1
-                    except Exception as e:
-                        logger.error(f"Error in packet handler for SSRC {header.ssrc}: {e}")
-                else:
-                    self.stats.packets_unknown_ssrc += 1
-                    self._on_unknown_ssrc(header.ssrc)
+                # Route by SSRC (already verified existence)
+                handler = self.ssrc_handlers[header.ssrc]
+                try:
+                    handler(header.ssrc, header, payload)
+                    self.stats.packets_routed += 1
+                except Exception as e:
+                     logger.error(f"Error in packet handler for SSRC {header.ssrc}: {e}")
                 
                 # Log periodic stats
                 packet_count += 1

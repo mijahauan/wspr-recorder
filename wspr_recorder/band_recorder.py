@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 # Constants
-SAMPLES_PER_MINUTE = 720_000  # 12000 Hz * 60 seconds
+# Constants
+# SAMPLES_PER_MINUTE is now calculated per instance: self.sample_rate * 60
 SAMPLES_PER_PACKET = 960 // 4  # 960 bytes / 4 bytes per float32 = 240 samples
 
 
@@ -48,7 +49,7 @@ class MinuteBuffer:
     @property
     def is_complete(self) -> bool:
         """Check if buffer has a full minute of samples."""
-        return self.sample_count >= SAMPLES_PER_MINUTE
+        return self.sample_count >= len(self.samples)
     
     @property
     def completeness_pct(self) -> float:
@@ -100,9 +101,6 @@ class BandRecorder:
     - Trigger callback when minute is complete
     """
     
-    # Maximum gap to fill (1 second at 12kHz)
-    MAX_GAP_SAMPLES = 12_000
-    
     def __init__(
         self,
         ssrc: int,
@@ -138,6 +136,9 @@ class BandRecorder:
         self._initialized = False
         self._synced = False  # True after first minute boundary
         
+        # Max gap to fill (2 seconds)
+        self.max_gap_samples = self.sample_rate * 2
+        
         # Sample buffer
         self._buffer = self._create_buffer()
         
@@ -146,8 +147,9 @@ class BandRecorder:
     
     def _create_buffer(self) -> MinuteBuffer:
         """Create a new minute buffer."""
+        samples_per_minute = self.sample_rate * 60
         return MinuteBuffer(
-            samples=np.zeros(SAMPLES_PER_MINUTE, dtype=np.float32),
+            samples=np.zeros(samples_per_minute, dtype=np.float32),
             sample_count=0,
             gaps=[],
             start_rtp_timestamp=None,
@@ -247,12 +249,12 @@ class BandRecorder:
             gap_samples = seq_gap * self._samples_per_packet
             
             # Cap the gap
-            if gap_samples > self.MAX_GAP_SAMPLES:
+            if gap_samples > self.max_gap_samples:
                 logger.warning(
                     f"{self.band_name}: Large gap {gap_samples} samples, "
-                    f"capping to {self.MAX_GAP_SAMPLES}"
+                    f"capping to {self.max_gap_samples}"
                 )
-                gap_samples = self.MAX_GAP_SAMPLES
+                gap_samples = self.max_gap_samples
             
             if gap_samples > 0 and self._synced:
                 self.stats.gaps_detected += 1
@@ -279,16 +281,29 @@ class BandRecorder:
     def _add_samples(self, samples: np.ndarray, header: RTPHeader) -> None:
         """Add samples to the current buffer."""
         if not self._synced:
-            # Check if we're at a minute boundary
-            # For now, we sync based on sample count reaching a minute
-            # In production, we'd use GPS time from radiod
-            self._synced = True
-            self._buffer.start_rtp_timestamp = header.timestamp
-            self._buffer.start_wallclock = datetime.now(timezone.utc)
-            logger.info(f"{self.band_name}: Synced to minute boundary")
+            # Sync to system clock minute boundary (driven by hf-timestd)
+            now = datetime.now(timezone.utc)
+            
+            # Check if we are at the top of the minute (allow 1s buffer window)
+            # We want to start exactly when the second rolls over to 0
+            if now.second == 0:
+                self._synced = True
+                
+                # Snap to exact minute boundary for metadata
+                self._buffer.start_wallclock = now.replace(microsecond=0)
+                self._buffer.start_rtp_timestamp = header.timestamp
+                
+                logger.info(
+                    f"{self.band_name}: Synced to minute boundary {self._buffer.start_wallclock} "
+                    f"(jitter: {now.microsecond/1000:.1f}ms)"
+                )
+            else:
+                # Not at boundary yet, discard samples
+                return
         
         # Calculate how many samples we can add
-        space_available = SAMPLES_PER_MINUTE - self._buffer.sample_count
+        samples_per_minute = self.sample_rate * 60
+        space_available = samples_per_minute - self._buffer.sample_count
         samples_to_add = min(len(samples), space_available)
         
         if samples_to_add > 0:
@@ -300,12 +315,14 @@ class BandRecorder:
         # If we have leftover samples, they go into the next minute
         if samples_to_add < len(samples):
             # This shouldn't happen often - minute boundary mid-packet
-            leftover = samples[samples_to_add:]
-            logger.debug(f"{self.band_name}: {len(leftover)} samples overflow to next minute")
+            # leftover = samples[samples_to_add:]
+            # logger.debug(f"{self.band_name}: {len(leftover)} samples overflow to next minute")
+            pass
     
     def _add_zeros(self, count: int) -> None:
         """Add zero samples to fill a gap."""
-        space_available = SAMPLES_PER_MINUTE - self._buffer.sample_count
+        samples_per_minute = self.sample_rate * 60
+        space_available = samples_per_minute - self._buffer.sample_count
         zeros_to_add = min(count, space_available)
         
         if zeros_to_add > 0:
@@ -324,7 +341,13 @@ class BandRecorder:
         
         # Create new buffer for next minute
         self._buffer = self._create_buffer()
-        self._buffer.start_wallclock = datetime.now(timezone.utc)
+        
+        # Calculate next start time based on previous to maintain grid
+        if completed_buffer.start_wallclock:
+            from datetime import timedelta
+            self._buffer.start_wallclock = completed_buffer.start_wallclock + timedelta(seconds=60)
+        else:
+            self._buffer.start_wallclock = datetime.now(timezone.utc)
         
         # Trigger callback
         if self.on_minute_complete:

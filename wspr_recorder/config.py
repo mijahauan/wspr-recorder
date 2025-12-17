@@ -103,7 +103,7 @@ def freq_to_band_name(freq_hz: int) -> str:
 
 @dataclass
 class ChannelDefaults:
-    """Default settings for radiod channels."""
+    """Default settings for channels."""
     sample_rate: int = 12000
     mode: str = "usb"
     encoding: str = "float"
@@ -112,24 +112,46 @@ class ChannelDefaults:
     low: int = 1300
     high: int = 1700
 
+    @classmethod
+    def from_dict(cls, data: dict) -> 'ChannelDefaults':
+        return cls(
+            sample_rate=data.get("sample_rate", 12000),
+            mode=data.get("mode", "usb"),
+            encoding=data.get("encoding", "float"),
+            agc=data.get("agc", False),
+            gain=data.get("gain", 0.0),
+            low=data.get("low", 1300),
+            high=data.get("high", 1700),
+        )
+
 
 @dataclass
 class RadiodConfig:
     """Radiod connection settings."""
     status_address: str = "hf.local"
-    destination: str = "239.1.2.3"
     port: int = 5004
 
 
 @dataclass 
 class RecorderConfig:
-    """Recorder output settings."""
+    """General recorder configuration."""
     output_dir: str = "/tmp/wspr-recorder"
-    sample_format: str = "int16"  # "int16" or "float32"
-    max_file_age_minutes: int = 35
-    max_files_per_band: int = 35  # Max WAV files per band directory
+    ipc_socket: str = "/tmp/wspr-recorder/control.sock"
     status_file: str = "status.json"
-    ipc_socket: str = "/run/wspr-recorder/control.sock"  # Unix socket for IPC
+    max_file_age_minutes: int = 60
+    max_files_per_band: int = 35
+    sample_format: str = "int16"  # "int16" or "float32"
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'RecorderConfig':
+        return cls(
+            output_dir=data["output_dir"],
+            ipc_socket=data.get("ipc_socket", "/tmp/wspr-recorder/control.sock"),
+            status_file=data.get("status_file", "status.json"),
+            max_file_age_minutes=data.get("max_file_age_minutes", 60),
+            max_files_per_band=data.get("max_files_per_band", 35),
+            sample_format=data.get("sample_format", "int16"),
+        )
 
 
 @dataclass
@@ -161,17 +183,12 @@ class Config:
             if freq < 100_000 or freq > 100_000_000:
                 errors.append(f"Frequency out of range: {freq} Hz")
         
-        # Validate destination IP
-        dest = self.radiod.destination
-        if not re.match(r'^239\.\d{1,3}\.\d{1,3}\.\d{1,3}$', dest):
-            errors.append(f"Destination must be multicast (239.x.x.x): {dest}")
-        
         # Validate port
         if not (1024 <= self.radiod.port <= 65535):
             errors.append(f"Port out of range: {self.radiod.port}")
         
         # Validate channel defaults
-        if self.channel_defaults.sample_rate not in (8000, 12000, 16000, 24000, 48000):
+        if self.channel_defaults.sample_rate not in (8000, 12000, 16000, 20000, 24000, 48000):
             errors.append(f"Unusual sample rate: {self.channel_defaults.sample_rate}")
         
         if self.channel_defaults.low >= self.channel_defaults.high:
@@ -232,7 +249,6 @@ def load_config(config_path: str) -> Config:
         rad = data["radiod"]
         config.radiod = RadiodConfig(
             status_address=rad.get("status_address", config.radiod.status_address),
-            destination=rad.get("destination", config.radiod.destination),
             port=rad.get("port", config.radiod.port),
         )
     

@@ -67,10 +67,3 @@ class TestConfigValidation:
         config.recorder.sample_format = "invalid"
         errors = config.validate()
         assert any("sample_format" in e for e in errors)
-    
-    def test_invalid_destination(self):
-        config = Config()
-        config.frequencies = [14095600]
-        config.radiod.destination = "192.168.1.1"  # Not multicast
-        errors = config.validate()
-        assert any("multicast" in e.lower() for e in errors)

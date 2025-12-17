@@ -72,9 +72,26 @@ pip install -e .
 ### Dependencies
 
 - Python 3.9+
-- [ka9q-python](https://github.com/mijahauan/ka9q-python) library
-- numpy
-- tomli (Python < 3.11)
+- [ka9q-python](https://github.com/mijahau## Usage
+
+The recommended way to run `wspr-recorder` is using the isolation script, which pins the process to a specific CPU core to ensure stable timing and recording:
+
+```bash
+./run_isolated.sh
+```
+
+Or run manually:
+
+```bash
+python3 -m wspr_recorder -c config.toml
+```
+
+## Features
+
+- **Precise Timing**: Recordings are aligned exactly to the minute boundary (00 seconds), relying on the system clock (disciplined by `hf-timestd`).
+- **Dynamic Connection**: Automatically discovers multicast addresses from `radiod` for requested frequencies.
+- **Robustness**: Handles `radiod` restarts and network interruptions gracefully.
+- **WsprDaemon Compatibility**: Produces 2-minute compatible WAV files (1-minute segments) with JSON metadata sidecars.
 
 ## Configuration
 
@@ -82,8 +99,17 @@ Copy `config.toml.example` to `config.toml` and edit:
 
 ```toml
 [recorder]
-output_dir = "/tmp/wspr-recorder"
-sample_format = "int16"  # or "float32"
+output_dir = "/dev/shm/wspr-recorder"
+sample_format = "int16" # Required for wsprd, use "float32" for research
+ipc_socket = "/tmp/wspr-recorder/control.sock"
+
+[radiod]
+status_address = "hf.local"
+port = 5004
+
+[channel_defaults]
+sample_rate = 12000 # 12000 for standard WSPR
+```# or "float32"
 
 [radiod]
 status_address = "hf.local"

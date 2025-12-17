@@ -201,7 +201,6 @@ class WsprRecorder:
             "running": self._running,
             "config": {
                 "radiod_address": self.config.radiod.status_address,
-                "destination": self.config.radiod.destination,
                 "port": self.config.radiod.port,
                 "frequencies": len(self.config.frequencies),
             },
