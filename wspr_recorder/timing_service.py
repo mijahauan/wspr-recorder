@@ -3,7 +3,7 @@
 Timing Service for wspr-recorder.
 
 Provides hierarchical timing source management:
-1. UTC(NIST) from grape-recorder D_clock (sub-ms accuracy)
+1. UTC from hf-timestd (either RTP/GPS or FUSION)
 2. Local GPS receiver via chrony
 3. NTP pools via chrony
 4. System clock (fallback)
@@ -15,6 +15,8 @@ import csv
 import logging
 import subprocess
 import time
+import urllib.request
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,22 +55,18 @@ class TimingQuality:
 # =============================================================================
 
 @dataclass
-class GrapeClockOffset:
-    """D_clock measurement from grape-recorder."""
-    system_time: float
-    minute_boundary_utc: int
-    clock_offset_ms: float
-    uncertainty_ms: float
-    station: str
-    frequency_mhz: float
-    quality_grade: str
-    confidence: float
-    is_locked: bool = False
-    
+class HFTimeStdStatus:
+    """Status from hf-timestd API or config."""
+    is_active: bool
+    authority: str  # 'rtp' or 'fusion'
+    fusion_d_clock_ms: Optional[float] = None
+    fusion_quality_grade: Optional[str] = None
+    fusion_uncertainty_ms: Optional[float] = None
+    fusion_age_seconds: Optional[float] = None
+
     @property
-    def age_seconds(self) -> float:
-        """Age of this measurement in seconds."""
-        return time.time() - self.system_time
+    def is_locked(self) -> bool:
+        return self.fusion_quality_grade in ('A', 'B') if self.fusion_quality_grade else False
 
 
 @dataclass
@@ -109,7 +107,7 @@ class TimingMetadata:
     """Complete timing metadata for a recording."""
     
     # Primary timing source used
-    timing_source: str  # 'UTC_NIST', 'GPS_LOCAL', 'NTP', 'SYSTEM'
+    timing_source: str  # 'HF_FUSION', 'GPS_LOCAL', 'NTP', 'SYSTEM', 'RTP_AUTHORITY_EXPECTED_GPS'
     
     # Source quality tier
     quality_tier: str  # 'A', 'B', 'C', 'D'
@@ -126,9 +124,9 @@ class TimingMetadata:
     rtp_timestamp_end: Optional[int] = None
     rtp_sample_rate: int = 12000
     
-    # System clock offset (D_clock if known)
+    # System clock offset
     system_clock_offset_ms: Optional[float] = None
-    system_clock_source: Optional[str] = None  # 'grape_wwv_15mhz', 'chrony', etc.
+    system_clock_source: Optional[str] = None  # 'hf-timestd_fusion', 'chrony', etc.
     
     # Chrony status at recording time
     chrony_stratum: Optional[int] = None
@@ -136,18 +134,18 @@ class TimingMetadata:
     chrony_root_delay_ms: Optional[float] = None
     chrony_root_dispersion_ms: Optional[float] = None
     
-    # Grape-recorder D_clock (if available)
-    grape_d_clock_ms: Optional[float] = None
-    grape_uncertainty_ms: Optional[float] = None
-    grape_station: Optional[str] = None
-    grape_frequency_mhz: Optional[float] = None
-    grape_locked: bool = False
+    # hf-timestd status (if available)
+    hf_d_clock_ms: Optional[float] = None
+    hf_uncertainty_ms: Optional[float] = None
+    hf_authority: Optional[str] = None
+    hf_quality_grade: Optional[str] = None
+    hf_locked: bool = False
     
     # Timestamps
     wallclock_start_utc: Optional[datetime] = None
     wallclock_end_utc: Optional[datetime] = None
     
-    # Corrected timestamps (adjusted by D_clock)
+    # Corrected timestamps
     estimated_true_start_utc: Optional[datetime] = None
     estimated_true_end_utc: Optional[datetime] = None
     
@@ -171,11 +169,11 @@ class TimingMetadata:
             'chrony_ref_id': self.chrony_ref_id,
             'chrony_root_delay_ms': self.chrony_root_delay_ms,
             'chrony_root_dispersion_ms': self.chrony_root_dispersion_ms,
-            'grape_d_clock_ms': self.grape_d_clock_ms,
-            'grape_uncertainty_ms': self.grape_uncertainty_ms,
-            'grape_station': self.grape_station,
-            'grape_frequency_mhz': self.grape_frequency_mhz,
-            'grape_locked': self.grape_locked,
+            'hf_d_clock_ms': self.hf_d_clock_ms,
+            'hf_uncertainty_ms': self.hf_uncertainty_ms,
+            'hf_authority': self.hf_authority,
+            'hf_quality_grade': self.hf_quality_grade,
+            'hf_locked': self.hf_locked,
             'wallclock_start_utc': dt_to_iso(self.wallclock_start_utc),
             'wallclock_end_utc': dt_to_iso(self.wallclock_end_utc),
             'estimated_true_start_utc': dt_to_iso(self.estimated_true_start_utc),
@@ -195,45 +193,33 @@ class TimingService:
     timing metadata for recordings.
     """
     
-    # Default paths for grape-recorder D_clock CSV files
-    DEFAULT_GRAPE_PATHS = [
-        Path('/tmp/grape-test/clock_offset/clock_offset_series.csv'),
-        Path('/tmp/grape-test/phase2/WWV_15_MHz/clock_offset/clock_offset_series.csv'),
-        Path('/tmp/grape-test/phase2/WWV_10_MHz/clock_offset/clock_offset_series.csv'),
-        Path('/tmp/grape-test/phase2/WWV_5_MHz/clock_offset/clock_offset_series.csv'),
-        Path('/data/grape/phase2/WWV_15_MHz/clock_offset/clock_offset_series.csv'),
-    ]
-    
-    # Maximum age for grape D_clock measurements (seconds)
-    MAX_GRAPE_AGE = 300  # 5 minutes
-    
     def __init__(
         self,
-        grape_csv_paths: Optional[List[Path]] = None,
         enable_chrony: bool = True,
-        enable_grape: bool = True,
+        enable_hf_timestd: bool = True,
+        authority: str = 'auto',
     ):
         """
         Initialize timing service.
         
         Args:
-            grape_csv_paths: Paths to grape-recorder clock_offset CSV files
             enable_chrony: Whether to query chrony for timing status
-            enable_grape: Whether to read grape-recorder D_clock
+            enable_hf_timestd: Whether to pull timing cues from hf-timestd
+            authority: 'auto' (read from hf-timestd), 'rtp', or 'fusion'
         """
-        self.grape_csv_paths = grape_csv_paths or self.DEFAULT_GRAPE_PATHS
         self.enable_chrony = enable_chrony
-        self.enable_grape = enable_grape
+        self.enable_hf_timestd = enable_hf_timestd
+        self.authority = authority
         
         # Cached values
         self._last_chrony_status: Optional[ChronyStatus] = None
         self._last_chrony_query: float = 0
-        self._last_grape_offset: Optional[GrapeClockOffset] = None
-        self._last_grape_query: float = 0
+        self._last_hf_status: Optional[HFTimeStdStatus] = None
+        self._last_hf_query: float = 0
         
         # Cache TTL
         self._chrony_cache_ttl = 10.0  # seconds
-        self._grape_cache_ttl = 60.0  # seconds
+        self._hf_cache_ttl = 60.0  # seconds
         
         logger.info("Timing service initialized")
     
@@ -267,10 +253,6 @@ class TimingService:
                 return None
             
             # Parse CSV output
-            # Fields: Reference ID (hex), Reference name, Stratum, Ref time, 
-            #         System time offset, Last offset, RMS offset, Frequency, 
-            #         Residual freq, Skew, Root delay, Root dispersion, 
-            #         Update interval, Leap status
             fields = result.stdout.strip().split(',')
             if len(fields) < 14:
                 logger.warning(f"Unexpected chronyc output: {result.stdout}")
@@ -327,126 +309,70 @@ class TimingService:
         except Exception as e:
             logger.warning(f"Error querying chrony: {e}")
             return None
-    
-    def get_grape_offset(self, force_refresh: bool = False) -> Optional[GrapeClockOffset]:
+
+    def get_hf_status(self, force_refresh: bool = False) -> Optional[HFTimeStdStatus]:
         """
-        Read latest D_clock from grape-recorder CSV.
+        Query hf-timestd for current timing cue.
         
         Returns:
-            GrapeClockOffset or None if unavailable/stale
+            HFTimeStdStatus or None if unavailable
         """
-        if not self.enable_grape:
+        if not self.enable_hf_timestd:
             return None
         
         # Check cache
         now = time.time()
-        if not force_refresh and self._last_grape_offset:
-            if now - self._last_grape_query < self._grape_cache_ttl:
-                # Check if cached value is still fresh enough
-                if self._last_grape_offset.age_seconds < self.MAX_GRAPE_AGE:
-                    return self._last_grape_offset
-        
-        # Try each configured path
-        best_offset: Optional[GrapeClockOffset] = None
-        
-        for csv_path in self.grape_csv_paths:
-            if not csv_path.exists():
-                continue
-            
+        if not force_refresh and self._last_hf_status:
+            if now - self._last_hf_query < self._hf_cache_ttl:
+                return self._last_hf_status
+                
+        # Determine authority
+        authority = self.authority
+        if authority == 'auto':
             try:
-                offset = self._read_grape_csv(csv_path)
-                if offset is None:
-                    continue
-                
-                # Check age
-                if offset.age_seconds > self.MAX_GRAPE_AGE:
-                    logger.debug(f"Grape offset from {csv_path} too old: {offset.age_seconds:.0f}s")
-                    continue
-                
-                # Prefer locked measurements, then by uncertainty
-                if best_offset is None:
-                    best_offset = offset
-                elif offset.is_locked and not best_offset.is_locked:
-                    best_offset = offset
-                elif offset.uncertainty_ms < best_offset.uncertainty_ms:
-                    best_offset = offset
-                    
+                with open('/etc/hf-timestd/timestd-config.toml', 'rb') as f:
+                    import sys
+                    if sys.version_info >= (3, 11):
+                        import tomllib
+                    else:
+                        import tomli as tomllib
+                    hf_config = tomllib.load(f)
+                authority = hf_config.get('timing', {}).get('authority', 'rtp')
             except Exception as e:
-                logger.debug(f"Error reading {csv_path}: {e}")
-                continue
+                logger.debug(f"/etc/hf-timestd/timestd-config.toml not read: {e}")
+                authority = 'rtp'
+                
+        status = HFTimeStdStatus(is_active=False, authority=authority)
         
-        if best_offset:
-            self._last_grape_offset = best_offset
-            self._last_grape_query = now
-            
-            logger.debug(
-                f"Grape D_clock: {best_offset.clock_offset_ms:+.3f}ms "
-                f"± {best_offset.uncertainty_ms:.1f}ms "
-                f"from {best_offset.station} {best_offset.frequency_mhz}MHz "
-                f"(age: {best_offset.age_seconds:.0f}s, locked: {best_offset.is_locked})"
-            )
-        
-        return best_offset
-    
-    def _read_grape_csv(self, csv_path: Path) -> Optional[GrapeClockOffset]:
-        """Read the last line of a grape-recorder clock_offset CSV."""
+        # Try fetching from API
         try:
-            # Read last line efficiently
-            with open(csv_path, 'rb') as f:
-                # Seek to end and read backwards to find last line
-                f.seek(0, 2)  # End of file
-                file_size = f.tell()
+            req = urllib.request.Request("http://127.0.0.1:8000/health")
+            with urllib.request.urlopen(req, timeout=1.0) as r:
+                if r.status == 200:
+                    status.is_active = True
+        except Exception:
+            pass
+            
+        if status.is_active and authority == 'fusion':
+            try:
+                req = urllib.request.Request("http://127.0.0.1:8000/api/metrology/fusion/latest")
+                with urllib.request.urlopen(req, timeout=1.0) as r:
+                    res = json.loads(r.read())
+                    status.fusion_d_clock_ms = res.get('d_clock_ms')
+                    status.fusion_quality_grade = res.get('quality_grade')
+                    status.fusion_uncertainty_ms = res.get('uncertainty_ms')
+                    status.fusion_age_seconds = 0
+            except Exception as e:
+                logger.debug(f"Failed to fetch fusion data: {e}")
                 
-                if file_size < 100:
-                    return None
-                
-                # Read last 2KB (should contain last few lines)
-                read_size = min(2048, file_size)
-                f.seek(file_size - read_size)
-                data = f.read().decode('utf-8', errors='ignore')
-            
-            # Get last complete line
-            lines = data.strip().split('\n')
-            if len(lines) < 2:
-                return None
-            
-            last_line = lines[-1]
-            
-            # Parse CSV fields
-            # system_time,utc_time,minute_boundary_utc,clock_offset_ms,station,
-            # frequency_mhz,propagation_delay_ms,propagation_mode,n_hops,confidence,
-            # uncertainty_ms,quality_grade,...
-            fields = last_line.split(',')
-            if len(fields) < 12:
-                return None
-            
-            system_time = float(fields[0])
-            minute_boundary = int(float(fields[2]))
-            clock_offset_ms = float(fields[3])
-            station = fields[4]
-            frequency_mhz = float(fields[5])
-            confidence = float(fields[9])
-            uncertainty_ms = float(fields[10])
-            quality_grade = fields[11]
-            
-            # Check if locked (quality A or B with low uncertainty)
-            is_locked = quality_grade in ('A', 'B') and uncertainty_ms < 3.0
-            
-            return GrapeClockOffset(
-                system_time=system_time,
-                minute_boundary_utc=minute_boundary,
-                clock_offset_ms=clock_offset_ms,
-                uncertainty_ms=uncertainty_ms,
-                station=station,
-                frequency_mhz=frequency_mhz,
-                quality_grade=quality_grade,
-                confidence=confidence,
-                is_locked=is_locked,
-            )
-            
-        except Exception as e:
-            logger.debug(f"Error parsing grape CSV {csv_path}: {e}")
-            return None
+        self._last_hf_status = status
+        self._last_hf_query = now
+        
+        logger.debug(
+            f"hf-timestd: active={status.is_active}, authority={status.authority}, "
+            f"fusion_d_clock={status.fusion_d_clock_ms}ms"
+        )
+        return status
     
     def get_timing_metadata(
         self,
@@ -471,7 +397,7 @@ class TimingService:
         """
         # Query sources
         chrony = self.get_chrony_status()
-        grape = self.get_grape_offset()
+        hf = self.get_hf_status()
         
         # Determine best timing source and offset
         timing_source = 'SYSTEM'
@@ -480,37 +406,40 @@ class TimingService:
         system_clock_offset_ms: Optional[float] = None
         system_clock_source: Optional[str] = None
         
-        # Priority 1: Grape-recorder UTC(NIST) if locked
-        if grape and grape.is_locked:
-            timing_source = 'UTC_NIST'
-            quality_tier = TimingQuality.A
-            uncertainty_ms = grape.uncertainty_ms
-            system_clock_offset_ms = grape.clock_offset_ms
-            system_clock_source = f"grape_{grape.station.lower()}_{grape.frequency_mhz}mhz"
-        
-        # Priority 2: Grape-recorder (not locked but recent)
-        elif grape and grape.age_seconds < 120:
-            timing_source = 'UTC_NIST'
-            quality_tier = TimingQuality.from_uncertainty_ms(grape.uncertainty_ms)
-            uncertainty_ms = grape.uncertainty_ms
-            system_clock_offset_ms = grape.clock_offset_ms
-            system_clock_source = f"grape_{grape.station.lower()}_{grape.frequency_mhz}mhz"
-        
-        # Priority 3: Chrony with GPS/PPS
-        elif chrony and chrony.ref_id in ('GPS', 'PPS', 'NIST'):
-            timing_source = 'GPS_LOCAL'
-            quality_tier = chrony.quality_tier
-            uncertainty_ms = chrony.estimated_uncertainty_ms
-            system_clock_offset_ms = chrony.system_time_offset_ms
-            system_clock_source = f"chrony_{chrony.ref_id.lower()}"
-        
-        # Priority 4: Chrony with NTP
-        elif chrony and chrony.stratum < 16:
-            timing_source = 'NTP'
-            quality_tier = chrony.quality_tier
-            uncertainty_ms = chrony.estimated_uncertainty_ms
-            system_clock_offset_ms = chrony.system_time_offset_ms
-            system_clock_source = f"chrony_stratum{chrony.stratum}"
+        # Check hf-timestd
+        if hf and hf.is_active:
+            if hf.authority == 'fusion' and hf.is_locked:
+                timing_source = 'HF_FUSION'
+                quality_tier = hf.fusion_quality_grade or TimingQuality.B
+                uncertainty_ms = hf.fusion_uncertainty_ms or 5.0
+                system_clock_offset_ms = hf.fusion_d_clock_ms
+                system_clock_source = "hf-timestd_fusion"
+            elif hf.authority == 'rtp':
+                # IF RTP, chrony is locally disciplined by GPS
+                if chrony and chrony.ref_id in ('GPS', 'PPS', 'NIST'):
+                    timing_source = 'GPS_LOCAL'
+                    quality_tier = chrony.quality_tier
+                    uncertainty_ms = chrony.estimated_uncertainty_ms
+                    system_clock_offset_ms = chrony.system_time_offset_ms
+                    system_clock_source = f"chrony_{chrony.ref_id.lower()}"
+                else:
+                    timing_source = 'RTP_AUTHORITY_EXPECTED_GPS'
+                    
+        if timing_source in ('SYSTEM', 'RTP_AUTHORITY_EXPECTED_GPS'):
+            # Priority: Chrony with GPS/PPS
+            if chrony and chrony.ref_id in ('GPS', 'PPS', 'NIST'):
+                timing_source = 'GPS_LOCAL'
+                quality_tier = chrony.quality_tier
+                uncertainty_ms = chrony.estimated_uncertainty_ms
+                system_clock_offset_ms = chrony.system_time_offset_ms
+                system_clock_source = f"chrony_{chrony.ref_id.lower()}"
+            # Priority: Chrony with NTP
+            elif chrony and chrony.stratum < 16:
+                timing_source = 'NTP'
+                quality_tier = chrony.quality_tier
+                uncertainty_ms = chrony.estimated_uncertainty_ms
+                system_clock_offset_ms = chrony.system_time_offset_ms
+                system_clock_source = f"chrony_stratum{chrony.stratum}"
         
         # Build metadata
         metadata = TimingMetadata(
@@ -533,13 +462,13 @@ class TimingService:
             metadata.chrony_root_delay_ms = chrony.root_delay_ms
             metadata.chrony_root_dispersion_ms = chrony.root_dispersion_ms
         
-        # Add grape details
-        if grape:
-            metadata.grape_d_clock_ms = grape.clock_offset_ms
-            metadata.grape_uncertainty_ms = grape.uncertainty_ms
-            metadata.grape_station = grape.station
-            metadata.grape_frequency_mhz = grape.frequency_mhz
-            metadata.grape_locked = grape.is_locked
+        # Add hf details
+        if hf:
+            metadata.hf_d_clock_ms = hf.fusion_d_clock_ms
+            metadata.hf_uncertainty_ms = hf.fusion_uncertainty_ms
+            metadata.hf_authority = hf.authority
+            metadata.hf_quality_grade = hf.fusion_quality_grade
+            metadata.hf_locked = hf.is_locked
         
         # Compute corrected timestamps
         if wallclock_start and system_clock_offset_ms is not None:
@@ -554,33 +483,31 @@ class TimingService:
     def get_status(self) -> Dict[str, Any]:
         """Get current timing service status for status.json."""
         chrony = self.get_chrony_status()
-        grape = self.get_grape_offset()
+        hf = self.get_hf_status()
         
         return {
             'chrony_available': chrony is not None,
             'chrony_ref_id': chrony.ref_id if chrony else None,
             'chrony_stratum': chrony.stratum if chrony else None,
             'chrony_offset_ms': chrony.system_time_offset_ms if chrony else None,
-            'grape_available': grape is not None,
-            'grape_d_clock_ms': grape.clock_offset_ms if grape else None,
-            'grape_uncertainty_ms': grape.uncertainty_ms if grape else None,
-            'grape_station': grape.station if grape else None,
-            'grape_locked': grape.is_locked if grape else False,
-            'grape_age_seconds': grape.age_seconds if grape else None,
-            'best_source': self._get_best_source_name(chrony, grape),
-            'best_uncertainty_ms': self._get_best_uncertainty(chrony, grape),
+            'hf_available': hf is not None and hf.is_active,
+            'hf_authority': hf.authority if hf else None,
+            'hf_fusion_d_clock_ms': hf.fusion_d_clock_ms if hf else None,
+            'hf_fusion_locked': hf.is_locked if hf else False,
+            'best_source': self._get_best_source_name(chrony, hf),
+            'best_uncertainty_ms': self._get_best_uncertainty(chrony, hf),
         }
     
     def _get_best_source_name(
         self,
         chrony: Optional[ChronyStatus],
-        grape: Optional[GrapeClockOffset]
+        hf: Optional[HFTimeStdStatus]
     ) -> str:
         """Determine best source name."""
-        if grape and grape.is_locked:
-            return f"UTC(NIST) via {grape.station}"
-        elif grape and grape.age_seconds < 120:
-            return f"UTC(NIST) via {grape.station} (unlocked)"
+        if hf and hf.is_active and hf.authority == 'fusion' and hf.is_locked:
+            return "hf-timestd (FUSION)"
+        elif hf and hf.is_active and hf.authority == 'rtp':
+            return "hf-timestd (RTP/GPS)"
         elif chrony and chrony.ref_id in ('GPS', 'PPS', 'NIST'):
             return f"chrony/{chrony.ref_id}"
         elif chrony:
@@ -591,11 +518,11 @@ class TimingService:
     def _get_best_uncertainty(
         self,
         chrony: Optional[ChronyStatus],
-        grape: Optional[GrapeClockOffset]
+        hf: Optional[HFTimeStdStatus]
     ) -> float:
         """Get best available uncertainty estimate."""
-        if grape and (grape.is_locked or grape.age_seconds < 120):
-            return grape.uncertainty_ms
+        if hf and hf.is_active and hf.authority == 'fusion' and hf.is_locked:
+            return hf.fusion_uncertainty_ms or 5.0
         elif chrony:
             return chrony.estimated_uncertainty_ms
         else:

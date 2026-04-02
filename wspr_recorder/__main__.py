@@ -341,7 +341,8 @@ class WsprRecorder:
         # Initialize timing service
         self.timing_service = TimingService(
             enable_chrony=True,
-            enable_grape=True,
+            enable_hf_timestd=True,
+            authority=self.config.timing.authority
         )
         logger.info(f"Timing service initialized: {self.timing_service.get_status()['best_source']}")
         

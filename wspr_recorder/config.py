@@ -132,6 +132,11 @@ class RadiodConfig:
     port: int = 5004
 
 
+@dataclass
+class TimingConfig:
+    """Timing source configuration."""
+    authority: str = "auto"  # "rtp", "fusion", "auto"
+
 @dataclass 
 class RecorderConfig:
     """General recorder configuration."""
@@ -158,6 +163,7 @@ class RecorderConfig:
 class Config:
     """Complete wspr-recorder configuration."""
     recorder: RecorderConfig = field(default_factory=RecorderConfig)
+    timing: TimingConfig = field(default_factory=TimingConfig)
     radiod: RadiodConfig = field(default_factory=RadiodConfig)
     channel_defaults: ChannelDefaults = field(default_factory=ChannelDefaults)
     frequencies: List[int] = field(default_factory=list)
@@ -251,6 +257,14 @@ def load_config(config_path: str) -> Config:
             status_address=rad.get("status_address", config.radiod.status_address),
             port=rad.get("port", config.radiod.port),
         )
+
+    # Parse timing section
+    if "timing" in data:
+        tim = data["timing"]
+        config.timing = TimingConfig(
+            authority=tim.get("authority", config.timing.authority),
+        )
+    
     
     # Parse channel_defaults section
     if "channel_defaults" in data:
