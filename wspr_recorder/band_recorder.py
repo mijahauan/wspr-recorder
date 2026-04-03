@@ -6,10 +6,13 @@ Per-band recording logic:
 - Resequences and fills gaps
 - Buffers samples until minute boundary (720,000 samples)
 - Triggers WAV file writes
+
+Samples are kept as native int16 throughout the pipeline to avoid
+unnecessary float32 conversion overhead. Only PT=11 (float32) payloads
+are converted to int16 on ingest.
 """
 
 import logging
-import struct
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List
@@ -19,12 +22,6 @@ from concurrent.futures import ThreadPoolExecutor
 from .rtp_ingest import RTPHeader
 
 logger = logging.getLogger(__name__)
-
-
-# Constants
-# Constants
-# SAMPLES_PER_MINUTE is now calculated per instance: self.sample_rate * 60
-SAMPLES_PER_PACKET = 960 // 4  # 960 bytes / 4 bytes per float32 = 240 samples
 
 
 @dataclass
@@ -40,17 +37,17 @@ class GapEvent:
 @dataclass
 class MinuteBuffer:
     """Buffer for one minute of samples."""
-    samples: np.ndarray  # float32 samples
+    samples: np.ndarray  # int16 samples
     sample_count: int = 0
     gaps: List[GapEvent] = field(default_factory=list)
     start_rtp_timestamp: Optional[int] = None
     start_wallclock: Optional[datetime] = None
-    
+
     @property
     def is_complete(self) -> bool:
         """Check if buffer has a full minute of samples."""
         return self.sample_count >= len(self.samples)
-    
+
     @property
     def completeness_pct(self) -> float:
         """Calculate completeness percentage."""
@@ -92,15 +89,15 @@ MinuteCompleteCallback = Callable[[int, np.ndarray, List[GapEvent], datetime, Op
 class BandRecorder:
     """
     Records samples for a single WSPR band.
-    
+
     Responsibilities:
-    - Parse float32 samples from RTP payload
+    - Buffer int16 samples from RTP payload (zero-copy for int16 payloads)
     - Track RTP sequence numbers and detect gaps
     - Fill gaps with zeros
     - Buffer samples until minute boundary
     - Trigger callback when minute is complete
     """
-    
+
     def __init__(
         self,
         ssrc: int,
@@ -112,7 +109,7 @@ class BandRecorder:
     ):
         """
         Initialize band recorder.
-        
+
         Args:
             ssrc: SSRC for this band
             frequency_hz: Center frequency in Hz
@@ -127,29 +124,29 @@ class BandRecorder:
         self.sample_rate = sample_rate
         self.on_minute_complete = on_minute_complete
         self.executor = executor
-        
+
         self.stats = BandRecorderStats()
-        
+
         # RTP state tracking
         self._last_sequence: Optional[int] = None
         self._last_timestamp: Optional[int] = None
         self._initialized = False
         self._synced = False  # True after first minute boundary
-        
-        # Max gap to fill (2 seconds)
+
+        # Cached constants
+        self._samples_per_minute = self.sample_rate * 60
         self.max_gap_samples = self.sample_rate * 2
-        
+
         # Sample buffer
         self._buffer = self._create_buffer()
-        
+
         # Samples per packet (calculated from first packet)
         self._samples_per_packet: Optional[int] = None
-    
+
     def _create_buffer(self) -> MinuteBuffer:
         """Create a new minute buffer."""
-        samples_per_minute = self.sample_rate * 60
         return MinuteBuffer(
-            samples=np.zeros(samples_per_minute, dtype=np.float32),
+            samples=np.zeros(self._samples_per_minute, dtype=np.int16),
             sample_count=0,
             gaps=[],
             start_rtp_timestamp=None,
@@ -169,28 +166,26 @@ class BandRecorder:
             return
         
         self.stats.packets_received += 1
-        
-        # Parse samples from payload based on payload type
-        # PT=98: int16 mono audio (most common for USB/LSB demod)
-        # PT=122: int16 but often empty/status packets
-        # PT=11: float32
+
+        # Parse samples from payload as int16.
+        # PT=98/120/122: int16 mono audio (most common) — zero-copy view
+        # PT=11: float32 — convert to int16
         try:
             payload_type = header.payload_type
             if payload_type in (98, 120, 122):
-                # int16 format - convert to float32 normalized
-                samples_i16 = np.frombuffer(payload, dtype=np.int16)
-                samples = samples_i16.astype(np.float32) / 32768.0
+                # int16 format — direct view, no allocation
+                samples = np.frombuffer(payload, dtype=np.int16)
             elif payload_type == 11:
-                # float32 format
-                samples = np.frombuffer(payload, dtype='<f4')
+                # float32 format — convert to int16
+                float_samples = np.frombuffer(payload, dtype='<f4')
+                samples = np.clip(float_samples * 32767.0, -32768, 32767).astype(np.int16)
             else:
                 # Default: try int16 (most common)
-                samples_i16 = np.frombuffer(payload, dtype=np.int16)
-                samples = samples_i16.astype(np.float32) / 32768.0
+                samples = np.frombuffer(payload, dtype=np.int16)
         except ValueError as e:
             logger.warning(f"Failed to parse payload for {self.band_name}: {e}")
             return
-        
+
         if len(samples) == 0:
             return
         
@@ -302,8 +297,7 @@ class BandRecorder:
                 return
         
         # Calculate how many samples we can add
-        samples_per_minute = self.sample_rate * 60
-        space_available = samples_per_minute - self._buffer.sample_count
+        space_available = self._samples_per_minute - self._buffer.sample_count
         samples_to_add = min(len(samples), space_available)
         
         if samples_to_add > 0:
@@ -321,14 +315,13 @@ class BandRecorder:
     
     def _add_zeros(self, count: int) -> None:
         """Add zero samples to fill a gap."""
-        samples_per_minute = self.sample_rate * 60
-        space_available = samples_per_minute - self._buffer.sample_count
+        space_available = self._samples_per_minute - self._buffer.sample_count
         zeros_to_add = min(count, space_available)
         
         if zeros_to_add > 0:
             start_idx = self._buffer.sample_count
             end_idx = start_idx + zeros_to_add
-            self._buffer.samples[start_idx:end_idx] = 0.0
+            self._buffer.samples[start_idx:end_idx] = 0
             self._buffer.sample_count += zeros_to_add
     
     def _flush_minute(self) -> None:
@@ -349,18 +342,18 @@ class BandRecorder:
         else:
             self._buffer.start_wallclock = datetime.now(timezone.utc)
         
-        # Trigger callback
+        # Trigger callback — hand off the buffer slice directly (no copy needed
+        # since we already allocated a fresh buffer above)
         if self.on_minute_complete:
-            samples = completed_buffer.samples[:completed_buffer.sample_count].copy()
-            gaps = completed_buffer.gaps.copy()
+            samples = completed_buffer.samples[:completed_buffer.sample_count]
+            gaps = completed_buffer.gaps
             start_time = completed_buffer.start_wallclock or datetime.now(timezone.utc)
             rtp_start = completed_buffer.start_rtp_timestamp
-            # Calculate end RTP timestamp from start + samples
             rtp_end = rtp_start + len(samples) if rtp_start is not None else None
-            
+
             self.stats.samples_written += len(samples)
             self.stats.files_written += 1
-            
+
             logger.info(
                 f"{self.band_name}: Minute complete, {len(samples)} samples, "
                 f"{len(gaps)} gaps, {completed_buffer.completeness_pct:.1f}% complete"
