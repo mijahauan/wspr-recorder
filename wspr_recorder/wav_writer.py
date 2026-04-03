@@ -81,14 +81,20 @@ def generate_wav_filename(frequency_hz: int, timestamp: datetime) -> str:
 def samples_to_int16(samples: np.ndarray) -> np.ndarray:
     """
     Convert float32 samples to int16.
-
+    
     Args:
         samples: Float32 samples (assumed to be in range -1.0 to 1.0)
-
+        
     Returns:
         Int16 samples
     """
-    return np.clip(samples * 32767.0, -32768, 32767).astype(np.int16)
+    # Clip to valid range
+    clipped = np.clip(samples, -1.0, 1.0)
+    
+    # Scale to int16 range
+    scaled = clipped * 32767.0
+    
+    return scaled.astype(np.int16)
 
 
 class WavWriter:
@@ -146,40 +152,39 @@ class WavWriter:
     ) -> Optional[Path]:
         """
         Write a minute of samples to WAV file.
-
+        
         Args:
             frequency_hz: Frequency in Hz
-            samples: int16 samples (native from BandRecorder pipeline)
+            samples: Float32 samples
             gaps: List of gap events
             start_time: UTC start time
             max_files_per_band: Max files to keep per band directory (default: 35)
             rtp_timestamp_start: RTP timestamp at start of recording
             rtp_timestamp_end: RTP timestamp at end of recording
-
+            
         Returns:
             Path to written WAV file, or None on error
         """
         try:
             # Ensure we don't exceed max files (delete oldest if needed)
             self.make_room_for_file(frequency_hz, max_files_per_band)
-
+            
             band_dir = self.get_band_dir(frequency_hz)
             band_name = freq_to_band_name(frequency_hz)
-
+            
             # Generate filename
             filename = generate_wav_filename(frequency_hz, start_time)
             wav_path = band_dir / filename
             tmp_path = band_dir / f".{filename}.tmp"
             json_path = band_dir / f"{filename[:-4]}.json"  # Replace .wav with .json
-
-            # Samples arrive as int16 from BandRecorder.
-            # Convert only if float32 output is explicitly requested.
-            if self.sample_format == "float32":
-                output_samples = samples.astype(np.float32) / 32768.0
-                sample_width = 4
-            else:
-                output_samples = samples if samples.dtype == np.int16 else samples_to_int16(samples)
+            
+            # Convert samples if needed
+            if self.sample_format == "int16":
+                output_samples = samples_to_int16(samples)
                 sample_width = 2
+            else:
+                output_samples = samples.astype(np.float32)
+                sample_width = 4
             
             # Write WAV file atomically
             self._write_wav(tmp_path, output_samples, sample_width)
