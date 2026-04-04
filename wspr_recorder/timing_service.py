@@ -496,6 +496,7 @@ class TimingService:
             'hf_fusion_locked': hf.is_locked if hf else False,
             'best_source': self._get_best_source_name(chrony, hf),
             'best_uncertainty_ms': self._get_best_uncertainty(chrony, hf),
+            'timing_level': self.detect_timing_level(),
         }
     
     def _get_best_source_name(
@@ -515,6 +516,84 @@ class TimingService:
         else:
             return "system clock"
     
+    def detect_timing_level(self) -> str:
+        """
+        Detect the current timing level based on available sources.
+
+        Returns one of: 'L6', 'L5', 'L4', 'L3', 'L2', 'L1'.
+        L6/L5 require explicit authority='rtp' in config (cannot be auto-detected).
+        """
+        if self.authority == 'rtp':
+            return 'L5'  # L5/L6 indistinguishable — user asserts GPSDO/PPS
+
+        chrony = self.get_chrony_status()
+        hf = self.get_hf_status()
+
+        # L4: chrony tracking GPS/PPS with sub-ms (GPS+PPS on LAN)
+        if chrony and chrony.ref_id in ('GPS', 'PPS') and chrony.estimated_uncertainty_ms < 1.0:
+            return 'L4'
+
+        # L3: hf-timestd Fusion feeding chrony
+        if hf and hf.is_active and hf.authority == 'fusion' and hf.is_locked:
+            return 'L3'
+
+        # L2: NTP via chrony
+        if chrony and chrony.stratum < 16:
+            return 'L2'
+
+        return 'L1'
+
+    def create_sync_strategy(self, sample_rate: int = 12000):
+        """
+        Create the appropriate SyncStrategy for the current timing authority.
+
+        Each BandRecorder should get its own instance (RTP strategy tracks
+        per-stream RTP timestamp state).
+        """
+        from .sync_strategy import (
+            RtpSyncStrategy, ClockSyncStrategy, FallbackSyncStrategy,
+        )
+
+        if self.authority == 'rtp':
+            logger.info("Timing: authority=rtp, using RtpSyncStrategy (L5/L6)")
+            return RtpSyncStrategy(sample_rate)
+
+        # Auto-detect best available
+        chrony = self.get_chrony_status()
+        hf = self.get_hf_status()
+
+        # L4: chrony with local GPS/PPS (sub-ms)
+        if chrony and chrony.ref_id in ('GPS', 'PPS') and chrony.estimated_uncertainty_ms < 1.0:
+            logger.info(
+                f"Timing: chrony/{chrony.ref_id} sub-ms, "
+                f"using ClockSyncStrategy (L4, {chrony.estimated_uncertainty_ms:.2f}ms)"
+            )
+            return ClockSyncStrategy(sample_rate, tier='L4',
+                                     uncertainty_ms=chrony.estimated_uncertainty_ms)
+
+        # L3: hf-timestd Fusion → chrony
+        if hf and hf.is_active and hf.authority == 'fusion' and hf.is_locked:
+            uncertainty = hf.fusion_uncertainty_ms or 1.0
+            logger.info(
+                f"Timing: hf-timestd Fusion locked, "
+                f"using ClockSyncStrategy (L3, {uncertainty:.2f}ms)"
+            )
+            return ClockSyncStrategy(sample_rate, tier='L3',
+                                     uncertainty_ms=uncertainty)
+
+        # L2: chrony with NTP
+        if chrony and chrony.stratum < 16:
+            logger.info(
+                f"Timing: chrony stratum {chrony.stratum}, "
+                f"using ClockSyncStrategy (L2, {chrony.estimated_uncertainty_ms:.2f}ms)"
+            )
+            return ClockSyncStrategy(sample_rate, tier='L2',
+                                     uncertainty_ms=chrony.estimated_uncertainty_ms)
+
+        # L1: undisciplined wall clock
+        logger.warning("Timing: no timing authority detected, using FallbackSyncStrategy (L1)")
+        return FallbackSyncStrategy(sample_rate)
+
     def _get_best_uncertainty(
         self,
         chrony: Optional[ChronyStatus],

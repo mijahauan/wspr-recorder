@@ -80,7 +80,10 @@ class WsprRecorder:
         """
         logger.info(f"Channel ready: SSRC {ssrc} -> {channel_state.band_name}")
         
-        # Create band recorder
+        # Create band recorder with timing-aware sync strategy
+        sync_strategy = self.timing_service.create_sync_strategy(
+            sample_rate=self.config.channel_defaults.sample_rate,
+        )
         recorder = BandRecorder(
             ssrc=ssrc,
             frequency_hz=channel_state.frequency_hz,
@@ -88,6 +91,7 @@ class WsprRecorder:
             sample_rate=self.config.channel_defaults.sample_rate,
             on_minute_complete=self._on_minute_complete,
             executor=self.executor,
+            sync_strategy=sync_strategy,
         )
         
         self.band_recorders[ssrc] = recorder

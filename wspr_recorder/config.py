@@ -199,7 +199,15 @@ class Config:
         
         if self.channel_defaults.low >= self.channel_defaults.high:
             errors.append(f"Filter low ({self.channel_defaults.low}) must be < high ({self.channel_defaults.high})")
-        
+
+        # Validate timing authority
+        valid_authorities = ("rtp", "fusion", "auto")
+        if self.timing.authority not in valid_authorities:
+            errors.append(
+                f"Invalid timing authority: {self.timing.authority!r}, "
+                f"must be one of {valid_authorities}"
+            )
+
         return errors
     
     def get_band_name(self, freq_hz: int) -> str:

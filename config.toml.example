@@ -29,6 +29,30 @@ status_file = "status.json"
 # IPC socket for wsprdaemon and other tools to query/control
 ipc_socket = "/run/wspr-recorder/control.sock"
 
+[timing]
+# Timing authority for minute-boundary sync.
+#
+# "auto" (default): Auto-detect the best available timing source, probing
+#   downward through the hierarchy:
+#     L4 - chrony tracking GPS/PPS with sub-ms dispersion (GPS+PPS on LAN)
+#     L3 - hf-timestd Fusion feeding chrony (UTC(NIST), sub-ms)
+#     L2 - chrony with WAN NTP pools (~10-100ms)
+#     L1 - undisciplined system clock (fallback)
+#
+# "rtp": Declare that radiod has GPSDO/PPS (L5/L6). The recorder will use
+#   RTP timestamps from the stream as the authoritative time source — the
+#   wall clock is consulted only once at startup to correlate the RTP
+#   timestamp with a UTC minute. All subsequent minute boundaries are
+#   derived from the GPSDO-clocked RTP sample counter, independent of the
+#   wspr-recorder machine's own clock discipline.
+#
+#   Set this ONLY if you know radiod is receiving GPS+PPS directly on its
+#   host or has HF-injected PPS — it cannot be auto-detected.
+#
+# "fusion": Force use of hf-timestd Fusion metrology (L3) regardless of
+#   other sources. Useful for testing.
+authority = "auto"
+
 [radiod]
 # radiod status/control multicast address (mDNS name like xxx-status.local)
 # Example: bee1-hf-status.local, rx888-status.local

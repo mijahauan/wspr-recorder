@@ -12,10 +12,11 @@ import logging
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 from .rtp_ingest import RTPHeader
+from .sync_strategy import SyncStrategy, FallbackSyncStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +103,11 @@ class BandRecorder:
         sample_rate: int = 12000,
         on_minute_complete: Optional[MinuteCompleteCallback] = None,
         executor: Optional[ThreadPoolExecutor] = None,
+        sync_strategy: Optional[SyncStrategy] = None,
     ):
         """
         Initialize band recorder.
-        
+
         Args:
             ssrc: SSRC for this band
             frequency_hz: Center frequency in Hz
@@ -113,6 +115,7 @@ class BandRecorder:
             sample_rate: Sample rate in Hz (default: 12000)
             on_minute_complete: Callback when minute buffer is full
             executor: ThreadPoolExecutor for async file writes
+            sync_strategy: Strategy for minute-boundary alignment
         """
         self.ssrc = ssrc
         self.frequency_hz = frequency_hz
@@ -120,6 +123,7 @@ class BandRecorder:
         self.sample_rate = sample_rate
         self.on_minute_complete = on_minute_complete
         self.executor = executor
+        self.sync_strategy = sync_strategy or FallbackSyncStrategy(sample_rate)
         
         self.stats = BandRecorderStats()
         
@@ -138,6 +142,9 @@ class BandRecorder:
         
         # Samples per packet (calculated from first packet)
         self._samples_per_packet: Optional[int] = None
+
+        # Overflow samples from a packet that spans a minute boundary
+        self._pending_overflow: Optional[np.ndarray] = None
     
     def _create_buffer(self) -> MinuteBuffer:
         """Create a new minute buffer."""
@@ -274,42 +281,50 @@ class BandRecorder:
     def _add_samples(self, samples: np.ndarray, header: RTPHeader) -> None:
         """Add samples to the current buffer."""
         if not self._synced:
-            # Sync to system clock minute boundary (driven by hf-timestd)
             now = datetime.now(timezone.utc)
-            
-            # Check if we are at the top of the minute (allow 1s buffer window)
-            # We want to start exactly when the second rolls over to 0
-            if now.second == 0:
-                self._synced = True
-                
-                # Snap to exact minute boundary for metadata
-                self._buffer.start_wallclock = now.replace(microsecond=0)
-                self._buffer.start_rtp_timestamp = header.timestamp
-                
-                logger.info(
-                    f"{self.band_name}: Synced to minute boundary {self._buffer.start_wallclock} "
-                    f"(jitter: {now.microsecond/1000:.1f}ms)"
-                )
-            else:
-                # Not at boundary yet, discard samples
+            decision = self.sync_strategy.should_start_minute(
+                header.timestamp, len(samples), now,
+            )
+            if decision is None:
                 return
-        
+
+            self._synced = True
+            self._buffer.start_wallclock = decision.start_wallclock
+            self._buffer.start_rtp_timestamp = decision.start_rtp_timestamp
+            self.sync_strategy.on_minute_started(
+                decision.start_rtp_timestamp, decision.start_wallclock,
+            )
+
+            logger.info(
+                f"{self.band_name}: Synced to minute boundary "
+                f"{decision.start_wallclock} via {self.sync_strategy.__class__.__name__}"
+            )
+
+            # Skip samples that precede the boundary within this packet
+            if decision.sample_offset > 0:
+                samples = samples[decision.sample_offset:]
+                if len(samples) == 0:
+                    return
+
         # Calculate how many samples we can add
         space_available = self._samples_per_minute - self._buffer.sample_count
         samples_to_add = min(len(samples), space_available)
-        
+
         if samples_to_add > 0:
             start_idx = self._buffer.sample_count
             end_idx = start_idx + samples_to_add
             self._buffer.samples[start_idx:end_idx] = samples[:samples_to_add]
             self._buffer.sample_count += samples_to_add
-        
-        # If we have leftover samples, they go into the next minute
+
+        # Carry overflow samples into the next minute buffer
         if samples_to_add < len(samples):
-            # This shouldn't happen often - minute boundary mid-packet
-            # leftover = samples[samples_to_add:]
-            # logger.debug(f"{self.band_name}: {len(leftover)} samples overflow to next minute")
-            pass
+            leftover = samples[samples_to_add:]
+            logger.debug(
+                f"{self.band_name}: {len(leftover)} samples overflow to next minute"
+            )
+            # _flush_minute (triggered by is_complete check in on_packet)
+            # will create a fresh buffer; add leftover there afterward.
+            self._pending_overflow = leftover
     
     def _add_zeros(self, count: int) -> None:
         """Add zero samples to fill a gap."""
@@ -326,20 +341,32 @@ class BandRecorder:
         """Flush the current minute buffer."""
         if self._buffer.sample_count == 0:
             return
-        
+
         # Get the completed buffer
         completed_buffer = self._buffer
-        
+
         # Create new buffer for next minute
         self._buffer = self._create_buffer()
-        
-        # Calculate next start time based on previous to maintain grid
+
+        # Maintain the grid: next minute's timestamps derived from previous
         if completed_buffer.start_wallclock:
-            from datetime import timedelta
             self._buffer.start_wallclock = completed_buffer.start_wallclock + timedelta(seconds=60)
         else:
             self._buffer.start_wallclock = datetime.now(timezone.utc)
-        
+
+        if completed_buffer.start_rtp_timestamp is not None:
+            self._buffer.start_rtp_timestamp = (
+                (completed_buffer.start_rtp_timestamp + self._samples_per_minute) & 0xFFFFFFFF
+            )
+
+        # Add any overflow samples from the previous packet
+        overflow = getattr(self, '_pending_overflow', None)
+        if overflow is not None and len(overflow) > 0:
+            end = min(len(overflow), self._samples_per_minute)
+            self._buffer.samples[:end] = overflow[:end]
+            self._buffer.sample_count = end
+            self._pending_overflow = None
+
         # Trigger callback — hand off the buffer slice directly (no copy needed
         # since we already allocated a fresh buffer above)
         if self.on_minute_complete:
@@ -348,15 +375,15 @@ class BandRecorder:
             start_time = completed_buffer.start_wallclock or datetime.now(timezone.utc)
             rtp_start = completed_buffer.start_rtp_timestamp
             rtp_end = rtp_start + len(samples) if rtp_start is not None else None
-            
+
             self.stats.samples_written += len(samples)
             self.stats.files_written += 1
-            
+
             logger.info(
                 f"{self.band_name}: Minute complete, {len(samples)} samples, "
                 f"{len(gaps)} gaps, {completed_buffer.completeness_pct:.1f}% complete"
             )
-            
+
             # Call callback (potentially in thread pool)
             if self.executor:
                 self.executor.submit(
@@ -390,6 +417,8 @@ class BandRecorder:
         stats["buffer_samples"] = self._buffer.sample_count
         stats["buffer_gaps"] = len(self._buffer.gaps)
         stats["synced"] = self._synced
+        stats["sync_strategy"] = self.sync_strategy.__class__.__name__
+        stats["sync_tier"] = getattr(self.sync_strategy, 'tier', None)
         return stats
     
     def reset(self) -> None:
@@ -399,4 +428,5 @@ class BandRecorder:
         self._initialized = False
         self._synced = False
         self._buffer = self._create_buffer()
+        self._pending_overflow = None
         self.stats = BandRecorderStats()

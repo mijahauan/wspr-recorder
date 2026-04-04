@@ -67,3 +67,18 @@ class TestConfigValidation:
         config.recorder.sample_format = "invalid"
         errors = config.validate()
         assert any("sample_format" in e for e in errors)
+
+    def test_valid_timing_authorities(self):
+        for authority in ("rtp", "fusion", "auto"):
+            config = Config()
+            config.frequencies = [14095600]
+            config.timing.authority = authority
+            errors = config.validate()
+            assert len(errors) == 0
+
+    def test_invalid_timing_authority(self):
+        config = Config()
+        config.frequencies = [14095600]
+        config.timing.authority = "invalid"
+        errors = config.validate()
+        assert any("timing authority" in e for e in errors)

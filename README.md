@@ -169,20 +169,57 @@ Each WAV has a JSON sidecar with comprehensive metadata:
 }
 ```
 
-## Timing Sources
+## Timing Authority
 
-The timing service queries multiple sources in priority order:
+Minute-boundary alignment is the whole point of a WSPR recorder: each 1-minute
+WAV file must start as close to UTC `:00.000` as the best available clock
+allows. wspr-recorder uses a hierarchy of timing authorities and picks an
+appropriate sync strategy per band.
 
-1. **UTC(NIST)** via grape-recorder D_clock (sub-ms accuracy when locked)
-2. **GPS/PPS** via chrony (if local GPS receiver available)
-3. **NTP** via chrony (network time pools)
-4. **System clock** (fallback)
+### Timing Levels
 
-Quality tiers:
-- **A**: < 1ms uncertainty (UTC(NIST), GPS+PPS)
-- **B**: < 10ms uncertainty (GPS, good NTP)
-- **C**: < 100ms uncertainty (NTP pools)
-- **D**: > 100ms or unknown
+| Level | Source | Typical accuracy | Sync strategy |
+|-------|--------|------------------|---------------|
+| **L6** | HF-injected PPS (PPS embedded in radiod's HF stream) | Sub-µs | RTP timestamps |
+| **L5** | GPS+PPS directly feeding the radiod host | Sub-µs | RTP timestamps |
+| **L4** | GPS+PPS reachable via LAN (e.g., local NTP/PTP GPS server) | < 1 ms | Disciplined wall clock |
+| **L3** | hf-timestd Fusion disciplining chrony on the wspr-recorder host | Sub-ms | Disciplined wall clock |
+| **L2** | WAN NTP pools via chrony | 10–100 ms | Wall clock |
+| **L1** | Undisciplined system clock | > 100 ms | Best-effort wall clock |
+
+At **L5/L6**, radiod's RTP timestamps are themselves driven by a GPSDO, so
+they are authoritative — sample-accurate relative to UTC. wspr-recorder
+correlates one RTP timestamp with the wall clock at startup (using the wall
+clock only to identify *which* minute we are in, with ~1 s tolerance), then
+derives every subsequent minute boundary purely from the RTP sample counter.
+The wspr-recorder machine's own clock discipline is irrelevant in this mode.
+
+At **L3/L4**, the wspr-recorder machine has a sub-ms disciplined wall clock.
+The recorder uses `datetime.now(timezone.utc)` with microsecond precision and
+discards any samples that arrive before the true boundary based on the
+sub-second component.
+
+### Configuration
+
+```toml
+[timing]
+authority = "auto"   # or "rtp"
+```
+
+- `"auto"` (default) probes downward: L4 → L3 → L2 → L1. L5/L6 cannot be
+  auto-detected because radiod does not report its GPSDO lock status.
+- `"rtp"` tells the recorder to trust RTP timestamps as the authoritative
+  time source. **Set this only if you know** radiod is receiving GPS+PPS
+  directly or has HF-injected PPS.
+
+### Quality Tiers in WAV Sidecar Metadata
+
+Each WAV file's JSON sidecar records the actual timing source and uncertainty:
+
+- **A**: < 1 ms uncertainty (UTC(NIST), GPS+PPS)
+- **B**: < 10 ms uncertainty (GPS, good NTP)
+- **C**: < 100 ms uncertainty (NTP pools)
+- **D**: > 100 ms or unknown
 
 ## Architecture
 
