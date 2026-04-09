@@ -163,28 +163,29 @@ class WsprRecorder:
                 logger.error(f"Status write error: {e}")
     
     async def _health_check_loop(self) -> None:
-        """Periodically check channel health and reconnect if needed."""
-        # Wait for startup grace period before checking health
+        """Periodically log channel health.
+
+        Channel recovery is handled automatically by ReceiverManager's
+        background health monitor thread. This loop only logs status.
+        """
         await asyncio.sleep(self.STARTUP_GRACE_PERIOD)
-        
+
         while self._running:
             try:
                 await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
-                
-                if self.receiver_manager and not self.receiver_manager.check_health():
-                    logger.warning("No active channels, attempting reconnect")
-                    
-                    # Unregister old handlers
-                    if self.rtp_ingest:
-                        for ssrc in list(self.band_recorders.keys()):
-                            self.rtp_ingest.unregister_handler(ssrc)
-                    
-                    # Clear recorders
-                    self.band_recorders.clear()
-                    
-                    # Reconnect
-                    self.receiver_manager.reconnect()
-                    
+
+                if self.receiver_manager:
+                    active = sum(
+                        1 for ch in self.receiver_manager.state.channels.values()
+                        if ch.is_active
+                    )
+                    total = len(self.receiver_manager.state.channels)
+                    if active < total:
+                        logger.warning(
+                            f"Channel health: {active}/{total} active "
+                            f"(recovery handled by ReceiverManager)"
+                        )
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
