@@ -2,10 +2,10 @@
 Band Recorder for wspr-recorder.
 
 Per-band recording logic:
-- Receives samples from RTP packets
+- Receives int16 samples from RTP packets
 - Resequences and fills gaps
-- Buffers samples until minute boundary (720,000 samples)
-- Triggers WAV file writes
+- Buffers samples in a ring buffer
+- At minute boundaries, checks decode schedules and emits DecodeRequests
 """
 
 import logging
@@ -17,6 +17,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .rtp_ingest import RTPHeader
 from .sync_strategy import SyncStrategy, FallbackSyncStrategy
+from .decode_mode import (
+    DecodeMode, DECODE_MODE_PERIODS,
+    modes_completing_at_minute, max_period_seconds, group_modes_by_period,
+)
+from .drift_tracker import DriftTracker, DriftObservation
 
 logger = logging.getLogger(__name__)
 
@@ -32,27 +37,21 @@ class GapEvent:
 
 
 @dataclass
-class MinuteBuffer:
-    """Buffer for one minute of samples."""
-    samples: np.ndarray  # float32 samples
-    sample_count: int = 0
-    gaps: List[GapEvent] = field(default_factory=list)
-    start_rtp_timestamp: Optional[int] = None
-    start_wallclock: Optional[datetime] = None
-    
-    @property
-    def is_complete(self) -> bool:
-        """Check if buffer has a full minute of samples."""
-        return self.sample_count >= len(self.samples)
-    
-    @property
-    def completeness_pct(self) -> float:
-        """Calculate completeness percentage."""
-        if self.sample_count == 0:
-            return 0.0
-        total_gap_samples = sum(g.duration_samples for g in self.gaps)
-        actual_samples = self.sample_count - total_gap_samples
-        return (actual_samples / self.sample_count) * 100.0
+class DecodeRequest:
+    """A request to write a WAV file and decode for a completed period."""
+    frequency_hz: int
+    band_name: str
+    modes: List[DecodeMode]       # e.g., [W2, F2] for shared 120s
+    period_seconds: int           # 120, 300, 900, or 1800
+    samples: np.ndarray           # int16, copied from ring
+    gaps: List[GapEvent]
+    start_wallclock: datetime
+    start_rtp_timestamp: int
+    end_rtp_timestamp: int
+    drift_observation: Optional[DriftObservation] = None
+
+
+PeriodCompleteCallback = Callable[[DecodeRequest], None]
 
 
 @dataclass
@@ -63,9 +62,9 @@ class BandRecorderStats:
     samples_written: int = 0
     gaps_detected: int = 0
     gaps_filled_samples: int = 0
-    files_written: int = 0
+    periods_emitted: int = 0
     sequence_errors: int = 0
-    
+
     def to_dict(self) -> dict:
         return {
             "packets_received": self.packets_received,
@@ -73,213 +72,189 @@ class BandRecorderStats:
             "samples_written": self.samples_written,
             "gaps_detected": self.gaps_detected,
             "gaps_filled_samples": self.gaps_filled_samples,
-            "files_written": self.files_written,
+            "periods_emitted": self.periods_emitted,
             "sequence_errors": self.sequence_errors,
         }
 
 
-# Callback type for when a minute is complete
-# Args: frequency_hz, samples, gaps, start_time, rtp_timestamp_start, rtp_timestamp_end
-MinuteCompleteCallback = Callable[[int, np.ndarray, List[GapEvent], datetime, Optional[int], Optional[int]], None]
+# Legacy alias for backward compat
+MinuteCompleteCallback = Callable[
+    [int, np.ndarray, List[GapEvent], datetime, Optional[int], Optional[int]], None
+]
 
 
 class BandRecorder:
     """
     Records samples for a single WSPR band.
-    
+
     Responsibilities:
-    - Parse float32 samples from RTP payload
+    - Parse int16 samples from RTP payload
     - Track RTP sequence numbers and detect gaps
     - Fill gaps with zeros
-    - Buffer samples until minute boundary
-    - Trigger callback when minute is complete
+    - Buffer samples in a ring buffer
+    - At minute boundaries, emit DecodeRequests for completed periods
     """
-    
+
     def __init__(
         self,
         ssrc: int,
         frequency_hz: int,
         band_name: str,
         sample_rate: int = 12000,
-        on_minute_complete: Optional[MinuteCompleteCallback] = None,
+        decode_modes: Optional[List[DecodeMode]] = None,
+        on_period_complete: Optional[PeriodCompleteCallback] = None,
         executor: Optional[ThreadPoolExecutor] = None,
         sync_strategy: Optional[SyncStrategy] = None,
+        # Legacy callback — used if on_period_complete is not provided
+        on_minute_complete: Optional[MinuteCompleteCallback] = None,
     ):
-        """
-        Initialize band recorder.
-
-        Args:
-            ssrc: SSRC for this band
-            frequency_hz: Center frequency in Hz
-            band_name: Band name (e.g., "20m")
-            sample_rate: Sample rate in Hz (default: 12000)
-            on_minute_complete: Callback when minute buffer is full
-            executor: ThreadPoolExecutor for async file writes
-            sync_strategy: Strategy for minute-boundary alignment
-        """
         self.ssrc = ssrc
         self.frequency_hz = frequency_hz
         self.band_name = band_name
         self.sample_rate = sample_rate
+        self.on_period_complete = on_period_complete
         self.on_minute_complete = on_minute_complete
         self.executor = executor
         self.sync_strategy = sync_strategy or FallbackSyncStrategy(sample_rate)
-        
+
+        self._decode_modes = decode_modes or [DecodeMode.W2]
         self.stats = BandRecorderStats()
-        
+
         # RTP state tracking
         self._last_sequence: Optional[int] = None
         self._last_timestamp: Optional[int] = None
         self._initialized = False
-        self._synced = False  # True after first minute boundary
-        
+        self._synced = False
+
         # Cached constants
         self._samples_per_minute = self.sample_rate * 60
         self.max_gap_samples = self.sample_rate * 2
 
-        # Sample buffer
-        self._buffer = self._create_buffer()
-        
         # Samples per packet (calculated from first packet)
         self._samples_per_packet: Optional[int] = None
 
-        # Overflow samples from a packet that spans a minute boundary
-        self._pending_overflow: Optional[np.ndarray] = None
-    
-    def _create_buffer(self) -> MinuteBuffer:
-        """Create a new minute buffer."""
-        return MinuteBuffer(
-            samples=np.zeros(self._samples_per_minute, dtype=np.float32),
-            sample_count=0,
-            gaps=[],
-            start_rtp_timestamp=None,
-            start_wallclock=None,
+        # Ring buffer (lazy import to avoid circular dependency)
+        from .ring_buffer import RingBuffer
+        capacity = max_period_seconds(self._decode_modes)
+        self._ring = RingBuffer(
+            capacity_seconds=capacity,
+            sample_rate=sample_rate,
         )
-    
+
+        # Drift tracker
+        self._drift_tracker = DriftTracker(sample_rate)
+
+        # Grid state — minute count and first-sync timestamps
+        self._minute_count: int = 0
+        self._first_wallclock: Optional[datetime] = None
+        self._first_rtp_timestamp: Optional[int] = None
+
     def on_packet(self, ssrc: int, header: RTPHeader, payload: bytes) -> None:
-        """
-        Process an RTP packet.
-        
-        Args:
-            ssrc: SSRC (should match self.ssrc)
-            header: Parsed RTP header
-            payload: Raw payload bytes
-        """
+        """Process an RTP packet."""
         if ssrc != self.ssrc:
             return
-        
+
         self.stats.packets_received += 1
-        
-        # Parse samples from payload based on payload type
-        # PT=98: int16 mono audio (most common for USB/LSB demod)
-        # PT=122: int16 but often empty/status packets
-        # PT=11: float32
+
+        # Parse samples as int16 natively
         try:
             payload_type = header.payload_type
             if payload_type in (98, 120, 122):
-                # int16 format - convert to float32 normalized
-                samples_i16 = np.frombuffer(payload, dtype=np.int16)
-                samples = samples_i16.astype(np.float32) / 32768.0
+                samples = np.frombuffer(payload, dtype=np.int16).copy()
             elif payload_type == 11:
-                # float32 format
-                samples = np.frombuffer(payload, dtype='<f4')
+                f32 = np.frombuffer(payload, dtype='<f4')
+                samples = (np.clip(f32, -1.0, 1.0) * 32767).astype(np.int16)
             else:
-                # Default: try int16 (most common)
-                samples_i16 = np.frombuffer(payload, dtype=np.int16)
-                samples = samples_i16.astype(np.float32) / 32768.0
+                samples = np.frombuffer(payload, dtype=np.int16).copy()
         except ValueError as e:
             logger.warning(f"Failed to parse payload for {self.band_name}: {e}")
             return
-        
+
         if len(samples) == 0:
             return
-        
+
         self.stats.samples_received += len(samples)
-        
+
         # Initialize on first packet
         if not self._initialized:
             self._initialize(header, samples)
             return
-        
+
         # Check for sequence gaps
         if self._last_sequence is not None:
             expected_seq = (self._last_sequence + 1) & 0xFFFF
             if header.sequence != expected_seq:
                 self._handle_sequence_gap(header, expected_seq)
-        
-        # Add samples to buffer
+
+        # Add samples to ring buffer
         self._add_samples(samples, header)
-        
+
         # Update state
         self._last_sequence = header.sequence
         self._last_timestamp = header.timestamp
-        
-        # Check if minute is complete
-        if self._buffer.is_complete:
-            self._flush_minute()
-    
+
     def _initialize(self, header: RTPHeader, samples: np.ndarray) -> None:
         """Initialize on first packet."""
         self._samples_per_packet = len(samples)
         self._last_sequence = header.sequence
         self._last_timestamp = header.timestamp
         self._initialized = True
-        
-        # Don't add samples until we're synced to minute boundary
-        # We'll start recording at the next minute
+
         logger.info(
             f"{self.band_name}: Initialized, samples/packet={self._samples_per_packet}, "
             f"waiting for minute boundary"
         )
-    
+
     def _handle_sequence_gap(self, header: RTPHeader, expected_seq: int) -> None:
         """Handle a gap in RTP sequence numbers."""
-        # Calculate gap size
         seq_gap = (header.sequence - expected_seq) & 0xFFFF
-        
-        # Handle wrap-around (if gap > 32768, it's probably a backward jump)
+
         if seq_gap > 32768:
             logger.debug(f"{self.band_name}: Sequence backward jump, ignoring")
             return
-        
+
         self.stats.sequence_errors += 1
-        
-        # Calculate samples to fill
+
         if self._samples_per_packet:
             gap_samples = seq_gap * self._samples_per_packet
-            
-            # Cap the gap
+
             if gap_samples > self.max_gap_samples:
                 logger.warning(
                     f"{self.band_name}: Large gap {gap_samples} samples, "
                     f"capping to {self.max_gap_samples}"
                 )
                 gap_samples = self.max_gap_samples
-            
+
             if gap_samples > 0 and self._synced:
                 self.stats.gaps_detected += 1
                 self.stats.gaps_filled_samples += gap_samples
-                
-                # Record gap event
+
                 gap_event = GapEvent(
-                    position_samples=self._buffer.sample_count,
+                    position_samples=self._ring.current_minute_sample_count,
                     duration_samples=gap_samples,
                     rtp_sequence_before=self._last_sequence or 0,
                     rtp_sequence_after=header.sequence,
                     timestamp_utc=datetime.now(timezone.utc).isoformat(),
                 )
-                self._buffer.gaps.append(gap_event)
-                
-                # Fill with zeros
-                self._add_zeros(gap_samples)
-                
+                self._ring.record_gap(gap_event)
+
+                # Fill with zeros, splitting at minute boundaries
+                remaining_zeros = gap_samples
+                while remaining_zeros > 0:
+                    space = self._samples_per_minute - self._ring.current_minute_sample_count
+                    chunk = min(remaining_zeros, space)
+                    self._ring.write_zeros(chunk)
+                    remaining_zeros -= chunk
+                    if self._ring.current_minute_sample_count >= self._samples_per_minute:
+                        self._on_minute_boundary()
+
                 logger.debug(
                     f"{self.band_name}: Gap filled: {gap_samples} samples "
                     f"(seq {expected_seq}->{header.sequence})"
                 )
-    
+
     def _add_samples(self, samples: np.ndarray, header: RTPHeader) -> None:
-        """Add samples to the current buffer."""
+        """Add samples to the ring buffer."""
         if not self._synced:
             now = datetime.now(timezone.utc)
             decision = self.sync_strategy.should_start_minute(
@@ -289,8 +264,8 @@ class BandRecorder:
                 return
 
             self._synced = True
-            self._buffer.start_wallclock = decision.start_wallclock
-            self._buffer.start_rtp_timestamp = decision.start_rtp_timestamp
+            self._first_wallclock = decision.start_wallclock
+            self._first_rtp_timestamp = decision.start_rtp_timestamp
             self.sync_strategy.on_minute_started(
                 decision.start_rtp_timestamp, decision.start_wallclock,
             )
@@ -306,127 +281,118 @@ class BandRecorder:
                 if len(samples) == 0:
                     return
 
-        # Calculate how many samples we can add
-        space_available = self._samples_per_minute - self._buffer.sample_count
-        samples_to_add = min(len(samples), space_available)
+        # Write samples, splitting at minute boundaries
+        remaining = samples
+        while len(remaining) > 0:
+            space = self._samples_per_minute - self._ring.current_minute_sample_count
+            chunk_size = min(len(remaining), space)
+            self._ring.write_samples(remaining[:chunk_size])
+            remaining = remaining[chunk_size:]
+            if self._ring.current_minute_sample_count >= self._samples_per_minute:
+                self._on_minute_boundary()
 
-        if samples_to_add > 0:
-            start_idx = self._buffer.sample_count
-            end_idx = start_idx + samples_to_add
-            self._buffer.samples[start_idx:end_idx] = samples[:samples_to_add]
-            self._buffer.sample_count += samples_to_add
+    def _on_minute_boundary(self) -> None:
+        """Called when samples_per_minute samples have been written."""
+        self._minute_count += 1
 
-        # Carry overflow samples into the next minute buffer
-        if samples_to_add < len(samples):
-            leftover = samples[samples_to_add:]
-            logger.debug(
-                f"{self.band_name}: {len(leftover)} samples overflow to next minute"
-            )
-            # _flush_minute (triggered by is_complete check in on_packet)
-            # will create a fresh buffer; add leftover there afterward.
-            self._pending_overflow = leftover
-    
-    def _add_zeros(self, count: int) -> None:
-        """Add zero samples to fill a gap."""
-        space_available = self._samples_per_minute - self._buffer.sample_count
-        zeros_to_add = min(count, space_available)
-        
-        if zeros_to_add > 0:
-            start_idx = self._buffer.sample_count
-            end_idx = start_idx + zeros_to_add
-            self._buffer.samples[start_idx:end_idx] = 0.0
-            self._buffer.sample_count += zeros_to_add
-    
-    def _flush_minute(self) -> None:
-        """Flush the current minute buffer."""
-        if self._buffer.sample_count == 0:
+        # Compute this minute's wallclock and RTP timestamp via grid propagation
+        minute_wallclock = self._first_wallclock + timedelta(seconds=60 * self._minute_count)
+        minute_rtp = (
+            (self._first_rtp_timestamp + self._minute_count * self._samples_per_minute) & 0xFFFFFFFF
+        )
+
+        # Observe drift
+        actual_wallclock = datetime.now(timezone.utc)
+        drift_obs = self._drift_tracker.observe(minute_wallclock, actual_wallclock)
+
+        # Close the minute in the ring buffer
+        self._ring.close_minute(minute_wallclock, minute_rtp)
+
+        # Check which decode periods complete at this minute
+        abs_minute = int(minute_wallclock.timestamp()) // 60
+        completing = modes_completing_at_minute(abs_minute, self._decode_modes)
+
+        if not completing:
             return
 
-        # Get the completed buffer
-        completed_buffer = self._buffer
+        # Group by period (W2+F2 share 120s → one WAV)
+        periods_to_emit = group_modes_by_period(completing)
 
-        # Create new buffer for next minute
-        self._buffer = self._create_buffer()
+        for period_sec, modes in periods_to_emit.items():
+            num_minutes = period_sec // 60
+            if self._ring.minutes_available < num_minutes:
+                logger.debug(
+                    f"{self.band_name}: {modes[0].value} needs {num_minutes} min "
+                    f"but only {self._ring.minutes_available} available, skipping"
+                )
+                continue
 
-        # Maintain the grid: next minute's timestamps derived from previous
-        if completed_buffer.start_wallclock:
-            self._buffer.start_wallclock = completed_buffer.start_wallclock + timedelta(seconds=60)
-        else:
-            self._buffer.start_wallclock = datetime.now(timezone.utc)
+            samples, gaps, start_wc, start_rtp = self._ring.extract_slice(num_minutes)
+            end_rtp = (start_rtp + len(samples)) & 0xFFFFFFFF
 
-        if completed_buffer.start_rtp_timestamp is not None:
-            self._buffer.start_rtp_timestamp = (
-                (completed_buffer.start_rtp_timestamp + self._samples_per_minute) & 0xFFFFFFFF
+            request = DecodeRequest(
+                frequency_hz=self.frequency_hz,
+                band_name=self.band_name,
+                modes=modes,
+                period_seconds=period_sec,
+                samples=samples,
+                gaps=gaps,
+                start_wallclock=start_wc,
+                start_rtp_timestamp=start_rtp,
+                end_rtp_timestamp=end_rtp,
+                drift_observation=drift_obs,
             )
-
-        # Add any overflow samples from the previous packet
-        overflow = getattr(self, '_pending_overflow', None)
-        if overflow is not None and len(overflow) > 0:
-            end = min(len(overflow), self._samples_per_minute)
-            self._buffer.samples[:end] = overflow[:end]
-            self._buffer.sample_count = end
-            self._pending_overflow = None
-
-        # Trigger callback — hand off the buffer slice directly (no copy needed
-        # since we already allocated a fresh buffer above)
-        if self.on_minute_complete:
-            samples = completed_buffer.samples[:completed_buffer.sample_count]
-            gaps = completed_buffer.gaps
-            start_time = completed_buffer.start_wallclock or datetime.now(timezone.utc)
-            rtp_start = completed_buffer.start_rtp_timestamp
-            rtp_end = rtp_start + len(samples) if rtp_start is not None else None
 
             self.stats.samples_written += len(samples)
-            self.stats.files_written += 1
+            self.stats.periods_emitted += 1
 
             logger.info(
-                f"{self.band_name}: Minute complete, {len(samples)} samples, "
-                f"{len(gaps)} gaps, {completed_buffer.completeness_pct:.1f}% complete"
+                f"{self.band_name}: Period {period_sec}s complete "
+                f"({[m.value for m in modes]}), {len(samples)} samples, "
+                f"{len(gaps)} gaps"
             )
 
-            # Call callback (potentially in thread pool)
-            if self.executor:
-                self.executor.submit(
-                    self.on_minute_complete,
-                    self.frequency_hz,
-                    samples,
-                    gaps,
-                    start_time,
-                    rtp_start,
-                    rtp_end,
-                )
-            else:
-                self.on_minute_complete(
-                    self.frequency_hz,
-                    samples,
-                    gaps,
-                    start_time,
-                    rtp_start,
-                    rtp_end,
-                )
-    
+            if self.on_period_complete:
+                if self.executor:
+                    self.executor.submit(self.on_period_complete, request)
+                else:
+                    self.on_period_complete(request)
+
     def flush(self) -> None:
         """Force flush any remaining samples (for shutdown)."""
-        if self._buffer.sample_count > 0:
-            logger.info(f"{self.band_name}: Flushing partial buffer ({self._buffer.sample_count} samples)")
-            self._flush_minute()
-    
+        if self._ring.current_minute_sample_count > 0:
+            logger.info(
+                f"{self.band_name}: Flushing partial buffer "
+                f"({self._ring.current_minute_sample_count} samples)"
+            )
+
     def get_stats(self) -> dict:
         """Get recorder statistics."""
         stats = self.stats.to_dict()
-        stats["buffer_samples"] = self._buffer.sample_count
-        stats["buffer_gaps"] = len(self._buffer.gaps)
+        stats["ring_buffer"] = self._ring.to_dict()
+        stats["drift"] = self._drift_tracker.to_dict()
         stats["synced"] = self._synced
         stats["sync_strategy"] = self.sync_strategy.__class__.__name__
         stats["sync_tier"] = getattr(self.sync_strategy, 'tier', None)
+        stats["decode_modes"] = [m.value for m in self._decode_modes]
+        stats["minute_count"] = self._minute_count
         return stats
-    
+
     def reset(self) -> None:
         """Reset recorder state."""
         self._last_sequence = None
         self._last_timestamp = None
         self._initialized = False
         self._synced = False
-        self._buffer = self._create_buffer()
-        self._pending_overflow = None
+        self._minute_count = 0
+        self._first_wallclock = None
+        self._first_rtp_timestamp = None
+
+        from .ring_buffer import RingBuffer
+        capacity = max_period_seconds(self._decode_modes)
+        self._ring = RingBuffer(
+            capacity_seconds=capacity,
+            sample_rate=self.sample_rate,
+        )
+        self._drift_tracker = DriftTracker(self.sample_rate)
         self.stats = BandRecorderStats()

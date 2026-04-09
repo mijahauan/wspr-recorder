@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from .decode_mode import VALID_MODE_STRINGS
+
 if sys.version_info >= (3, 11):
     import tomllib
 else:
@@ -137,7 +139,26 @@ class TimingConfig:
     """Timing source configuration."""
     authority: str = "auto"  # "rtp", "fusion", "auto"
 
-@dataclass 
+@dataclass
+class BandConfig:
+    """Per-band configuration with decode modes."""
+    frequency: int  # Hz
+    modes: List[str] = field(default_factory=lambda: ["W2"])
+
+    def validate(self) -> List[str]:
+        errors = []
+        if not self.modes:
+            errors.append(f"Band {self.frequency}: no modes configured")
+        for m in self.modes:
+            if m not in VALID_MODE_STRINGS:
+                errors.append(
+                    f"Band {self.frequency}: invalid mode {m!r}, "
+                    f"must be one of {sorted(VALID_MODE_STRINGS)}"
+                )
+        return errors
+
+
+@dataclass
 class RecorderConfig:
     """General recorder configuration."""
     output_dir: str = "/tmp/wspr-recorder"
@@ -167,7 +188,8 @@ class Config:
     radiod: RadiodConfig = field(default_factory=RadiodConfig)
     channel_defaults: ChannelDefaults = field(default_factory=ChannelDefaults)
     frequencies: List[int] = field(default_factory=list)
-    
+    bands: List[BandConfig] = field(default_factory=list)
+
     def validate(self) -> List[str]:
         """
         Validate configuration.
@@ -208,6 +230,10 @@ class Config:
                 f"must be one of {valid_authorities}"
             )
 
+        # Validate band configs
+        for bc in self.bands:
+            errors.extend(bc.validate())
+
         return errors
     
     def get_band_name(self, freq_hz: int) -> str:
@@ -222,6 +248,13 @@ class Config:
         """Get output directory for a specific band."""
         band_name = self.get_band_name(freq_hz)
         return self.get_output_path() / band_name
+
+    def get_band_config(self, freq_hz: int) -> BandConfig:
+        """Get BandConfig for a frequency. Returns default (W2 only) if not found."""
+        for bc in self.bands:
+            if bc.frequency == freq_hz:
+                return bc
+        return BandConfig(frequency=freq_hz)
 
 
 def load_config(config_path: str) -> Config:
@@ -287,21 +320,33 @@ def load_config(config_path: str) -> Config:
             high=ch.get("high", config.channel_defaults.high),
         )
     
-    # Parse frequencies
-    if "frequencies" in data:
+    # Parse band configurations — new [[band]] format takes precedence
+    if "band" in data:
+        for band_entry in data["band"]:
+            try:
+                freq_hz = parse_frequency(str(band_entry["frequency"]))
+                modes = band_entry.get("modes", ["W2"])
+                config.bands.append(BandConfig(frequency=freq_hz, modes=modes))
+                config.frequencies.append(freq_hz)
+            except (ValueError, KeyError) as e:
+                logger.warning(f"Skipping invalid band entry: {e}")
+
+    # Fall back to old [frequencies] format if no [[band]] sections
+    if not config.bands and "frequencies" in data:
         freq_data = data["frequencies"]
         if "bands" in freq_data:
             for freq_str in freq_data["bands"]:
                 try:
                     freq_hz = parse_frequency(str(freq_str))
                     config.frequencies.append(freq_hz)
+                    config.bands.append(BandConfig(frequency=freq_hz))
                 except ValueError as e:
                     logger.warning(f"Skipping invalid frequency: {e}")
-    
+
     # Validate
     errors = config.validate()
     if errors:
         raise ValueError(f"Configuration errors: {'; '.join(errors)}")
-    
-    logger.info(f"Loaded config with {len(config.frequencies)} frequencies")
+
+    logger.info(f"Loaded config with {len(config.frequencies)} frequencies, {len(config.bands)} bands")
     return config

@@ -87,27 +87,91 @@ gain = 0.0
 low = 1300
 high = 1700
 
-[frequencies]
-# WSPR frequencies in Hz
-# Supports formats:
-#   - Plain Hz: "14095600"
-#   - MHz notation: "14m095600"
-#   - kHz notation: "474k200"
-bands = [
-    "136000",      # 2200m
-    "474200",      # 630m
-    "1836600",     # 160m
-    "3568600",     # 80m
-    "3592600",     # 80m EU
-    "5287200",     # 60m
-    "5364700",     # 60m EU
-    "7038600",     # 40m
-    "10138700",    # 30m
-    "13553900",    # 22m
-    "14095600",    # 20m
-    "18104600",    # 17m
-    "21094600",    # 15m
-    "24924600",    # 12m
-    "28124600",    # 10m
-    "50293000",    # 6m
-]
+# --------------------------------------------------------------------------
+# Band configuration (v4 format)
+#
+# Each [[band]] section defines a frequency and its decode modes.
+# Available modes: W2 (WSPR-2), F2 (FST4W-120), F5 (FST4W-300),
+#                  F15 (FST4W-900), F30 (FST4W-1800)
+#
+# W2 and F2 share the same 2-minute window (one WAV serves both decoders).
+# Longer FST4W modes require more memory per band (up to ~43 MB for F30).
+#
+# Memory per band: W2/F2 only = ~274 KB, F5 = ~720 KB,
+#                  F15 = ~2.2 MB, F30 = ~43 MB
+# --------------------------------------------------------------------------
+
+[[band]]
+frequency = "136000"       # 2200m
+modes = ["W2", "F2", "F5", "F15", "F30"]
+
+[[band]]
+frequency = "474200"       # 630m
+modes = ["W2", "F2", "F5", "F15", "F30"]
+
+[[band]]
+frequency = "1836600"      # 160m
+modes = ["W2", "F2", "F5"]
+
+[[band]]
+frequency = "3568600"      # 80m
+modes = ["W2", "F2", "F5"]
+
+[[band]]
+frequency = "3592600"      # 80m EU
+modes = ["W2", "F2", "F5"]
+
+[[band]]
+frequency = "5287200"      # 60m
+modes = ["W2", "F2", "F5"]
+
+[[band]]
+frequency = "5364700"      # 60m EU
+modes = ["W2", "F2", "F5"]
+
+[[band]]
+frequency = "7038600"      # 40m
+modes = ["W2", "F2"]
+
+[[band]]
+frequency = "10138700"     # 30m
+modes = ["W2", "F2"]
+
+[[band]]
+frequency = "13553900"     # 22m
+modes = ["W2"]
+
+[[band]]
+frequency = "14095600"     # 20m
+modes = ["W2", "F2"]
+
+[[band]]
+frequency = "18104600"     # 17m
+modes = ["W2"]
+
+[[band]]
+frequency = "21094600"     # 15m
+modes = ["W2"]
+
+[[band]]
+frequency = "24924600"     # 12m
+modes = ["W2"]
+
+[[band]]
+frequency = "28124600"     # 10m
+modes = ["W2"]
+
+[[band]]
+frequency = "50293000"     # 6m
+modes = ["W2"]
+
+# --------------------------------------------------------------------------
+# Legacy format (backward compatible, used if no [[band]] sections above)
+# All bands default to W2 (WSPR-2) only.
+# --------------------------------------------------------------------------
+# [frequencies]
+# bands = [
+#     "136000",      # 2200m
+#     "474200",      # 630m
+#     "14095600",    # 20m
+# ]

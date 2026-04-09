@@ -22,10 +22,11 @@ import numpy as np
 from .config import Config, load_config, freq_to_band_name
 from .receiver_manager import ReceiverManager, ChannelState
 from .rtp_ingest import RTPIngest
-from .band_recorder import BandRecorder, GapEvent
+from .band_recorder import BandRecorder, GapEvent, DecodeRequest
 from .wav_writer import WavWriter
 from .timing_service import TimingService
 from .ipc_server import IPCServer
+from .decode_mode import DecodeMode
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,10 @@ class WsprRecorder:
         """
         logger.info(f"Channel ready: SSRC {ssrc} -> {channel_state.band_name}")
         
+        # Look up per-band decode modes from config
+        band_config = self.config.get_band_config(channel_state.frequency_hz)
+        decode_modes = [DecodeMode(m) for m in band_config.modes]
+
         # Create band recorder with timing-aware sync strategy
         sync_strategy = self.timing_service.create_sync_strategy(
             sample_rate=self.config.channel_defaults.sample_rate,
@@ -89,7 +94,8 @@ class WsprRecorder:
             frequency_hz=channel_state.frequency_hz,
             band_name=channel_state.band_name,
             sample_rate=self.config.channel_defaults.sample_rate,
-            on_minute_complete=self._on_minute_complete,
+            decode_modes=decode_modes,
+            on_period_complete=self._on_period_complete,
             executor=self.executor,
             sync_strategy=sync_strategy,
         )
@@ -112,29 +118,16 @@ class WsprRecorder:
             recorder.on_packet(ssrc_arg, header, payload)
         return handler
     
-    def _on_minute_complete(
-        self,
-        frequency_hz: int,
-        samples: np.ndarray,
-        gaps: List[GapEvent],
-        start_time: datetime,
-        rtp_timestamp_start: Optional[int] = None,
-        rtp_timestamp_end: Optional[int] = None,
-    ) -> None:
+    def _on_period_complete(self, request: DecodeRequest) -> None:
         """
-        Called when a minute of samples is complete.
-        
-        Writes WAV file (runs in thread pool).
+        Called when a decode period completes.
+
+        Writes period-length WAV file (runs in thread pool via BandRecorder).
         """
         if self.wav_writer:
-            self.wav_writer.write_minute(
-                frequency_hz, 
-                samples, 
-                gaps, 
-                start_time,
+            self.wav_writer.write_period(
+                request,
                 max_files_per_band=self.config.recorder.max_files_per_band,
-                rtp_timestamp_start=rtp_timestamp_start,
-                rtp_timestamp_end=rtp_timestamp_end,
             )
     
     async def _cleanup_loop(self) -> None:
@@ -256,9 +249,11 @@ class WsprRecorder:
                 "frequency_hz": recorder.frequency_hz,
                 "ssrc": ssrc,
                 "synced": recorder._synced,
-                "buffer_samples": recorder._buffer.sample_count,
+                "ring_minutes": recorder._ring.minutes_available,
+                "current_minute_samples": recorder._ring.current_minute_sample_count,
                 "packets_received": recorder.stats.packets_received,
-                "files_written": recorder.stats.files_written,
+                "periods_emitted": recorder.stats.periods_emitted,
+                "decode_modes": [m.value for m in recorder._decode_modes],
             }
         return {"bands": bands, "count": len(bands)}
     

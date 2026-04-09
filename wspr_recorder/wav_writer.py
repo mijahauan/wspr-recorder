@@ -15,7 +15,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from .band_recorder import GapEvent
+from .band_recorder import GapEvent, DecodeRequest
 from .config import freq_to_band_name
 
 logger = logging.getLogger(__name__)
@@ -76,6 +76,19 @@ def generate_wav_filename(frequency_hz: int, timestamp: datetime) -> str:
     time_str = timestamp.strftime("%Y%m%dT%H%M00Z")
     
     return f"{time_str}_{frequency_hz}_usb.wav"
+
+
+def generate_period_wav_filename(
+    frequency_hz: int, timestamp: datetime, period_seconds: int
+) -> str:
+    """
+    Generate WAV filename with period suffix.
+
+    Format: YYYYMMDDTHHMMSSz_freq_usb_Ps.wav
+    Example: 20260408T023000Z_14095600_usb_120.wav
+    """
+    time_str = timestamp.strftime("%Y%m%dT%H%M00Z")
+    return f"{time_str}_{frequency_hz}_usb_{period_seconds}.wav"
 
 
 def samples_to_int16(samples: np.ndarray) -> np.ndarray:
@@ -258,6 +271,119 @@ class WavWriter:
                     pass
             return None
     
+    def write_period(
+        self,
+        request: DecodeRequest,
+        max_files_per_band: int = 35,
+    ) -> Optional[Path]:
+        """
+        Write a period-length WAV file from a DecodeRequest.
+
+        Samples arrive as int16 from the ring buffer — written directly,
+        no format conversion. JSON sidecar includes drift observation,
+        decode modes, and period length.
+
+        Args:
+            request: DecodeRequest with int16 samples and metadata
+            max_files_per_band: Max files to keep per band directory
+
+        Returns:
+            Path to written WAV file, or None on error
+        """
+        try:
+            self.make_room_for_file(request.frequency_hz, max_files_per_band)
+
+            band_dir = self.get_band_dir(request.frequency_hz)
+            filename = generate_period_wav_filename(
+                request.frequency_hz, request.start_wallclock, request.period_seconds,
+            )
+            wav_path = band_dir / filename
+            tmp_path = band_dir / f".{filename}.tmp"
+            json_path = band_dir / f"{filename[:-4]}.json"
+
+            # Samples are already int16 from ring buffer
+            with wave.open(str(tmp_path), 'wb') as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(self.sample_rate)
+                wav.writeframes(request.samples.tobytes())
+
+            tmp_path.rename(wav_path)
+
+            # Build metadata
+            from datetime import timedelta
+            total_gaps_filled = sum(g.duration_samples for g in request.gaps)
+            n_samples = len(request.samples)
+            actual_samples = n_samples - total_gaps_filled
+            completeness_pct = (actual_samples / n_samples * 100.0) if n_samples > 0 else 0.0
+            end_time = request.start_wallclock + timedelta(seconds=request.period_seconds)
+
+            # Get timing metadata if available
+            timing_dict: Optional[dict] = None
+            if self.timing_service:
+                try:
+                    timing_metadata = self.timing_service.get_timing_metadata(
+                        wallclock_start=request.start_wallclock,
+                        wallclock_end=end_time,
+                        rtp_timestamp_start=request.start_rtp_timestamp,
+                        rtp_timestamp_end=request.end_rtp_timestamp,
+                        sample_rate=self.sample_rate,
+                    )
+                    timing_dict = timing_metadata.to_dict()
+                except Exception as e:
+                    logger.warning(f"Failed to get timing metadata: {e}")
+
+            sidecar = {
+                "filename": filename,
+                "frequency_hz": request.frequency_hz,
+                "band_name": request.band_name,
+                "sample_rate": self.sample_rate,
+                "samples": n_samples,
+                "sample_format": "int16",
+                "period_seconds": request.period_seconds,
+                "decode_modes": [m.value for m in request.modes],
+                "start_rtp_timestamp": request.start_rtp_timestamp,
+                "end_rtp_timestamp": request.end_rtp_timestamp,
+                "wallclock_start": request.start_wallclock.isoformat(),
+                "wallclock_end": end_time.isoformat(),
+                "gaps": [
+                    {
+                        "position": g.position_samples,
+                        "duration": g.duration_samples,
+                        "rtp_seq_before": g.rtp_sequence_before,
+                        "rtp_seq_after": g.rtp_sequence_after,
+                        "timestamp": g.timestamp_utc,
+                    }
+                    for g in request.gaps
+                ],
+                "total_gaps_filled": total_gaps_filled,
+                "completeness_pct": round(completeness_pct, 2),
+            }
+
+            if request.drift_observation:
+                sidecar["drift"] = request.drift_observation.to_dict()
+
+            if timing_dict:
+                sidecar["timing"] = timing_dict
+
+            with open(json_path, 'w') as f:
+                json.dump(sidecar, f, indent=2)
+
+            logger.info(
+                f"Wrote {wav_path.name} ({n_samples} samples, "
+                f"{request.period_seconds}s, {completeness_pct:.1f}% complete)"
+            )
+            return wav_path
+
+        except Exception as e:
+            logger.error(f"Failed to write period WAV file: {e}")
+            if 'tmp_path' in locals() and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+            return None
+
     def _write_wav(self, path: Path, samples: np.ndarray, sample_width: int) -> None:
         """
         Write samples to WAV file.
