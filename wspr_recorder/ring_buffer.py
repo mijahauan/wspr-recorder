@@ -9,7 +9,7 @@ configured decode period (2, 5, 15, or 30 minutes).
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -196,10 +196,14 @@ class RingBuffer:
                 )
                 merged_gaps.append(rebased)
 
+        # MinuteMark.wallclock is the END of that minute (first_wallclock + N*60s).
+        # The slice starts one minute earlier than start_mark's boundary.
+        start_wallclock = start_mark.wallclock - timedelta(seconds=60)
+
         return (
             samples,
             merged_gaps,
-            start_mark.wallclock,
+            start_wallclock,
             start_mark.rtp_timestamp,
         )
 

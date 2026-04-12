@@ -289,6 +289,7 @@ def load_config(config_path: str) -> Config:
             max_file_age_minutes=rec.get("max_file_age_minutes", config.recorder.max_file_age_minutes),
             max_files_per_band=rec.get("max_files_per_band", config.recorder.max_files_per_band),
             status_file=rec.get("status_file", config.recorder.status_file),
+            ipc_socket=rec.get("ipc_socket", config.recorder.ipc_socket),
         )
     
     # Parse radiod section
