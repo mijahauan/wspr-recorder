@@ -2,8 +2,8 @@
 Band Recorder for wspr-recorder.
 
 Per-band recording logic:
-- Receives int16 samples from RTP packets
-- Resequences and fills gaps
+- Receives float32 samples from ka9q-python ManagedStream callback
+- Converts to int16 for the ring buffer (wsprd/jt9 require int16 PCM)
 - Buffers samples in a ring buffer
 - At minute boundaries, checks decode schedules and emits DecodeRequests
 """
@@ -15,7 +15,6 @@ from typing import Optional, Callable, List
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
-from .rtp_ingest import RTPHeader
 from .sync_strategy import SyncStrategy, FallbackSyncStrategy
 from .decode_mode import (
     DecodeMode, DECODE_MODE_PERIODS,
@@ -88,9 +87,9 @@ class BandRecorder:
     Records samples for a single WSPR band.
 
     Responsibilities:
-    - Parse int16 samples from RTP payload
-    - Track RTP sequence numbers and detect gaps
-    - Fill gaps with zeros
+    - Receive float32 samples from ka9q-python ManagedStream callback
+    - Convert float32 → int16 (wsprd/jt9 require int16 PCM)
+    - Track gaps from StreamQuality metadata
     - Buffer samples in a ring buffer
     - At minute boundaries, emit DecodeRequests for completed periods
     """
@@ -120,18 +119,12 @@ class BandRecorder:
         self._decode_modes = decode_modes or [DecodeMode.W2]
         self.stats = BandRecorderStats()
 
-        # RTP state tracking
-        self._last_sequence: Optional[int] = None
-        self._last_timestamp: Optional[int] = None
         self._initialized = False
         self._synced = False
 
         # Cached constants
         self._samples_per_minute = self.sample_rate * 60
         self.max_gap_samples = self.sample_rate * 2
-
-        # Samples per packet (calculated from first packet)
-        self._samples_per_packet: Optional[int] = None
 
         # Ring buffer (lazy import to avoid circular dependency)
         from .ring_buffer import RingBuffer
@@ -149,116 +142,63 @@ class BandRecorder:
         self._first_wallclock: Optional[datetime] = None
         self._first_rtp_timestamp: Optional[int] = None
 
-    def on_packet(self, ssrc: int, header: RTPHeader, payload: bytes) -> None:
-        """Process an RTP packet."""
-        if ssrc != self.ssrc:
+    def on_samples(self, samples: np.ndarray, quality) -> None:
+        """Process samples from ka9q-python ManagedStream callback.
+
+        Args:
+            samples: float32 audio samples (decoded from S16BE by ka9q-python)
+            quality: StreamQuality with RTP timestamps, gap info, etc.
+        """
+        n = len(samples)
+        if n == 0:
             return
 
-        self.stats.packets_received += 1
+        self.stats.samples_received += n
 
-        # Parse samples as int16 natively
-        try:
-            payload_type = header.payload_type
-            if payload_type in (98, 120, 122):
-                samples = np.frombuffer(payload, dtype=np.int16).copy()
-            elif payload_type == 11:
-                f32 = np.frombuffer(payload, dtype='<f4')
-                samples = (np.clip(f32, -1.0, 1.0) * 32767).astype(np.int16)
-            else:
-                samples = np.frombuffer(payload, dtype=np.int16).copy()
-        except ValueError as e:
-            logger.warning(f"Failed to parse payload for {self.band_name}: {e}")
-            return
+        # Convert float32 → int16 for the ring buffer
+        int16_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
 
-        if len(samples) == 0:
-            return
+        # Compute the RTP timestamp for this batch
+        batch_rtp_ts = (
+            quality.first_rtp_timestamp
+            + quality.total_samples_delivered
+            - n
+        ) & 0xFFFFFFFF
 
-        self.stats.samples_received += len(samples)
-
-        # Initialize on first packet
-        if not self._initialized:
-            self._initialize(header, samples)
-            return
-
-        # Check for sequence gaps
-        if self._last_sequence is not None:
-            expected_seq = (self._last_sequence + 1) & 0xFFFF
-            if header.sequence != expected_seq:
-                self._handle_sequence_gap(header, expected_seq)
-
-        # Add samples to ring buffer
-        self._add_samples(samples, header)
-
-        # Update state
-        self._last_sequence = header.sequence
-        self._last_timestamp = header.timestamp
-
-    def _initialize(self, header: RTPHeader, samples: np.ndarray) -> None:
-        """Initialize on first packet."""
-        self._samples_per_packet = len(samples)
-        self._last_sequence = header.sequence
-        self._last_timestamp = header.timestamp
-        self._initialized = True
-
-        logger.info(
-            f"{self.band_name}: Initialized, samples/packet={self._samples_per_packet}, "
-            f"waiting for minute boundary"
-        )
-
-    def _handle_sequence_gap(self, header: RTPHeader, expected_seq: int) -> None:
-        """Handle a gap in RTP sequence numbers."""
-        seq_gap = (header.sequence - expected_seq) & 0xFFFF
-
-        if seq_gap > 32768:
-            logger.debug(f"{self.band_name}: Sequence backward jump, ignoring")
-            return
-
-        self.stats.sequence_errors += 1
-
-        if self._samples_per_packet:
-            gap_samples = seq_gap * self._samples_per_packet
-
-            if gap_samples > self.max_gap_samples:
-                logger.warning(
-                    f"{self.band_name}: Large gap {gap_samples} samples, "
-                    f"capping to {self.max_gap_samples}"
-                )
-                gap_samples = self.max_gap_samples
-
-            if gap_samples > 0 and self._synced:
+        # Track gaps from ka9q-python's resequencer
+        if hasattr(quality, 'batch_gaps') and quality.batch_gaps:
+            for gap in quality.batch_gaps:
+                gap_samples = gap.duration_samples
+                if gap_samples > self.max_gap_samples:
+                    gap_samples = self.max_gap_samples
                 self.stats.gaps_detected += 1
                 self.stats.gaps_filled_samples += gap_samples
-
                 gap_event = GapEvent(
                     position_samples=self._ring.current_minute_sample_count,
                     duration_samples=gap_samples,
-                    rtp_sequence_before=self._last_sequence or 0,
-                    rtp_sequence_after=header.sequence,
+                    rtp_sequence_before=0,
+                    rtp_sequence_after=0,
                     timestamp_utc=datetime.now(timezone.utc).isoformat(),
                 )
                 self._ring.record_gap(gap_event)
 
-                # Fill with zeros, splitting at minute boundaries
-                remaining_zeros = gap_samples
-                while remaining_zeros > 0:
-                    space = self._samples_per_minute - self._ring.current_minute_sample_count
-                    chunk = min(remaining_zeros, space)
-                    self._ring.write_zeros(chunk)
-                    remaining_zeros -= chunk
-                    if self._ring.current_minute_sample_count >= self._samples_per_minute:
-                        self._on_minute_boundary()
+        # Initialize on first batch
+        if not self._initialized:
+            self._initialized = True
+            logger.info(
+                f"{self.band_name}: Initialized via ManagedStream, "
+                f"first batch n={n}, waiting for minute boundary"
+            )
 
-                logger.debug(
-                    f"{self.band_name}: Gap filled: {gap_samples} samples "
-                    f"(seq {expected_seq}->{header.sequence})"
-                )
+        # Add samples to ring buffer
+        self._add_samples(int16_samples, batch_rtp_ts)
 
-    def _add_samples(self, samples: np.ndarray, header: RTPHeader) -> None:
-        """Add samples to the ring buffer."""
+    def _add_samples(self, samples: np.ndarray, rtp_timestamp: int) -> None:
+        """Add int16 samples to the ring buffer."""
         if not self._synced:
             now = datetime.now(timezone.utc)
             decision = self.sync_strategy.should_start_minute(
-                header.timestamp, len(samples), now,
+                rtp_timestamp, len(samples), now,
             )
             if decision is None:
                 return
@@ -380,8 +320,6 @@ class BandRecorder:
 
     def reset(self) -> None:
         """Reset recorder state."""
-        self._last_sequence = None
-        self._last_timestamp = None
         self._initialized = False
         self._synced = False
         self._minute_count = 0

@@ -1,54 +1,65 @@
-"""Integration tests for BandRecorder with ring buffer and multi-period callbacks."""
+"""Integration tests for BandRecorder with ring buffer and multi-period callbacks.
+
+Tests use BandRecorder.on_samples() with float32 samples and a mock
+StreamQuality, matching the ka9q-python ManagedStream callback interface.
+"""
 
 import numpy as np
-from collections import namedtuple
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import List
 from unittest.mock import MagicMock
 
 from wspr_recorder.band_recorder import BandRecorder, DecodeRequest, GapEvent
 from wspr_recorder.decode_mode import DecodeMode
 from wspr_recorder.sync_strategy import SyncDecision
 
-# Minimal RTPHeader for testing
-RTPHeader = namedtuple("RTPHeader", [
-    "version", "padding", "extension", "csrc_count",
-    "marker", "payload_type", "sequence", "timestamp", "ssrc",
-])
+
+@dataclass
+class MockGapEvent:
+    duration_samples: int = 0
 
 
-def make_header(seq: int, ts: int, ssrc: int = 1, pt: int = 98) -> RTPHeader:
-    return RTPHeader(
-        version=2, padding=False, extension=False, csrc_count=0,
-        marker=False, payload_type=pt, sequence=seq & 0xFFFF,
-        timestamp=ts & 0xFFFFFFFF, ssrc=ssrc,
-    )
+@dataclass
+class MockQuality:
+    """Minimal mock for ka9q StreamQuality."""
+    first_rtp_timestamp: int = 0
+    total_samples_delivered: int = 0
+    batch_gaps: List[MockGapEvent] = field(default_factory=list)
 
 
-def make_payload(n_samples: int, value: int = 100) -> bytes:
-    """Create int16 payload bytes."""
-    return np.full(n_samples, value, dtype=np.int16).tobytes()
+def make_float32_samples(n_samples: int, value: float = 0.01) -> np.ndarray:
+    """Create float32 samples as ManagedStream delivers."""
+    return np.full(n_samples, value, dtype=np.float32)
 
 
-def send_init_packet(rec, ssrc=1, packet_size=240, seq=0, ts=0):
-    """Send one initialization packet (consumed by _initialize, no samples added)."""
-    rec.on_packet(ssrc, make_header(seq, ts, ssrc=ssrc), make_payload(packet_size))
-    return seq + 1, ts + packet_size
+def send_samples(rec, samples, quality):
+    """Feed samples to the recorder via on_samples."""
+    rec.on_samples(samples, quality)
 
 
 def feed_minutes(rec, n_minutes, sample_rate, packet_size=240,
-                 ssrc=1, seq=0, ts=0, value=100):
-    """Feed exactly n_minutes of samples in packet-sized chunks."""
+                 first_rtp=0, total_delivered_start=0, value=0.01):
+    """Feed exactly n_minutes of samples in packet-sized chunks.
+
+    Returns (total_samples_fed, last_rtp_ts) for continuation.
+    """
     spm = sample_rate * 60
+    total_delivered = total_delivered_start
+
     for _ in range(n_minutes):
         fed = 0
         while fed < spm:
             chunk = min(packet_size, spm - fed)
-            rec.on_packet(ssrc, make_header(seq, ts, ssrc=ssrc),
-                          make_payload(chunk, value=value))
-            seq += 1
-            ts += chunk
+            samples = make_float32_samples(chunk, value=value)
+            total_delivered += chunk
+            quality = MockQuality(
+                first_rtp_timestamp=first_rtp,
+                total_samples_delivered=total_delivered,
+            )
+            rec.on_samples(samples, quality)
             fed += chunk
-    return seq, ts
+    return total_delivered
 
 
 class FakeSync:
@@ -80,7 +91,6 @@ class TestBasicMinuteBoundary:
     def test_w2_fires_at_even_minute(self):
         """W2 fires when ring has 2 minutes and minute boundary is even."""
         results = []
-        # Start at even-minute boundary: 00:02:00 UTC
         start_wc = datetime(2026, 4, 8, 0, 2, 0, tzinfo=timezone.utc)
         rate = 1200
         sync = FakeSync(sample_rate=rate, minute_wallclock=start_wc)
@@ -92,10 +102,7 @@ class TestBasicMinuteBoundary:
             sync_strategy=sync,
         )
 
-        # First packet consumed by _initialize (no samples added)
-        seq, ts = send_init_packet(rec, packet_size=240)
-        # Feed 2 full minutes
-        seq, ts = feed_minutes(rec, 2, rate, seq=seq, ts=ts, value=42)
+        total = feed_minutes(rec, 2, rate)
 
         w2 = [r for r in results if DecodeMode.W2 in r.modes]
         assert len(w2) >= 1
@@ -104,8 +111,8 @@ class TestBasicMinuteBoundary:
         assert req.samples.dtype == np.int16
         assert len(req.samples) == 2 * rate * 60
 
-    def test_int16_passthrough_pt98(self):
-        """PT=98 int16 payload passes through without float32 roundtrip."""
+    def test_float32_to_int16_conversion(self):
+        """Float32 samples from ManagedStream are converted to int16."""
         results = []
         rate = 1200
         sync = FakeSync(sample_rate=rate)
@@ -116,59 +123,46 @@ class TestBasicMinuteBoundary:
             sync_strategy=sync,
         )
 
-        seq, ts = send_init_packet(rec)
-        spm = rate * 60
-
-        # Feed 2 minutes with distinctive values
-        for minute_val in [1000, 2000]:
-            fed = 0
-            while fed < spm:
-                chunk = min(240, spm - fed)
-                payload = np.full(chunk, minute_val, dtype=np.int16).tobytes()
-                rec.on_packet(1, make_header(seq, ts), payload)
-                seq += 1
-                ts += chunk
-                fed += chunk
+        # Feed 2 minutes of float32 samples with value 0.5
+        total = feed_minutes(rec, 2, rate, value=0.5)
 
         assert len(results) >= 1
         samples = results[0].samples
         assert samples.dtype == np.int16
-        assert samples[0] == 1000
-        assert samples[-1] == 2000
-
-    def test_float32_converted_to_int16(self):
-        """PT=11 float32 payload is converted to int16."""
-        results = []
-        rate = 1200
-        sync = FakeSync(sample_rate=rate)
-        rec = BandRecorder(
-            ssrc=1, frequency_hz=14095600, band_name="20",
-            sample_rate=rate, decode_modes=[DecodeMode.W2],
-            on_period_complete=lambda r: results.append(r),
-            sync_strategy=sync,
-        )
-
-        # Init with float32 packet
-        f32_init = np.full(240, 0.5, dtype=np.float32).tobytes()
-        rec.on_packet(1, make_header(0, 0, pt=11), f32_init)
-        seq, ts = 1, 240
-
-        spm = rate * 60
-        for _ in range(2):
-            fed = 0
-            while fed < spm:
-                chunk = min(240, spm - fed)
-                f32 = np.full(chunk, 0.5, dtype=np.float32)
-                payload = f32.tobytes()
-                rec.on_packet(1, make_header(seq, ts, pt=11), payload)
-                seq += 1
-                ts += chunk
-                fed += chunk
-
-        assert len(results) >= 1
-        samples = results[0].samples
-        assert samples.dtype == np.int16
+        # 0.5 * 32767 ≈ 16383
         assert abs(int(samples[0]) - 16383) <= 1
+
+    def test_distinctive_values_per_minute(self):
+        """Verify samples from different minutes are preserved correctly."""
+        results = []
+        rate = 1200
+        sync = FakeSync(sample_rate=rate)
+        rec = BandRecorder(
+            ssrc=1, frequency_hz=14095600, band_name="20",
+            sample_rate=rate, decode_modes=[DecodeMode.W2],
+            on_period_complete=lambda r: results.append(r),
+            sync_strategy=sync,
+        )
+
+        spm = rate * 60
+        total_delivered = 0
+        for val in [0.03, 0.06]:
+            fed = 0
+            while fed < spm:
+                chunk = min(240, spm - fed)
+                samples = make_float32_samples(chunk, value=val)
+                total_delivered += chunk
+                q = MockQuality(first_rtp_timestamp=0, total_samples_delivered=total_delivered)
+                rec.on_samples(samples, q)
+                fed += chunk
+
+        assert len(results) >= 1
+        out = results[0].samples
+        assert out.dtype == np.int16
+        # First minute's value: 0.03 * 32767 ≈ 983
+        assert abs(int(out[0]) - 983) <= 1
+        # Last minute's value: 0.06 * 32767 ≈ 1966
+        assert abs(int(out[-1]) - 1966) <= 1
 
 
 class TestMultiPeriodCallbacks:
@@ -187,16 +181,12 @@ class TestMultiPeriodCallbacks:
             sync_strategy=sync,
         )
 
-        seq, ts = send_init_packet(rec, packet_size=120)
-        seq, ts = feed_minutes(rec, 5, rate, packet_size=120, seq=seq, ts=ts)
+        feed_minutes(rec, 5, rate, packet_size=120)
 
         w2_hits = [r for r in results if DecodeMode.W2 in r.modes]
         f5_hits = [r for r in results if DecodeMode.F5 in r.modes]
 
-        # W2 should fire at even-minute boundaries (at least twice in 5 minutes)
         assert len(w2_hits) >= 2
-
-        # F5 should fire at minute 5
         assert len(f5_hits) >= 1
         assert f5_hits[0].period_seconds == 300
         assert len(f5_hits[0].samples) == 5 * rate * 60
@@ -216,15 +206,14 @@ class TestMultiPeriodCallbacks:
             sync_strategy=sync,
         )
 
-        seq, ts = send_init_packet(rec, packet_size=20)
-
         # Feed 29 minutes — F30 should not fire
-        seq, ts = feed_minutes(rec, 29, rate, packet_size=20, seq=seq, ts=ts)
+        total = feed_minutes(rec, 29, rate, packet_size=20)
         f30_hits = [r for r in results if DecodeMode.F30 in r.modes]
         assert len(f30_hits) == 0
 
         # Feed minute 30 — now F30 fires
-        seq, ts = feed_minutes(rec, 1, rate, packet_size=20, seq=seq, ts=ts)
+        feed_minutes(rec, 1, rate, packet_size=20,
+                     total_delivered_start=total)
         f30_hits = [r for r in results if DecodeMode.F30 in r.modes]
         assert len(f30_hits) == 1
         assert f30_hits[0].period_seconds == 1800
@@ -232,8 +221,8 @@ class TestMultiPeriodCallbacks:
 
 
 class TestGapInRing:
-    def test_sequence_gap_recorded(self):
-        """Simulate a sequence gap and verify it appears in decode request."""
+    def test_gap_from_quality_recorded(self):
+        """Gaps reported in StreamQuality.batch_gaps appear in decode request."""
         results = []
         start_wc = datetime(2026, 4, 8, 0, 0, 0, tzinfo=timezone.utc)
         rate = 1200
@@ -247,22 +236,28 @@ class TestGapInRing:
         )
 
         spm = rate * 60
-        packet_size = 240
-        seq, ts = send_init_packet(rec, packet_size=packet_size)
+        total_delivered = 0
 
         # Feed first minute normally
-        seq, ts = feed_minutes(rec, 1, rate, packet_size=packet_size, seq=seq, ts=ts)
+        total_delivered = feed_minutes(rec, 1, rate,
+                                       total_delivered_start=total_delivered)
 
-        # Feed second minute with a gap at the start: skip 2 packets
-        seq += 2
-        ts += 2 * packet_size
-        fed = 2 * packet_size  # gap samples
+        # Feed second minute with a gap in the first batch
+        fed = 0
+        first_batch = True
         while fed < spm:
-            chunk = min(packet_size, spm - fed)
-            rec.on_packet(1, make_header(seq, ts), make_payload(chunk))
-            seq += 1
-            ts += chunk
+            chunk = min(240, spm - fed)
+            samples = make_float32_samples(chunk)
+            total_delivered += chunk
+            gaps = [MockGapEvent(duration_samples=480)] if first_batch else []
+            quality = MockQuality(
+                first_rtp_timestamp=0,
+                total_samples_delivered=total_delivered,
+                batch_gaps=gaps,
+            )
+            rec.on_samples(samples, quality)
             fed += chunk
+            first_batch = False
 
         w2 = [r for r in results if DecodeMode.W2 in r.modes]
         assert len(w2) >= 1
@@ -285,8 +280,7 @@ class TestDriftObservation:
             sync_strategy=sync,
         )
 
-        seq, ts = send_init_packet(rec)
-        seq, ts = feed_minutes(rec, 2, rate, seq=seq, ts=ts)
+        feed_minutes(rec, 2, rate)
 
         w2 = [r for r in results if DecodeMode.W2 in r.modes]
         assert len(w2) >= 1

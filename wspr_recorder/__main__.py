@@ -21,7 +21,6 @@ import numpy as np
 
 from .config import Config, load_config, freq_to_band_name
 from .receiver_manager import ReceiverManager, ChannelState
-from .rtp_ingest import RTPIngest
 from .band_recorder import BandRecorder, GapEvent, DecodeRequest
 from .wav_writer import WavWriter
 from .timing_service import TimingService
@@ -34,11 +33,10 @@ logger = logging.getLogger(__name__)
 class WsprRecorder:
     """
     Main WSPR recorder application.
-    
+
     Coordinates:
-    - ReceiverManager: radiod channel lifecycle
-    - RTPIngest: asyncio packet reception
-    - BandRecorder: per-band sample buffering
+    - ReceiverManager: radiod channel lifecycle via ka9q-python ManagedStream
+    - BandRecorder: per-band sample buffering + decode scheduling
     - WavWriter: file output
     """
     
@@ -58,7 +56,6 @@ class WsprRecorder:
         
         # Components
         self.receiver_manager: Optional[ReceiverManager] = None
-        self.rtp_ingest: Optional[RTPIngest] = None
         self.wav_writer: Optional[WavWriter] = None
         self.timing_service: Optional[TimingService] = None
         self.ipc_server: Optional[IPCServer] = None
@@ -75,12 +72,12 @@ class WsprRecorder:
     def _on_channel_ready(self, ssrc: int, channel_state: ChannelState) -> None:
         """
         Called when a channel is ready in radiod.
-        
-        Creates BandRecorder. Registration with RTP ingest happens later
-        after we discover the multicast address.
+
+        Creates BandRecorder and wires its on_samples callback into
+        the channel's ManagedStream via ReceiverManager.
         """
         logger.info(f"Channel ready: SSRC {ssrc} -> {channel_state.band_name}")
-        
+
         # Look up per-band decode modes from config
         band_config = self.config.get_band_config(channel_state.frequency_hz)
         decode_modes = [DecodeMode(m) for m in band_config.modes]
@@ -99,24 +96,29 @@ class WsprRecorder:
             executor=self.executor,
             sync_strategy=sync_strategy,
         )
-        
+
         self.band_recorders[ssrc] = recorder
-        
-        # Register with RTP ingest if it exists
-        # (During initial discovery, rtp_ingest doesn't exist yet - 
-        #  handlers are registered after we discover the multicast address)
-        if self.rtp_ingest:
-            self.rtp_ingest.register_handler(ssrc, self._make_packet_handler(ssrc, recorder))
-    
-    def _make_packet_handler(self, ssrc: int, recorder: BandRecorder):
-        """Create a packet handler that also updates receiver manager state."""
-        def handler(ssrc_arg, header, payload):
-            # Record packet for health tracking
+
+        # Wire sample callback into ManagedStream
+        def on_samples_wrapper(samples, quality):
             if self.receiver_manager:
-                self.receiver_manager.record_packet(ssrc)
-            # Forward to band recorder
-            recorder.on_packet(ssrc_arg, header, payload)
-        return handler
+                self.receiver_manager.record_samples(ssrc, len(samples))
+            recorder.on_samples(samples, quality)
+
+        def on_dropped_wrapper(reason):
+            logger.warning(f"{channel_state.band_name}: Stream dropped — {reason}")
+            channel_state.drop_count += 1
+
+        def on_restored_wrapper(channel_info):
+            logger.info(f"{channel_state.band_name}: Stream restored")
+            channel_state.restore_count += 1
+
+        self.receiver_manager.set_sample_callback(
+            ssrc,
+            on_samples_cb=on_samples_wrapper,
+            on_dropped_cb=on_dropped_wrapper,
+            on_restored_cb=on_restored_wrapper,
+        )
     
     def _on_period_complete(self, request: DecodeRequest) -> None:
         """
@@ -165,8 +167,9 @@ class WsprRecorder:
     async def _health_check_loop(self) -> None:
         """Periodically log channel health.
 
-        Channel recovery is handled automatically by ReceiverManager's
-        background health monitor thread. This loop only logs status.
+        Channel recovery is handled automatically by ka9q-python's
+        ManagedStream (auto-restore on stream drop). This loop only
+        logs status.
         """
         await asyncio.sleep(self.STARTUP_GRACE_PERIOD)
 
@@ -206,9 +209,6 @@ class WsprRecorder:
         
         if self.receiver_manager:
             status["receiver_manager"] = self.receiver_manager.get_status()
-        
-        if self.rtp_ingest:
-            status["rtp_ingest"] = self.rtp_ingest.get_stats()
         
         if self.timing_service:
             status["timing"] = self.timing_service.get_status()
@@ -360,41 +360,18 @@ class WsprRecorder:
         )
         
         try:
-            # Connect to radiod and discover channels
-            # This discovers the actual multicast addresses where data is sent
+            # Connect to radiod and provision channels via ManagedStream.
+            # on_channel_ready callbacks create BandRecorders and wire
+            # sample callbacks into each ManagedStream.
             logger.info("Connecting to radiod...")
             if not self.receiver_manager.connect():
                 logger.error("Failed to connect to radiod")
                 return
-            
-            # Get the discovered multicast addresses
-            mcast_addresses = self.receiver_manager.get_multicast_addresses()
-            if not mcast_addresses:
-                logger.error("No multicast addresses discovered from channels")
-                return
-            
-            # Use the first discovered multicast address
-            # (All our channels should be on the same multicast group)
-            mcast_addr, mcast_port = next(iter(mcast_addresses))
-            logger.info(f"Using discovered multicast address: {mcast_addr}:{mcast_port}")
-            
-            self.rtp_ingest = RTPIngest(
-                multicast_address=mcast_addr,
-                port=mcast_port,
-            )
-            
-            # Re-register handlers now that rtp_ingest exists
-            for ssrc, channel_state in self.receiver_manager.state.channels.items():
-                if ssrc in self.band_recorders:
-                    self.rtp_ingest.register_handler(
-                        ssrc, 
-                        self._make_packet_handler(ssrc, self.band_recorders[ssrc])
-                    )
-            
-            # Start RTP ingestion
-            logger.info("Starting RTP ingestion...")
-            await self.rtp_ingest.start()
-            
+
+            # Start all ManagedStreams (begins sample delivery)
+            logger.info("Starting ManagedStreams...")
+            self.receiver_manager.start_streams()
+
             # Start IPC server
             await self._setup_ipc_server()
             
@@ -436,12 +413,8 @@ class WsprRecorder:
         # Stop IPC server
         if self.ipc_server:
             await self.ipc_server.stop()
-        
-        # Stop RTP ingestion
-        if self.rtp_ingest:
-            await self.rtp_ingest.stop()
-        
-        # Disconnect from radiod
+
+        # Disconnect from radiod (stops all ManagedStreams)
         if self.receiver_manager:
             self.receiver_manager.shutdown()
         
