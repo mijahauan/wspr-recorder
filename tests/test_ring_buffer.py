@@ -68,7 +68,9 @@ class TestSingleMinute:
         assert out.dtype == np.int16
         assert np.all(out == 42)
         assert len(gaps) == 0
-        assert wc == make_wallclock(1)
+        # wallclock is the START of the slice. close_minute(t=1) marks the
+        # end of minute 0, so the slice begins at make_wallclock(0).
+        assert wc == make_wallclock(0)
         assert rtp == 6000
 
     def test_extract_returns_copy(self):
@@ -100,7 +102,7 @@ class TestMultiMinute:
         assert out[0] == 1
         # Last minute should be value=5
         assert out[-1] == 5
-        assert wc == make_wallclock(1)
+        assert wc == make_wallclock(0)
         assert rtp == 6000
 
     def test_extract_partial(self):
@@ -116,7 +118,7 @@ class TestMultiMinute:
         assert len(out) == 2 * RATE * 60
         assert out[0] == 4  # minute 4
         assert out[-1] == 5  # minute 5
-        assert wc == make_wallclock(4)
+        assert wc == make_wallclock(3)
 
     def test_extract_insufficient_raises(self):
         ring = RingBuffer(capacity_seconds=300, sample_rate=RATE)
@@ -150,7 +152,7 @@ class TestWrapAround:
         # Should be minutes 2 and 3
         assert out[0] == 2
         assert out[-1] == 3
-        assert wc == make_wallclock(2)
+        assert wc == make_wallclock(1)
 
     def test_write_wraps_data_integrity(self):
         """Verify data integrity when writes span the ring boundary."""
@@ -267,7 +269,7 @@ class TestMinuteMarkEviction:
         out, _, wc, _ = ring.extract_slice(3)
         # Should be minutes 8, 9, 10 (values 7, 8, 9)
         assert out[0] == 7
-        assert wc == make_wallclock(8)
+        assert wc == make_wallclock(7)
 
 
 class TestWriteInChunks:
