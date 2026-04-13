@@ -125,9 +125,14 @@ class BandRecorder:
         self._samples_per_minute = self.sample_rate * 60
         self.max_gap_samples = self.sample_rate * 2
 
-        # Ring buffer (lazy import to avoid circular dependency)
+        # Ring buffer (lazy import to avoid circular dependency).
+        # Capacity = longest decode period + 120 s headroom. The +120 s
+        # guarantees the W2 cycle that straddles the longest period's
+        # boundary (e.g. the W2 at minute 6 that needs minutes 4-5, one
+        # tick after F5 fires at minute 5) remains fully in the ring,
+        # with margin against late callbacks or future refactors.
         from .ring_buffer import RingBuffer
-        capacity = max_period_seconds(self._decode_modes)
+        capacity = max_period_seconds(self._decode_modes) + 120
         self._ring = RingBuffer(
             capacity_seconds=capacity,
             sample_rate=sample_rate,
@@ -330,7 +335,7 @@ class BandRecorder:
         self._first_rtp_timestamp = None
 
         from .ring_buffer import RingBuffer
-        capacity = max_period_seconds(self._decode_modes)
+        capacity = max_period_seconds(self._decode_modes) + 120
         self._ring = RingBuffer(
             capacity_seconds=capacity,
             sample_rate=self.sample_rate,

@@ -189,6 +189,68 @@ class TestMultiPeriodCallbacks:
         assert f5_hits[0].period_seconds == 300
         assert len(f5_hits[0].samples) == 5 * rate * 60
 
+    def test_w2_straddles_f5_boundary(self):
+        """After F5 fires at minute 5 (odd), the W2 cycle covering
+        minutes 4-5 must still emit correctly at minute 6, with the
+        straddling samples intact.
+
+        Each minute is filled with a distinctive float32 value so we can
+        verify the W2 WAV contains minute-4 samples in its first half
+        and minute-5 samples in its second half.
+        """
+        results = []
+        start_wc = datetime(2026, 4, 8, 0, 0, 0, tzinfo=timezone.utc)
+        rate = 600
+        sync = FakeSync(sample_rate=rate, minute_wallclock=start_wc)
+
+        rec = BandRecorder(
+            ssrc=1, frequency_hz=14095600, band_name="20",
+            sample_rate=rate,
+            decode_modes=[DecodeMode.W2, DecodeMode.F5],
+            on_period_complete=lambda r: results.append(r),
+            sync_strategy=sync,
+        )
+
+        spm = rate * 60
+        total_delivered = 0
+        # Minutes 0..5 use values 0.01..0.06; the W2 straddle cycle
+        # will pull minutes 4 and 5 (0.05 and 0.06).
+        for minute_idx in range(6):
+            value = 0.01 * (minute_idx + 1)
+            fed = 0
+            while fed < spm:
+                chunk = min(120, spm - fed)
+                samples = make_float32_samples(chunk, value=value)
+                total_delivered += chunk
+                q = MockQuality(
+                    first_rtp_timestamp=0,
+                    total_samples_delivered=total_delivered,
+                )
+                rec.on_samples(samples, q)
+                fed += chunk
+
+        f5_hits = [r for r in results if DecodeMode.F5 in r.modes]
+        w2_hits = [r for r in results if DecodeMode.W2 in r.modes]
+
+        assert len(f5_hits) == 1, "F5 should fire once at minute 5"
+        assert len(w2_hits) >= 3, "W2 fires at minutes 2, 4, 6"
+
+        f5 = f5_hits[0]
+        assert f5.period_seconds == 300
+        assert len(f5.samples) == 5 * spm
+        # F5 covers minutes 0-4 → first sample is 0.01, last is 0.05
+        assert abs(float(f5.samples[0]) - 0.01) < 1e-6
+        assert abs(float(f5.samples[-1]) - 0.05) < 1e-6
+
+        # Straddling W2 cycle: fires at abs_min=6, covers minutes 4-5
+        w2_straddle = w2_hits[-1]
+        assert w2_straddle.period_seconds == 120
+        assert len(w2_straddle.samples) == 2 * spm
+        assert abs(float(w2_straddle.samples[0]) - 0.05) < 1e-6
+        assert abs(float(w2_straddle.samples[spm - 1]) - 0.05) < 1e-6
+        assert abs(float(w2_straddle.samples[spm]) - 0.06) < 1e-6
+        assert abs(float(w2_straddle.samples[-1]) - 0.06) < 1e-6
+
     def test_f30_needs_30_minutes(self):
         """F30 doesn't fire until 30 minutes of data accumulated."""
         results = []
