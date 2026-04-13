@@ -108,11 +108,13 @@ class TestBasicMinuteBoundary:
         assert len(w2) >= 1
         req = w2[0]
         assert req.period_seconds == 120
-        assert req.samples.dtype == np.int16
+        assert req.samples.dtype == np.float32
         assert len(req.samples) == 2 * rate * 60
 
-    def test_float32_to_int16_conversion(self):
-        """Float32 samples from ManagedStream are converted to int16."""
+    def test_float32_preserved_through_ring(self):
+        """Float32 samples from MultiStream are stored as float32 in the
+        ring buffer and delivered unchanged in the DecodeRequest. int16
+        conversion + peak normalization happens in WavWriter."""
         results = []
         rate = 1200
         sync = FakeSync(sample_rate=rate)
@@ -123,14 +125,12 @@ class TestBasicMinuteBoundary:
             sync_strategy=sync,
         )
 
-        # Feed 2 minutes of float32 samples with value 0.5
         total = feed_minutes(rec, 2, rate, value=0.5)
 
         assert len(results) >= 1
         samples = results[0].samples
-        assert samples.dtype == np.int16
-        # 0.5 * 32767 ≈ 16383
-        assert abs(int(samples[0]) - 16383) <= 1
+        assert samples.dtype == np.float32
+        assert abs(float(samples[0]) - 0.5) < 1e-6
 
     def test_distinctive_values_per_minute(self):
         """Verify samples from different minutes are preserved correctly."""
@@ -158,11 +158,9 @@ class TestBasicMinuteBoundary:
 
         assert len(results) >= 1
         out = results[0].samples
-        assert out.dtype == np.int16
-        # First minute's value: 0.03 * 32767 ≈ 983
-        assert abs(int(out[0]) - 983) <= 1
-        # Last minute's value: 0.06 * 32767 ≈ 1966
-        assert abs(int(out[-1]) - 1966) <= 1
+        assert out.dtype == np.float32
+        assert abs(float(out[0]) - 0.03) < 1e-6
+        assert abs(float(out[-1]) - 0.06) < 1e-6
 
 
 class TestMultiPeriodCallbacks:

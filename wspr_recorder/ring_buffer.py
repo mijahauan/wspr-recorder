@@ -1,9 +1,15 @@
 """
 Circular sample buffer for wspr-recorder.
 
-Stores int16 audio samples in a fixed-size ring, tracking minute
+Stores float32 audio samples in a fixed-size ring, tracking minute
 boundaries so that multi-minute slices can be extracted for any
 configured decode period (2, 5, 15, or 30 minutes).
+
+Float32 storage preserves the full dynamic range delivered by
+ka9q-python's RadiodStream. Peak normalization and int16 conversion
+happen downstream at WAV-write time, using the per-period peak so
+that each decoder WAV uses the full int16 range regardless of signal
+level.
 """
 
 import logging
@@ -57,7 +63,7 @@ class RingBuffer:
         self._samples_per_minute = sample_rate * 60
 
         total_samples = capacity_minutes * self._samples_per_minute
-        self._samples = np.zeros(total_samples, dtype=np.int16)
+        self._samples = np.zeros(total_samples, dtype=np.float32)
         self._capacity = total_samples
 
         self._write_pos: int = 0
@@ -85,10 +91,10 @@ class RingBuffer:
 
     def write_samples(self, samples: np.ndarray) -> None:
         """
-        Write int16 samples into the ring at the current write position.
+        Write float32 samples into the ring at the current write position.
 
         Handles wrap-around at the ring boundary. Caller must ensure
-        samples are int16 dtype.
+        samples are float32 dtype.
         """
         n = len(samples)
         if n == 0:
@@ -113,7 +119,7 @@ class RingBuffer:
         """Fill `count` zero samples into the ring (gap fill)."""
         if count <= 0:
             return
-        zeros = np.zeros(count, dtype=np.int16)
+        zeros = np.zeros(count, dtype=np.float32)
         self.write_samples(zeros)
 
     def record_gap(self, gap: GapEvent) -> None:

@@ -13,8 +13,8 @@ RATE = 100  # 100 samples/sec → 6000 samples/minute
 
 
 def make_minute_samples(value: int = 1) -> np.ndarray:
-    """Create one minute of int16 samples filled with a constant value."""
-    return np.full(RATE * 60, value, dtype=np.int16)
+    """Create one minute of float32 samples filled with a constant value."""
+    return np.full(RATE * 60, value, dtype=np.float32)
 
 
 def make_wallclock(minute: int) -> datetime:
@@ -39,18 +39,18 @@ class TestRingBufferBasics:
 
     def test_write_and_count(self):
         ring = RingBuffer(capacity_seconds=120, sample_rate=RATE)
-        samples = np.ones(100, dtype=np.int16)
+        samples = np.ones(100, dtype=np.float32)
         ring.write_samples(samples)
         assert ring.current_minute_sample_count == 100
 
     def test_write_empty(self):
         ring = RingBuffer(capacity_seconds=120, sample_rate=RATE)
-        ring.write_samples(np.array([], dtype=np.int16))
+        ring.write_samples(np.array([], dtype=np.float32))
         assert ring.current_minute_sample_count == 0
 
-    def test_int16_dtype(self):
+    def test_float32_dtype(self):
         ring = RingBuffer(capacity_seconds=120, sample_rate=RATE)
-        assert ring._samples.dtype == np.int16
+        assert ring._samples.dtype == np.float32
 
 
 class TestSingleMinute:
@@ -65,7 +65,7 @@ class TestSingleMinute:
 
         out, gaps, wc, rtp = ring.extract_slice(1)
         assert len(out) == RATE * 60
-        assert out.dtype == np.int16
+        assert out.dtype == np.float32
         assert np.all(out == 42)
         assert len(gaps) == 0
         # wallclock is the START of the slice. close_minute(t=1) marks the
@@ -185,7 +185,7 @@ class TestGapHandling:
         spm = RATE * 60
 
         # Write some samples, then a gap, then more
-        ring.write_samples(np.full(1000, 5, dtype=np.int16))
+        ring.write_samples(np.full(1000, 5, dtype=np.float32))
         gap = GapEvent(
             position_samples=1000,
             duration_samples=200,
@@ -195,7 +195,7 @@ class TestGapHandling:
         )
         ring.record_gap(gap)
         ring.write_zeros(200)
-        ring.write_samples(np.full(spm - 1200, 5, dtype=np.int16))
+        ring.write_samples(np.full(spm - 1200, 5, dtype=np.float32))
         ring.close_minute(make_wallclock(1), 0)
 
         out, gaps, _, _ = ring.extract_slice(1)
@@ -213,7 +213,7 @@ class TestGapHandling:
         ring.close_minute(make_wallclock(1), 0)
 
         # Minute 2: gap at position 500
-        ring.write_samples(np.full(500, 2, dtype=np.int16))
+        ring.write_samples(np.full(500, 2, dtype=np.float32))
         gap = GapEvent(
             position_samples=500,
             duration_samples=100,
@@ -223,7 +223,7 @@ class TestGapHandling:
         )
         ring.record_gap(gap)
         ring.write_zeros(100)
-        ring.write_samples(np.full(spm - 600, 2, dtype=np.int16))
+        ring.write_samples(np.full(spm - 600, 2, dtype=np.float32))
         ring.close_minute(make_wallclock(2), 6000)
 
         out, gaps, _, _ = ring.extract_slice(2)
@@ -236,17 +236,17 @@ class TestGapHandling:
         spm = RATE * 60
 
         # Minute 1: gap at 100
-        ring.write_samples(np.full(100, 1, dtype=np.int16))
+        ring.write_samples(np.full(100, 1, dtype=np.float32))
         ring.record_gap(GapEvent(100, 50, 1, 2, "t1"))
         ring.write_zeros(50)
-        ring.write_samples(np.full(spm - 150, 1, dtype=np.int16))
+        ring.write_samples(np.full(spm - 150, 1, dtype=np.float32))
         ring.close_minute(make_wallclock(1), 0)
 
         # Minute 2: gap at 200
-        ring.write_samples(np.full(200, 2, dtype=np.int16))
+        ring.write_samples(np.full(200, 2, dtype=np.float32))
         ring.record_gap(GapEvent(200, 75, 3, 4, "t2"))
         ring.write_zeros(75)
-        ring.write_samples(np.full(spm - 275, 2, dtype=np.int16))
+        ring.write_samples(np.full(spm - 275, 2, dtype=np.float32))
         ring.close_minute(make_wallclock(2), 6000)
 
         _, gaps, _, _ = ring.extract_slice(2)
@@ -283,7 +283,7 @@ class TestWriteInChunks:
         total = 0
         while total < spm:
             chunk_size = min(packet_size, spm - total)
-            ring.write_samples(np.full(chunk_size, 7, dtype=np.int16))
+            ring.write_samples(np.full(chunk_size, 7, dtype=np.float32))
             total += chunk_size
 
         assert ring.current_minute_sample_count == spm
@@ -301,4 +301,4 @@ class TestToDict:
         assert d["capacity_minutes"] == 2
         assert d["minutes_available"] == 0
         assert d["current_minute_samples"] == 0
-        assert d["memory_bytes"] == 2 * RATE * 60 * 2  # 2 min * int16
+        assert d["memory_bytes"] == 2 * RATE * 60 * 4  # 2 min * float32

@@ -2,10 +2,10 @@
 Band Recorder for wspr-recorder.
 
 Per-band recording logic:
-- Receives float32 samples from ka9q-python ManagedStream callback
-- Converts to int16 for the ring buffer (wsprd/jt9 require int16 PCM)
-- Buffers samples in a ring buffer
+- Receives float32 samples from ka9q-python MultiStream callback
+- Buffers samples as float32 in a ring buffer (preserves dynamic range)
 - At minute boundaries, checks decode schedules and emits DecodeRequests
+- int16 conversion + per-period peak normalization happens in WavWriter
 """
 
 import logging
@@ -42,7 +42,7 @@ class DecodeRequest:
     band_name: str
     modes: List[DecodeMode]       # e.g., [W2, F2] for shared 120s
     period_seconds: int           # 120, 300, 900, or 1800
-    samples: np.ndarray           # int16, copied from ring
+    samples: np.ndarray           # float32, copied from ring
     gaps: List[GapEvent]
     start_wallclock: datetime
     start_rtp_timestamp: int
@@ -87,10 +87,9 @@ class BandRecorder:
     Records samples for a single WSPR band.
 
     Responsibilities:
-    - Receive float32 samples from ka9q-python ManagedStream callback
-    - Convert float32 → int16 (wsprd/jt9 require int16 PCM)
+    - Receive float32 samples from ka9q-python MultiStream callback
     - Track gaps from StreamQuality metadata
-    - Buffer samples in a ring buffer
+    - Buffer samples as float32 in a ring buffer (preserves dynamic range)
     - At minute boundaries, emit DecodeRequests for completed periods
     """
 
@@ -143,10 +142,11 @@ class BandRecorder:
         self._first_rtp_timestamp: Optional[int] = None
 
     def on_samples(self, samples: np.ndarray, quality) -> None:
-        """Process samples from ka9q-python ManagedStream callback.
+        """Process samples from ka9q-python MultiStream callback.
 
         Args:
-            samples: float32 audio samples (decoded from S16BE by ka9q-python)
+            samples: float32 audio samples from ka9q-python (wire encoding
+                is configurable; the client always sees float32).
             quality: StreamQuality with RTP timestamps, gap info, etc.
         """
         n = len(samples)
@@ -155,8 +155,11 @@ class BandRecorder:
 
         self.stats.samples_received += n
 
-        # Convert float32 → int16 for the ring buffer
-        int16_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+        # Ensure float32 dtype — ring buffer stores samples as-is to
+        # preserve full dynamic range. int16 conversion + per-period
+        # peak normalization happens at WAV-write time.
+        if samples.dtype != np.float32:
+            samples = samples.astype(np.float32)
 
         # Compute the RTP timestamp for this batch
         batch_rtp_ts = (
@@ -191,10 +194,10 @@ class BandRecorder:
             )
 
         # Add samples to ring buffer
-        self._add_samples(int16_samples, batch_rtp_ts)
+        self._add_samples(samples, batch_rtp_ts)
 
     def _add_samples(self, samples: np.ndarray, rtp_timestamp: int) -> None:
-        """Add int16 samples to the ring buffer."""
+        """Add float32 samples to the ring buffer."""
         if not self._synced:
             now = datetime.now(timezone.utc)
             decision = self.sync_strategy.should_start_minute(

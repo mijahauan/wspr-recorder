@@ -32,8 +32,18 @@ from .config import Config, freq_to_band_name
 
 logger = logging.getLogger(__name__)
 
-# Encoding.S16BE
-ENCODING_S16BE = 2
+
+def _resolve_encoding(enc_str: str) -> int:
+    """Map config encoding string to ka9q.Encoding integer."""
+    mapping = {
+        "s16be": 2,
+        "s16le": 1,
+        "f32":   4,
+        "f32le": 4,
+        "f32be": 8,
+        "float": 4,  # legacy alias
+    }
+    return mapping.get(enc_str.lower(), 4)
 
 
 @dataclass
@@ -135,6 +145,7 @@ class ReceiverManager:
         assert self._control is not None
         band_name = freq_to_band_name(freq_hz)
         defaults = self.config.channel_defaults
+        encoding_int = _resolve_encoding(defaults.encoding)
 
         try:
             info = self._control.ensure_channel(
@@ -143,7 +154,7 @@ class ReceiverManager:
                 sample_rate=defaults.sample_rate,
                 agc_enable=1 if defaults.agc else 0,
                 gain=defaults.gain,
-                encoding=ENCODING_S16BE,
+                encoding=encoding_int,
             )
             self._control.set_filter(
                 ssrc=info.ssrc,
@@ -177,7 +188,7 @@ class ReceiverManager:
                 sample_rate=defaults.sample_rate,
                 agc_enable=1 if defaults.agc else 0,
                 gain=defaults.gain,
-                encoding=ENCODING_S16BE,
+                encoding=encoding_int,
                 on_samples=sink.on_samples,
                 on_stream_dropped=sink.on_stream_dropped,
                 on_stream_restored=sink.on_stream_restored,

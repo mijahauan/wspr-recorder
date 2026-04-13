@@ -108,7 +108,7 @@ class ChannelDefaults:
     """Default settings for channels."""
     sample_rate: int = 12000
     mode: str = "usb"
-    encoding: str = "float"
+    encoding: str = "f32"
     agc: bool = False
     gain: float = 0.0
     low: int = 1300
@@ -119,7 +119,7 @@ class ChannelDefaults:
         return cls(
             sample_rate=data.get("sample_rate", 12000),
             mode=data.get("mode", "usb"),
-            encoding=data.get("encoding", "float"),
+            encoding=data.get("encoding", "f32"),
             agc=data.get("agc", False),
             gain=data.get("gain", 0.0),
             low=data.get("low", 1300),

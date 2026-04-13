@@ -72,8 +72,12 @@ sample_rate = 12000
 # Demodulation mode
 mode = "usb"
 
-# Internal encoding (radiod uses float internally)
-encoding = "float"
+# RTP wire encoding from radiod to the recorder.
+# "f32"   - IEEE float32, preserves full dynamic range (recommended for WSPR)
+# "s16be" - 16-bit big-endian (half the bandwidth but loses precision on
+#           weak signals; S16BE→float32 is done by ka9q-python at the
+#           callback boundary, so client-side samples are always float32)
+encoding = "f32"
 
 # AGC: false for WSPR (we want consistent levels)
 agc = false
@@ -95,10 +99,12 @@ high = 1700
 #                  F15 (FST4W-900), F30 (FST4W-1800)
 #
 # W2 and F2 share the same 2-minute window (one WAV serves both decoders).
-# Longer FST4W modes require more memory per band (up to ~43 MB for F30).
+# Longer FST4W modes require more memory per band (ring buffer is
+# float32 to preserve dynamic range; int16 conversion + per-period peak
+# normalization happens at WAV-write time).
 #
-# Memory per band: W2/F2 only = ~274 KB, F5 = ~720 KB,
-#                  F15 = ~2.2 MB, F30 = ~43 MB
+# Memory per band (float32): W2/F2 = ~5.8 MB, F5 = ~14 MB,
+#                             F15 = ~43 MB, F30 = ~86 MB
 # --------------------------------------------------------------------------
 
 [[band]]

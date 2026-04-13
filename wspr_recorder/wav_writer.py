@@ -279,12 +279,14 @@ class WavWriter:
         """
         Write a period-length WAV file from a DecodeRequest.
 
-        Samples arrive as int16 from the ring buffer — written directly,
-        no format conversion. JSON sidecar includes drift observation,
-        decode modes, and period length.
+        Samples arrive as float32 from the ring buffer. They are
+        peak-normalized over the full period and converted to int16
+        for the WAV (wsprd/jt9 require int16 PCM). The applied scale
+        factor is recorded in the JSON sidecar so absolute amplitude
+        can be reconstructed downstream.
 
         Args:
-            request: DecodeRequest with int16 samples and metadata
+            request: DecodeRequest with float32 samples and metadata
             max_files_per_band: Max files to keep per band directory
 
         Returns:
@@ -301,12 +303,23 @@ class WavWriter:
             tmp_path = band_dir / f".{filename}.tmp"
             json_path = band_dir / f"{filename[:-4]}.json"
 
-            # Samples are already int16 from ring buffer
+            # Per-period peak-normalize float32 → int16. Uses the full
+            # int16 range regardless of signal level, maximizing dynamic
+            # range for weak WSPR signals.
+            peak = float(np.abs(request.samples).max()) if len(request.samples) else 0.0
+            if peak > 0.0:
+                scale = 32767.0 / peak
+            else:
+                scale = 1.0  # silent period — emit zeros
+            int16_samples = np.clip(
+                request.samples * scale, -32768.0, 32767.0,
+            ).astype(np.int16)
+
             with wave.open(str(tmp_path), 'wb') as wav:
                 wav.setnchannels(1)
                 wav.setsampwidth(2)
                 wav.setframerate(self.sample_rate)
-                wav.writeframes(request.samples.tobytes())
+                wav.writeframes(int16_samples.tobytes())
 
             tmp_path.rename(wav_path)
 
@@ -340,6 +353,10 @@ class WavWriter:
                 "sample_rate": self.sample_rate,
                 "samples": n_samples,
                 "sample_format": "int16",
+                "normalization": {
+                    "float32_peak": peak,
+                    "int16_scale": scale,
+                },
                 "period_seconds": request.period_seconds,
                 "decode_modes": [m.value for m in request.modes],
                 "start_rtp_timestamp": request.start_rtp_timestamp,

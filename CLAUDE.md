@@ -34,10 +34,13 @@ wspr-ctl bands
 The system is a pipeline: RTP multicast packets flow in, get demuxed by SSRC (one per frequency band), buffered in a per-band ring buffer with minute-boundary tracking, then sliced at decode period boundaries (120s, 300s, 900s, 1800s) into WAV files. These are decoded by wsprd and jt9, with spots processed and enhanced for upload.
 
 ```
-radiod RTP stream (12kHz S16BE per band)
+radiod RTP stream (12kHz, wire encoding configurable — default f32)
     → ka9q-python MultiStream (one per multicast group, shared socket)
-        → per-channel ChannelSink → BandRecorder.on_samples()
-                                    (float32→int16, ring buffer, decode scheduling)
+        → per-channel ChannelSink → BandRecorder.on_samples()  [float32]
+                                    → float32 ring buffer, decode scheduling
+                                        → DecodeRequest (float32 samples)
+                                            → WavWriter.write_period()
+                                              (peak-normalize → int16 WAV)
                 → at period boundary: extract_slice → WAV on tmpfs
                     → DecoderRunner (decoder.py)
                         → wsprd (2-pass: standard + spreading, merged)
@@ -89,7 +92,7 @@ All boundaries are epoch-aligned (`unix_timestamp % period == 0`). Modes are con
 ## Key Design Decisions
 
 - **Ring buffer replaces 1-minute files**: Instead of writing 1-minute WAVs and concatenating with sox (v3's approach), samples stay in a per-band circular buffer. At decode boundaries, the relevant window is sliced out and written as a single WAV. Eliminates sox, reduces file I/O, handles all period lengths uniformly.
-- **Int16 in ring buffer and WAV output**: ka9q-python decodes S16BE wire format to float32 in the `RadiodStream` callback. `BandRecorder.on_samples()` converts float32 → int16 via `clip(±1.0) × 32767` before writing to the ring buffer. Both wsprd and jt9 require int16 PCM WAV input. The float32 intermediate is a brief conversion at the callback boundary; the ring buffer and all downstream storage is int16.
+- **Float32 in ring buffer, per-period peak-normalized int16 WAV output**: ka9q-python delivers float32 samples to `BandRecorder.on_samples()` regardless of wire encoding (configurable via `channel_defaults.encoding`; default `f32` preserves radiod's internal precision). Samples are stored as float32 in the ring buffer — the full dynamic range is preserved all the way to WAV-write time. `WavWriter.write_period()` computes the float32 peak across the entire period, scales to full int16 range (`scale = 32767 / peak`), and writes int16 PCM. The applied `int16_scale` and `float32_peak` are recorded in the JSON sidecar so absolute amplitude can be reconstructed. This maximizes decoder SNR on weak WSPR signals, where a fixed `× 32767` conversion would waste 5-6 bits of the int16 range.
 - **Sample-count minute boundaries**: Minutes are exactly 720,000 samples. Once the initial boundary is found, every subsequent minute is triggered by the ring buffer filling — no further clock checks. The grid is maintained via arithmetic propagation from the initial sync point.
 - **Cross-decoder hash resolution**: wsprd and jt9 use incompatible hash systems (15-bit vs 22-bit). `CallsignDB` maintains a unified lookup table, pre-populates both decoder formats before each run, and resolves jt9 `-Y` numeric hashes after decoding. This recovers type-3 spots that v3 discards as `<...>`.
 - **wsprd two-pass**: Standard pass + spreading variant, merged by preferring spots with spreading data, then best SNR. The spreading value replaces the metric field.
