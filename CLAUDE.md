@@ -53,15 +53,19 @@ radiod RTP stream (12kHz, wire encoding configurable — default f32)
 
 ### Five Decode Modes
 
-| Mode | Period | Decoder | Cadence |
-|------|--------|---------|---------|
-| W2 (WSPR-2) | 120s | wsprd | Every even minute |
-| F2 (FST4W-120) | 120s | jt9 --fst4w | Every even minute (shares WAV with W2) |
-| F5 (FST4W-300) | 300s | jt9 --fst4w | Every 5 min |
-| F15 (FST4W-900) | 900s | jt9 --fst4w | Every 15 min |
-| F30 (FST4W-1800) | 1800s | jt9 --fst4w | Every 30 min |
+| Mode | Period | Decoder | Fires when | Start minutes within an hour |
+|------|--------|---------|------------|-------------------------------|
+| W2 (WSPR-2) | 120 s | wsprd | `abs_minute % 2 == 0` | :00, :02, …, :58 |
+| F2 (FST4W-120) | 120 s | jt9 --fst4w | `abs_minute % 2 == 0` (shares WAV with W2) | :00, :02, …, :58 |
+| F5 (FST4W-300) | 300 s | jt9 --fst4w | `abs_minute % 5 == 0` | :00, :05, :10, :15, …, :55 |
+| F15 (FST4W-900) | 900 s | jt9 --fst4w | `abs_minute % 15 == 0` | :00, :15, :30, :45 |
+| F30 (FST4W-1800) | 1800 s | jt9 --fst4w | `abs_minute % 30 == 0` | :00, :30 |
 
-All boundaries are epoch-aligned (`unix_timestamp % period == 0`). Modes are configurable per band via `[[band]]` sections in config.toml.
+All boundaries are epoch-aligned in UTC (`unix_timestamp % period == 0`). Modes are configurable per band via `[[band]]` sections in config.toml. W2 and F2 are epoch-aligned identically and share one 2-minute WAV per cycle — `group_modes_by_period` collapses them so one file feeds both decoders.
+
+**Simultaneous emissions.** All four cadences coincide at :00 every hour, and at :30. At :15 and :45, every cadence except F30 coincides. At those ticks, `BandRecorder._on_minute_boundary` dispatches one `DecodeRequest` per distinct period, each producing its own WAV named with the `_Ps.wav` suffix (`_120`, `_300`, `_900`, `_1800`).
+
+**Client protocol.** Downstream consumers (`wsprdaemon-client`) don't need to hardcode these cadences: each WAV's JSON sidecar carries `period_seconds` and `decode_modes`, and the filename suffix is self-describing. The cadence rule is a property of wspr-recorder's output contract, not a shared constant.
 
 ### Key Components
 

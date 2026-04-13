@@ -3,6 +3,21 @@ Decode mode definitions and scheduling for wspr-recorder.
 
 Defines the five WSPR/FST4W decode modes, their periods, and logic
 for determining which modes complete at a given minute boundary.
+
+Epoch alignment (all start times are UTC minute-of-epoch):
+
+  W2, F2   120 s    abs_minute % 2  == 0   :00, :02, :04, …, :58
+  F5       300 s    abs_minute % 5  == 0   :00, :05, :10, :15, …, :55
+  F15      900 s    abs_minute % 15 == 0   :00, :15, :30, :45
+  F30     1800 s    abs_minute % 30 == 0   :00, :30
+
+W2 and F2 are epoch-aligned identically and share the same 2-minute
+window — one WAV serves both decoders (see group_modes_by_period).
+
+All four cadences coincide at :00 every hour, and at :30. At :15 and
+:45, all cadences except F30 coincide. In those simultaneous-emission
+minutes, BandRecorder._on_minute_boundary dispatches one
+DecodeRequest per distinct period, each with its own WAV.
 """
 
 from enum import Enum
