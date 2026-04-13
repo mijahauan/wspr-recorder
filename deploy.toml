@@ -1,0 +1,66 @@
+[package]
+name             = "wspr-recorder"
+version          = "0.1.0"
+contract_version = "0.4"
+license          = "MIT"
+
+[build]
+steps = [
+    "python3 -m venv /opt/wspr-recorder/venv",
+    "/opt/wspr-recorder/venv/bin/pip install --upgrade pip setuptools wheel",
+    "/opt/wspr-recorder/venv/bin/pip install -e /opt/git/wspr-recorder",
+]
+produces = [
+    "/opt/wspr-recorder/venv/bin/wspr-recorder",
+]
+
+[[install.steps]]
+kind = "link"
+src  = "/opt/wspr-recorder/venv/bin/wspr-recorder"
+dst  = "/usr/local/bin/wspr-recorder"
+
+[[install.steps]]
+kind = "link"
+src  = "/opt/wspr-recorder/venv/bin/wspr-ctl"
+dst  = "/usr/local/bin/wspr-ctl"
+
+[[install.steps]]
+kind = "link"
+src  = "systemd/wspr-recorder@.service"
+dst  = "/etc/systemd/system/wspr-recorder@.service"
+
+[[install.steps]]
+kind      = "render"
+src       = "config.toml.example"
+dst       = "/etc/wspr-recorder/config.toml"
+if_absent = true
+
+[[install.steps]]
+kind  = "mkdir"
+dst   = "/var/log/wspr-recorder"
+owner = "wsprrec:wsprrec"
+mode  = "0755"
+
+[[install.steps]]
+kind  = "mkdir"
+dst   = "/dev/shm/wspr-recorder"
+owner = "wsprrec:wsprrec"
+mode  = "0755"
+
+[systemd]
+units = ["wspr-recorder@.service"]
+
+[deps]
+[[deps.pypi]]
+name    = "ka9q-python"
+version = "3.8.0"
+venv    = "/opt/wspr-recorder/venv"
+
+[[deps.pypi]]
+name    = "numpy"
+version = "1.20.0"
+venv    = "/opt/wspr-recorder/venv"
+
+[[deps.apt]]
+name = "wsjtx"
+note = "provides jt9 for FST4W decoding"
