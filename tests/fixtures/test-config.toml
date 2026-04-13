@@ -1,0 +1,32 @@
+[recorder]
+output_dir = "/tmp/wspr-recorder-test"
+sample_format = "int16"
+max_file_age_minutes = 35
+max_files_per_band = 35
+status_file = "status.json"
+ipc_socket = "/tmp/wspr-recorder-test/control.sock"
+
+[timing]
+authority = "auto"
+
+[radiod]
+status_address = "test-hf-status.local"
+destination = "239.1.2.3"
+port = 5004
+
+[channel_defaults]
+sample_rate = 12000
+mode = "usb"
+encoding = "f32"
+agc = false
+gain = 0.0
+low = 1300
+high = 1700
+
+[[band]]
+frequency = "14095600"
+modes = ["W2", "F2"]
+
+[[band]]
+frequency = "474200"
+modes = ["W2", "F2", "F5", "F15", "F30"]

@@ -1,0 +1,54 @@
+[Unit]
+Description=wspr-recorder WSPR/FST4W audio recorder for radiod %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=notify
+User=wsprrec
+Group=wsprrec
+
+WatchdogSec=180
+NotifyAccess=main
+
+EnvironmentFile=-/etc/sigmond/coordination.env
+EnvironmentFile=-/etc/wspr-recorder/env/%i.env
+
+WorkingDirectory=/opt/wspr-recorder
+
+ExecStartPre=+/bin/mkdir -p /dev/shm/wspr-recorder
+ExecStartPre=+/bin/mkdir -p /var/log/wspr-recorder
+ExecStartPre=+/usr/bin/chown -R wsprrec:wsprrec /dev/shm/wspr-recorder
+ExecStartPre=+/usr/bin/chown -R wsprrec:wsprrec /var/log/wspr-recorder
+
+ExecStart=/opt/wspr-recorder/venv/bin/python3 -m wspr_recorder.cli daemon \
+    --config /etc/wspr-recorder/config.toml
+
+TimeoutStartSec=60
+
+Restart=always
+RestartSec=5
+
+StandardOutput=append:/var/log/wspr-recorder/%i.log
+StandardError=inherit
+SyslogIdentifier=wspr-recorder@%i
+
+Nice=5
+MemoryMax=1G
+MemorySwapMax=0
+
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/dev/shm/wspr-recorder /var/log/wspr-recorder /run/wspr-recorder
+ReadOnlyPaths=/etc/wspr-recorder
+PrivateNetwork=false
+
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
