@@ -24,6 +24,7 @@ INSTALL_DIR="/opt/wspr-recorder"
 CONFIG_DIR="/etc/wspr-recorder"
 RUN_DIR="/run/wspr-recorder"
 OUTPUT_DIR="/dev/shm/wspr-recorder"
+LOG_DIR="/var/log/wspr-recorder"
 SERVICE_USER="wsprrec"
 SERVICE_GROUP="wsprrec"
 
@@ -192,66 +193,47 @@ install_config() {
 
 install_systemd() {
     info "Installing systemd service..."
-    
-    # Create tmpfiles.d config for runtime directory
+
+    # Create tmpfiles.d config for runtime + log directories
     cat > /etc/tmpfiles.d/wspr-recorder.conf << EOF
-# wspr-recorder runtime directory
+# wspr-recorder runtime, output, and log directories
 d $RUN_DIR 0755 $SERVICE_USER $SERVICE_GROUP -
 d $OUTPUT_DIR 0755 $SERVICE_USER $SERVICE_GROUP -
+d $LOG_DIR 0755 $SERVICE_USER $SERVICE_GROUP -
 EOF
-    
-    # Create the directories now
+
     systemd-tmpfiles --create /etc/tmpfiles.d/wspr-recorder.conf
-    
-    # Install systemd service
-    cat > /etc/systemd/system/wspr-recorder.service << EOF
-[Unit]
-Description=WSPR Audio Recorder
-Documentation=https://github.com/mijahauan/wspr-recorder
-After=network.target
-Wants=network.target
 
-[Service]
-Type=simple
-User=$SERVICE_USER
-Group=$SERVICE_GROUP
+    # Install the canonical templated unit from the repo (NOT an inline
+    # unit). This keeps the deployed service in lockstep with
+    # systemd/wspr-recorder@.service (Type=notify, WatchdogSec=180,
+    # MemoryMax=1G, MALLOC_ARENA_MAX=2, EnvironmentFile coordination.env)
+    # so sigmond-driven and standalone installs share one unit file.
+    local repo_root unit_src unit_dst
+    repo_root="$(cd "$(dirname "$0")" && pwd)"
+    unit_src="$repo_root/systemd/wspr-recorder@.service"
+    unit_dst="/etc/systemd/system/wspr-recorder@.service"
 
-# Paths
-Environment=PATH=$INSTALL_DIR/venv/bin:/usr/bin:/bin
-WorkingDirectory=$INSTALL_DIR
+    if [[ ! -f "$unit_src" ]]; then
+        error "Canonical unit not found at $unit_src"
+    fi
 
-# Main process
-ExecStart=$INSTALL_DIR/venv/bin/wspr-recorder -c $CONFIG_DIR/config.toml
-ExecReload=/bin/kill -HUP \$MAINPID
+    # Clean up the legacy non-templated unit from pre-contract installs.
+    if [[ -f /etc/systemd/system/wspr-recorder.service ]]; then
+        warn "Removing legacy non-templated /etc/systemd/system/wspr-recorder.service"
+        systemctl disable --now wspr-recorder.service 2>/dev/null || true
+        rm -f /etc/systemd/system/wspr-recorder.service
+    fi
 
-# Runtime directory
-RuntimeDirectory=wspr-recorder
-RuntimeDirectoryMode=0755
+    ln -sfn "$unit_src" "$unit_dst"
+    info "Installed $unit_dst -> $unit_src"
 
-# Restart policy
-Restart=on-failure
-RestartSec=10
-
-# Security hardening
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-ReadWritePaths=$OUTPUT_DIR $RUN_DIR
-ReadOnlyPaths=$CONFIG_DIR
-
-# Resource limits
-LimitNOFILE=65536
-MemoryMax=512M
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    # Reload systemd
     systemctl daemon-reload
-    
-    info "Systemd service installed"
+
+    info "Systemd service installed (templated). Enable with:"
+    info "  sudo systemctl enable --now wspr-recorder@<instance>"
+    info "where <instance> is derived from [radiod].status_address in config.toml"
+    info "(e.g. bee3-status.local -> wspr-recorder@bee3)."
 }
 
 install_symlinks() {
@@ -267,16 +249,17 @@ install_symlinks() {
 uninstall() {
     info "Uninstalling wspr-recorder..."
     
-    # Stop and disable service
-    if systemctl is-active --quiet wspr-recorder; then
-        systemctl stop wspr-recorder
-    fi
-    if systemctl is-enabled --quiet wspr-recorder 2>/dev/null; then
-        systemctl disable wspr-recorder
-    fi
-    
+    # Stop and disable every templated instance, then the legacy unit.
+    local instances
+    instances=$(systemctl list-units --no-legend --all 'wspr-recorder@*.service' 2>/dev/null | awk '{print $1}')
+    for inst in $instances; do
+        systemctl disable --now "$inst" 2>/dev/null || true
+    done
+    systemctl disable --now wspr-recorder.service 2>/dev/null || true
+
     # Remove systemd files
     rm -f /etc/systemd/system/wspr-recorder.service
+    rm -f /etc/systemd/system/wspr-recorder@.service
     rm -f /etc/tmpfiles.d/wspr-recorder.conf
     systemctl daemon-reload
     
@@ -317,11 +300,16 @@ uninstall() {
 }
 
 show_status() {
+    # "Upgrade" if any templated instance is already installed (enabled
+    # or disabled but present). The unit is templated so we look for
+    # enabled instances.
+    local existing
+    existing=$(systemctl list-unit-files --no-legend 'wspr-recorder@*.service' 2>/dev/null | awk '{print $1}' | head -1)
     local IS_UPGRADE=false
-    if systemctl is-enabled --quiet wspr-recorder 2>/dev/null; then
+    if [[ -n "$existing" ]]; then
         IS_UPGRADE=true
     fi
-    
+
     echo ""
     if [[ "$IS_UPGRADE" == true ]]; then
         echo "=============================================="
@@ -337,35 +325,35 @@ show_status() {
     echo "Configuration file:     $CONFIG_DIR/config.toml"
     echo "IPC socket:             $RUN_DIR/control.sock"
     echo "WAV output:             $OUTPUT_DIR/<band>/"
+    echo "Logs:                   $LOG_DIR/<instance>.log"
+    echo ""
+    echo "Instance name is derived from [radiod].status_address with"
+    echo "-status.local / .local stripped. Example:"
+    echo "  status_address = \"bee3-status.local\"  ->  wspr-recorder@bee3"
     echo ""
     if [[ "$IS_UPGRADE" == true ]]; then
         echo "Next steps:"
-        echo "  1. Restart the service to use updated version:"
-        echo "     sudo systemctl restart wspr-recorder"
+        echo "  1. Restart running instances to pick up the new version:"
+        echo "     sudo systemctl restart 'wspr-recorder@*'"
         echo ""
         echo "  2. Check status:"
-        echo "     sudo systemctl status wspr-recorder"
+        echo "     sudo systemctl status wspr-recorder@<instance>"
         echo "     wspr-ctl health"
-        echo ""
-        echo "  3. View logs:"
-        echo "     journalctl -u wspr-recorder -f"
     else
         echo "Next steps:"
         echo "  1. Edit configuration:"
-        echo "     sudo nano $CONFIG_DIR/config.toml"
+        echo "     sudoedit $CONFIG_DIR/config.toml"
         echo ""
-        echo "  2. Start the service:"
-        echo "     sudo systemctl start wspr-recorder"
+        echo "  2. Validate it:"
+        echo "     wspr-recorder validate --json"
         echo ""
-        echo "  3. Enable on boot:"
-        echo "     sudo systemctl enable wspr-recorder"
+        echo "  3. Enable and start your instance:"
+        echo "     sudo systemctl enable --now wspr-recorder@<instance>"
         echo ""
         echo "  4. Check status:"
-        echo "     sudo systemctl status wspr-recorder"
+        echo "     sudo systemctl status wspr-recorder@<instance>"
+        echo "     journalctl -fu wspr-recorder@<instance>"
         echo "     wspr-ctl health"
-        echo ""
-        echo "  5. View logs:"
-        echo "     journalctl -u wspr-recorder -f"
     fi
     echo ""
 }

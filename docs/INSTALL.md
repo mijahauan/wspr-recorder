@@ -75,22 +75,15 @@ The script is idempotent (re-running upgrades in place, including
 6. **Runtime dirs** — `/etc/tmpfiles.d/wspr-recorder.conf` declares
    `/run/wspr-recorder` and `/dev/shm/wspr-recorder` owned by
    `wsprrec`; `systemd-tmpfiles --create` materializes them now.
-7. **Systemd unit** — `install.sh` currently writes a *non-templated*
-   `/etc/systemd/system/wspr-recorder.service` (Type=simple,
-   MemoryMax=512M). The canonical templated unit
+7. **Systemd unit** — symlinks the canonical templated unit
    [systemd/wspr-recorder@.service](../systemd/wspr-recorder@.service)
-   (Type=notify, WatchdogSec=180, MemoryMax=1G,
-   `EnvironmentFile=-/etc/sigmond/coordination.env`) is what
-   sigmond-driven deploys install via [deploy.toml](../deploy.toml).
-   **If you want the templated unit, install it manually:**
-
-   ```bash
-   sudo install -m 644 /opt/git/wspr-recorder/systemd/wspr-recorder@.service \
-       /etc/systemd/system/wspr-recorder@.service
-   sudo systemctl disable --now wspr-recorder.service
-   sudo rm /etc/systemd/system/wspr-recorder.service
-   sudo systemctl daemon-reload
-   ```
+   (Type=notify, WatchdogSec=180, MemoryMax=1G, MALLOC_ARENA_MAX=2,
+   `EnvironmentFile=-/etc/sigmond/coordination.env`) into
+   `/etc/systemd/system/` and reloads systemd. If a legacy
+   non-templated `/etc/systemd/system/wspr-recorder.service` exists
+   from an earlier install, it is stopped, disabled, and removed.
+   This is the same unit sigmond-driven deploys install via
+   [deploy.toml](../deploy.toml).
 8. **Symlinks** — `/usr/local/bin/wspr-recorder` and `wspr-ctl`
    point into the venv.
 
