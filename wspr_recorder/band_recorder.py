@@ -64,6 +64,19 @@ class BandRecorderStats:
     periods_emitted: int = 0
     sequence_errors: int = 0
 
+    # Latest StreamQuality snapshot (captured on every on_samples call).
+    # Exposes resequencer-level ground truth for drift diagnosis.
+    sq_total_samples_delivered: int = 0
+    sq_total_samples_expected: int = 0
+    sq_total_gaps_filled: int = 0
+    sq_rtp_packets_received: int = 0
+    sq_rtp_packets_expected: int = 0
+    sq_rtp_packets_lost: int = 0
+    sq_rtp_packets_late: int = 0
+    sq_rtp_packets_duplicate: int = 0
+    sq_rtp_packets_resequenced: int = 0
+    sq_sample_rate: int = 0
+
     def to_dict(self) -> dict:
         return {
             "packets_received": self.packets_received,
@@ -73,6 +86,18 @@ class BandRecorderStats:
             "gaps_filled_samples": self.gaps_filled_samples,
             "periods_emitted": self.periods_emitted,
             "sequence_errors": self.sequence_errors,
+            "stream_quality": {
+                "total_samples_delivered": self.sq_total_samples_delivered,
+                "total_samples_expected": self.sq_total_samples_expected,
+                "total_gaps_filled": self.sq_total_gaps_filled,
+                "rtp_packets_received": self.sq_rtp_packets_received,
+                "rtp_packets_expected": self.sq_rtp_packets_expected,
+                "rtp_packets_lost": self.sq_rtp_packets_lost,
+                "rtp_packets_late": self.sq_rtp_packets_late,
+                "rtp_packets_duplicate": self.sq_rtp_packets_duplicate,
+                "rtp_packets_resequenced": self.sq_rtp_packets_resequenced,
+                "sample_rate": self.sq_sample_rate,
+            },
         }
 
 
@@ -159,6 +184,18 @@ class BandRecorder:
             return
 
         self.stats.samples_received += n
+
+        # Capture resequencer ground-truth counters (drift diagnosis).
+        self.stats.sq_total_samples_delivered = getattr(quality, "total_samples_delivered", 0)
+        self.stats.sq_total_samples_expected = getattr(quality, "total_samples_expected", 0)
+        self.stats.sq_total_gaps_filled = getattr(quality, "total_gaps_filled", 0)
+        self.stats.sq_rtp_packets_received = getattr(quality, "rtp_packets_received", 0)
+        self.stats.sq_rtp_packets_expected = getattr(quality, "rtp_packets_expected", 0)
+        self.stats.sq_rtp_packets_lost = getattr(quality, "rtp_packets_lost", 0)
+        self.stats.sq_rtp_packets_late = getattr(quality, "rtp_packets_late", 0)
+        self.stats.sq_rtp_packets_duplicate = getattr(quality, "rtp_packets_duplicate", 0)
+        self.stats.sq_rtp_packets_resequenced = getattr(quality, "rtp_packets_resequenced", 0)
+        self.stats.sq_sample_rate = getattr(quality, "sample_rate", 0)
 
         # Ensure float32 dtype — ring buffer stores samples as-is to
         # preserve full dynamic range. int16 conversion + per-period
