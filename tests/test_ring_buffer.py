@@ -71,7 +71,10 @@ class TestSingleMinute:
         # wallclock is the START of the slice. close_minute(t=1) marks the
         # end of minute 0, so the slice begins at make_wallclock(0).
         assert wc == make_wallclock(0)
-        assert rtp == 6000
+        # rtp is the START of the slice. close_minute received the
+        # end-of-minute rtp (6000); the slice start rtp is one minute
+        # earlier = 0.
+        assert rtp == 0
 
     def test_extract_returns_copy(self):
         """Extracted data should be a copy, not a view into the ring."""
@@ -103,7 +106,8 @@ class TestMultiMinute:
         # Last minute should be value=5
         assert out[-1] == 5
         assert wc == make_wallclock(0)
-        assert rtp == 6000
+        # Slice start rtp = end-of-minute-0 rtp (6000) minus one minute = 0.
+        assert rtp == 0
 
     def test_extract_partial(self):
         """Extract fewer minutes than available."""

@@ -30,8 +30,8 @@ class MinuteMark:
     """Metadata for a completed minute within the ring buffer."""
     ring_position: int          # Sample index in the ring where this minute starts
     absolute_sample_index: int  # Monotonic sample counter since first sync
-    wallclock: datetime         # UTC wall clock for this minute boundary
-    rtp_timestamp: int          # 32-bit RTP timestamp at this boundary
+    wallclock: datetime         # UTC wall clock for the start of this minute
+    rtp_timestamp: int          # 32-bit RTP timestamp for the start of this minute
     gaps: List[GapEvent] = field(default_factory=list)
 
 
@@ -132,11 +132,14 @@ class RingBuffer:
         have been written. Creates a MinuteMark capturing where this
         minute started, and resets per-minute state.
         """
+        minute_start_wallclock = wallclock - timedelta(seconds=60)
+        minute_start_rtp = (rtp_timestamp - self._samples_per_minute) & 0xFFFFFFFF
+
         mark = MinuteMark(
             ring_position=self._current_minute_start_pos,
             absolute_sample_index=self._absolute_sample_count - self._current_minute_sample_count,
-            wallclock=wallclock,
-            rtp_timestamp=rtp_timestamp,
+            wallclock=minute_start_wallclock,
+            rtp_timestamp=minute_start_rtp,
             gaps=self._current_minute_gaps,
         )
         self._minute_marks.append(mark)
@@ -202,14 +205,10 @@ class RingBuffer:
                 )
                 merged_gaps.append(rebased)
 
-        # MinuteMark.wallclock is the END of that minute (first_wallclock + N*60s).
-        # The slice starts one minute earlier than start_mark's boundary.
-        start_wallclock = start_mark.wallclock - timedelta(seconds=60)
-
         return (
             samples,
             merged_gaps,
-            start_wallclock,
+            start_mark.wallclock,
             start_mark.rtp_timestamp,
         )
 
