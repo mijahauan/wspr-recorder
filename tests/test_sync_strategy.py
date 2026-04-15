@@ -111,6 +111,17 @@ class TestRtpSyncStrategy:
         assert result is not None
         assert result.sample_offset == 0
 
+    def test_boundary_is_next_minute_when_wall_clock_before_30s(self):
+        """If the first packet spans the next minute boundary, the start_wallclock should be the upcoming minute."""
+        strategy = RtpSyncStrategy(SAMPLE_RATE)
+        samples_per_packet = 500_000
+        wall = utc(second=20, us=0)
+        rtp_base = 1_000_000
+
+        result = strategy.should_start_minute(rtp_base, samples_per_packet, wall)
+        assert result is not None
+        assert result.start_wallclock == utc(minute=1)
+
 
 # =============================================================================
 # ClockSyncStrategy

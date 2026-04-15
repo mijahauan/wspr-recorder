@@ -80,6 +80,7 @@ class RtpSyncStrategy(SyncStrategy):
         # Correlation state
         self._correlated = False
         self._next_boundary: Optional[int] = None  # unwrapped RTP ts of next boundary
+        self._next_minute: Optional[datetime] = None  # UTC wall clock of next boundary
         # 32-bit unwrap tracking
         self._last_raw: Optional[int] = None
         self._unwrapped: int = 0
@@ -110,6 +111,7 @@ class RtpSyncStrategy(SyncStrategy):
 
         next_minute = (wall_clock.replace(second=0, microsecond=0)
                        + timedelta(minutes=1 if seconds_past > 0 else 0))
+        self._next_minute = next_minute
         logger.info(
             f"RtpSync: correlated rtp_ts={rtp_timestamp} with {wall_clock.isoformat()}, "
             f"next boundary at unwrapped={self._next_boundary} "
@@ -137,20 +139,11 @@ class RtpSyncStrategy(SyncStrategy):
         # Does [unwrapped, packet_end) span the boundary?
         if unwrapped <= self._next_boundary < packet_end:
             sample_offset = self._next_boundary - unwrapped
-
-            # Compute the wall-clock minute this corresponds to
-            # We know the correlation, so derive it from boundary position
-            samples_from_correlation_to_boundary = self._next_boundary - self._unwrapped
-            # But simpler: just round wall_clock to the nearest minute boundary
-            if wall_clock.second < 30:
-                minute_utc = wall_clock.replace(second=0, microsecond=0)
-            else:
-                minute_utc = (wall_clock.replace(second=0, microsecond=0)
-                              + timedelta(minutes=1))
+            minute_utc = self._next_minute or wall_clock.replace(second=0, microsecond=0)
 
             return SyncDecision(
                 start_wallclock=minute_utc,
-                start_rtp_timestamp=rtp_timestamp + sample_offset,
+                start_rtp_timestamp=(rtp_timestamp + sample_offset) & 0xFFFFFFFF,
                 sample_offset=sample_offset,
             )
 
@@ -160,9 +153,11 @@ class RtpSyncStrategy(SyncStrategy):
         """Advance the boundary target by one minute of samples."""
         if self._next_boundary is not None:
             self._next_boundary += self.samples_per_minute
+        if self._next_minute is not None:
+            self._next_minute += timedelta(minutes=1)
             logger.debug(
                 f"RtpSync: next boundary at unwrapped={self._next_boundary} "
-                f"(~{wall_clock.strftime('%H:%M')}Z +60s)"
+                f"({self._next_minute.strftime('%H:%M')}Z +60s)"
             )
 
 
