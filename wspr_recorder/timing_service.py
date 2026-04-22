@@ -516,6 +516,48 @@ class TimingService:
         else:
             return "system clock"
     
+    def check_clock_health(self) -> bool:
+        """
+        Check whether the system clock is synchronized and accurate.
+
+        Logs an ERROR if the clock is unsynchronized or off by >= 1 second.
+        Returns True if the clock looks healthy, False if there is a problem.
+
+        Call this at startup and whenever a sync strategy is created so
+        operators see an immediate warning rather than discovering zero spots
+        after the fact.
+        """
+        chrony = self.get_chrony_status(force_refresh=True)
+        if chrony is None:
+            logger.warning(
+                "CLOCK WARNING: chronyc is unavailable — cannot verify system "
+                "clock accuracy. WAV timestamps may be wrong."
+            )
+            return False
+
+        if chrony.leap_status.strip() == "Not synchronised" or chrony.stratum == 0:
+            logger.error(
+                "CLOCK ERROR: System clock is NOT synchronized (chrony stratum 0, "
+                "ref_id=00000000, leap_status='%s'). WAV file timestamps will be "
+                "wrong and WSPR decode rate will be zero. Fix NTP/chrony "
+                "configuration and restart wspr-recorder.",
+                chrony.leap_status.strip(),
+            )
+            return False
+
+        if abs(chrony.system_time_offset_ms) >= 1000.0:
+            logger.error(
+                "CLOCK ERROR: System clock is %.1f seconds off from NTP "
+                "(chrony stratum %d, ref=%s). WAV file timestamps may be wrong "
+                "and WSPR decode rate may be zero.",
+                chrony.system_time_offset_ms / 1000.0,
+                chrony.stratum,
+                chrony.ref_id,
+            )
+            return False
+
+        return True
+
     def detect_timing_level(self) -> str:
         """
         Detect the current timing level based on available sources.
@@ -553,6 +595,8 @@ class TimingService:
         from .sync_strategy import (
             RtpSyncStrategy, ClockSyncStrategy, FallbackSyncStrategy,
         )
+
+        self.check_clock_health()
 
         if self.authority == 'rtp':
             logger.info("Timing: authority=rtp, using RtpSyncStrategy (L5/L6)")

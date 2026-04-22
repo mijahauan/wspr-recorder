@@ -418,6 +418,7 @@ class WsprRecorder:
             authority=self.config.timing.authority
         )
         logger.info(f"Timing service initialized: {self.timing_service.get_status()['best_source']}")
+        self.timing_service.check_clock_health()
         
         # Initialize components
         self.wav_writer = WavWriter(

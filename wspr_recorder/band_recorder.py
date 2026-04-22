@@ -290,6 +290,16 @@ class BandRecorder:
         actual_wallclock = datetime.now(timezone.utc)
         drift_obs = self._drift_tracker.observe(minute_wallclock, actual_wallclock)
 
+        if abs(drift_obs.delta_ms) >= 1000.0:
+            logger.error(
+                "%s: CLOCK ERROR: system clock is %.1fs off from RTP-derived "
+                "UTC (cumulative drift %.1fs). WAV timestamps are wrong — "
+                "WSPR decode rate will be zero. Fix NTP/chrony and restart.",
+                self.band_name,
+                drift_obs.delta_ms / 1000.0,
+                drift_obs.cumulative_drift_ms / 1000.0,
+            )
+
         # Close the minute in the ring buffer
         self._ring.close_minute(minute_wallclock, minute_rtp)
 
