@@ -188,3 +188,85 @@ class TestFallbackSyncStrategy:
         result = strategy.should_start_minute(42_000, 240, wall)
         assert result is not None
         assert result.start_rtp_timestamp == 42_000
+
+
+# =============================================================================
+# RtpSyncStrategy with AuthorityReader
+# =============================================================================
+
+class _FakeSnap:
+    """Stand-in for AuthoritySnapshot exposing just what the strategy needs."""
+    def __init__(self, offset_usable: bool, offset_ns: int = 0):
+        self.offset_usable = offset_usable
+        self.rtp_to_utc_offset_ns = offset_ns
+
+
+class _FakeReader:
+    """In-memory authority reader stand-in."""
+    def __init__(self, snap):
+        self._snap = snap
+
+    def read(self):
+        return self._snap
+
+
+class TestRtpSyncStrategyWithAuthority:
+
+    def test_no_reader_attached_logs_as_wall_clock_source(self, caplog):
+        """Legacy RtpSyncStrategy behavior — no reader means wall_clock correlation."""
+        import logging
+        strategy = RtpSyncStrategy(SAMPLE_RATE)
+        with caplog.at_level(logging.WARNING, logger="wspr_recorder.sync_strategy"):
+            strategy.should_start_minute(100_000, 240, utc(second=58))
+        assert strategy.correlation_source == "wall_clock"
+        assert strategy.correlation_offset_ns is None
+        # Warning must flag the standalone-fallback semantics.
+        assert any("standalone fallback" in r.message for r in caplog.records)
+
+    def test_reader_with_no_snapshot_falls_back_to_wall_clock(self):
+        strategy = RtpSyncStrategy(SAMPLE_RATE, authority_reader=_FakeReader(None))
+        strategy.should_start_minute(100_000, 240, utc(second=58))
+        assert strategy.correlation_source == "wall_clock"
+
+    def test_reader_with_unusable_offset_falls_back_to_wall_clock(self):
+        # t_level_active=None -> offset_usable=False (bootstrap-pending or T0)
+        strategy = RtpSyncStrategy(
+            SAMPLE_RATE,
+            authority_reader=_FakeReader(_FakeSnap(offset_usable=False)),
+        )
+        strategy.should_start_minute(100_000, 240, utc(second=58))
+        assert strategy.correlation_source == "wall_clock"
+
+    def test_reader_with_usable_offset_uses_authority_source(self):
+        strategy = RtpSyncStrategy(
+            SAMPLE_RATE,
+            authority_reader=_FakeReader(_FakeSnap(offset_usable=True, offset_ns=812_345)),
+        )
+        strategy.should_start_minute(100_000, 240, utc(second=58))
+        assert strategy.correlation_source == "authority"
+        assert strategy.correlation_offset_ns == 812_345
+
+    def test_reader_exception_treated_as_unavailable(self, caplog):
+        class _BoomReader:
+            def read(self):
+                raise RuntimeError("kaboom")
+        strategy = RtpSyncStrategy(SAMPLE_RATE, authority_reader=_BoomReader())
+        import logging
+        with caplog.at_level(logging.WARNING, logger="wspr_recorder.sync_strategy"):
+            strategy.should_start_minute(100_000, 240, utc(second=58))
+        assert strategy.correlation_source == "wall_clock"
+        assert any("Authority reader raised" in r.message for r in caplog.records)
+
+    def test_correlation_happens_once(self):
+        """Authority reader should be consulted at correlation, not every packet."""
+        calls = {"n": 0}
+
+        class _CountingReader:
+            def read(self_inner):
+                calls["n"] += 1
+                return _FakeSnap(offset_usable=True, offset_ns=100)
+
+        strategy = RtpSyncStrategy(SAMPLE_RATE, authority_reader=_CountingReader())
+        for i in range(5):
+            strategy.should_start_minute(100_000 + i * 240, 240, utc(second=58))
+        assert calls["n"] == 1  # only the first packet triggers correlation

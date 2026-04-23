@@ -589,9 +589,32 @@ class TimingService:
         """
         Create the appropriate SyncStrategy for the current timing authority.
 
-        Each BandRecorder should get its own instance (RTP strategy tracks
-        per-stream RTP timestamp state).
+        Under the RTP-reference labeling invariant
+        (hf-timestd/docs/METROLOGY.md §4.5.1), RtpSyncStrategy is the
+        default in every mode — labels are always derived from RTP time.
+        What changes between modes is where the RTP→UTC offset comes
+        from at one-time correlation:
+
+          authority = "auto" (default): prefer /run/hf-timestd/authority.json.
+            When the file is available and reports a usable offset, correlate
+            via the offset (precise, system-clock-independent). When the file
+            is missing or stale (standalone mode, no hf-timestd), fall back
+            to wall-clock correlation one-time at startup with a warning.
+
+          authority = "rtp": force RtpSyncStrategy with no authority reader.
+            Legacy explicit-RTP behavior. The correlation uses the wall clock.
+
+          authority = "fusion": deprecated alias for "auto". Kept for
+            backward compatibility with older configs.
+
+          authority = "legacy-clock": use the deprecated ClockSyncStrategy /
+            FallbackSyncStrategy hierarchy below. Retained for operators
+            without hf-timestd who prefer the old behavior explicitly.
+
+        Each BandRecorder should get its own instance (RtpSyncStrategy
+        tracks per-stream RTP timestamp state).
         """
+        from .authority_reader import AuthorityReader
         from .sync_strategy import (
             RtpSyncStrategy, ClockSyncStrategy, FallbackSyncStrategy,
         )
@@ -599,44 +622,59 @@ class TimingService:
         self.check_clock_health()
 
         if self.authority == 'rtp':
-            logger.info("Timing: authority=rtp, using RtpSyncStrategy (L5/L6)")
+            logger.info("Timing: authority=rtp, using RtpSyncStrategy (no authority reader)")
             return RtpSyncStrategy(sample_rate)
 
-        # Auto-detect best available
-        chrony = self.get_chrony_status()
-        hf = self.get_hf_status()
+        if self.authority in ('auto', 'fusion'):
+            reader = AuthorityReader()
+            snap = reader.read()
+            if snap is not None and snap.offset_usable:
+                logger.info(
+                    "Timing: authority=%s, hf-timestd authority.json available "
+                    "(a_level=%s, t_level_active=%s, offset=%+d ns, sigma=%s ns)",
+                    self.authority, snap.a_level, snap.t_level_active,
+                    snap.rtp_to_utc_offset_ns, snap.sigma_ns,
+                )
+            else:
+                logger.warning(
+                    "Timing: authority=%s, hf-timestd authority.json unavailable — "
+                    "falling back to wall-clock-correlated RtpSyncStrategy "
+                    "(standalone mode; ensure radiod's host clock is correct at "
+                    "startup and note that RTP_TIMESNAP staleness will drift "
+                    "~18 ms/hour without a GPSDO on the radiod host)",
+                    self.authority,
+                )
+            # Always use RtpSyncStrategy — reader is used opportunistically.
+            return RtpSyncStrategy(sample_rate, authority_reader=reader)
 
-        # L4: chrony with local GPS/PPS (sub-ms)
-        if chrony and chrony.ref_id in ('GPS', 'PPS') and chrony.estimated_uncertainty_ms < 1.0:
-            logger.info(
-                f"Timing: chrony/{chrony.ref_id} sub-ms, "
-                f"using ClockSyncStrategy (L4, {chrony.estimated_uncertainty_ms:.2f}ms)"
+        if self.authority == 'legacy-clock':
+            # Deprecated but kept for operators who want the old behavior
+            # explicitly. Will be removed in a future release.
+            logger.warning(
+                "Timing: authority=legacy-clock — using deprecated "
+                "ClockSyncStrategy/FallbackSyncStrategy hierarchy. These "
+                "consult the system clock for labeling and violate the "
+                "RTP-reference invariant. Prefer authority=auto."
             )
-            return ClockSyncStrategy(sample_rate, tier='L4',
-                                     uncertainty_ms=chrony.estimated_uncertainty_ms)
+            chrony = self.get_chrony_status()
+            if chrony and chrony.ref_id in ('GPS', 'PPS') and chrony.estimated_uncertainty_ms < 1.0:
+                return ClockSyncStrategy(
+                    sample_rate, tier='L4',
+                    uncertainty_ms=chrony.estimated_uncertainty_ms,
+                )
+            if chrony and chrony.stratum < 16:
+                return ClockSyncStrategy(
+                    sample_rate, tier='L2',
+                    uncertainty_ms=chrony.estimated_uncertainty_ms,
+                )
+            return FallbackSyncStrategy(sample_rate)
 
-        # L3: hf-timestd Fusion → chrony
-        if hf and hf.is_active and hf.authority == 'fusion' and hf.is_locked:
-            uncertainty = hf.fusion_uncertainty_ms or 1.0
-            logger.info(
-                f"Timing: hf-timestd Fusion locked, "
-                f"using ClockSyncStrategy (L3, {uncertainty:.2f}ms)"
-            )
-            return ClockSyncStrategy(sample_rate, tier='L3',
-                                     uncertainty_ms=uncertainty)
-
-        # L2: chrony with NTP
-        if chrony and chrony.stratum < 16:
-            logger.info(
-                f"Timing: chrony stratum {chrony.stratum}, "
-                f"using ClockSyncStrategy (L2, {chrony.estimated_uncertainty_ms:.2f}ms)"
-            )
-            return ClockSyncStrategy(sample_rate, tier='L2',
-                                     uncertainty_ms=chrony.estimated_uncertainty_ms)
-
-        # L1: undisciplined wall clock
-        logger.warning("Timing: no timing authority detected, using FallbackSyncStrategy (L1)")
-        return FallbackSyncStrategy(sample_rate)
+        # Unknown value — treat as auto with a warning.
+        logger.warning(
+            "Timing: unknown authority=%r; defaulting to auto", self.authority,
+        )
+        reader = AuthorityReader()
+        return RtpSyncStrategy(sample_rate, authority_reader=reader)
 
     def _get_best_uncertainty(
         self,

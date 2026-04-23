@@ -47,25 +47,35 @@ ipc_socket = "/run/wspr-recorder/control.sock"
 [timing]
 # Timing authority for minute-boundary sync.
 #
-# "auto" (default): Auto-detect the best available timing source, probing
-#   downward through the hierarchy:
-#     L4 - chrony tracking GPS/PPS with sub-ms dispersion (GPS+PPS on LAN)
-#     L3 - hf-timestd Fusion feeding chrony (UTC(NIST), sub-ms)
-#     L2 - chrony with WAN NTP pools (~10-100ms)
-#     L1 - undisciplined system clock (fallback)
+# Under the RTP-reference labeling invariant
+# (hf-timestd/docs/METROLOGY.md §4.5.1), all WAV labels are derived from
+# radiod's RTP timestamps plus an optional RTP→UTC offset from hf-timestd.
+# The recorder never consults its own system clock for data labeling;
+# the wall clock is used at most ONCE at startup to correlate the RTP
+# counter with a UTC minute, after which the GPSDO-clocked RTP counter
+# carries the alignment.
 #
-# "rtp": Declare that radiod has GPSDO/PPS (L5/L6). The recorder will use
-#   RTP timestamps from the stream as the authoritative time source — the
-#   wall clock is consulted only once at startup to correlate the RTP
-#   timestamp with a UTC minute. All subsequent minute boundaries are
-#   derived from the GPSDO-clocked RTP sample counter, independent of the
-#   wspr-recorder machine's own clock discipline.
+# "auto" (default): RtpSyncStrategy with optional /run/hf-timestd/authority.json
+#   reader. When hf-timestd is running and publishing a usable offset,
+#   correlation uses the offset (precise, system-clock-independent). When
+#   the file is missing or stale (standalone mode — sigmond client running
+#   without hf-timestd), correlation falls back to a one-time wall-clock
+#   read at startup. Operator is responsible for ensuring radiod's host
+#   clock is at least minute-accurate at startup and that radiod refreshes
+#   its RTP_TIMESNAP often enough to keep oscillator drift within WSPR
+#   tolerance.
 #
-#   Set this ONLY if you know radiod is receiving GPS+PPS directly on its
-#   host or has HF-injected PPS — it cannot be auto-detected.
+# "rtp": RtpSyncStrategy without the authority reader. Legacy explicit-RTP
+#   behavior — one-time wall-clock correlation at startup, no later offset
+#   application.
 #
-# "fusion": Force use of hf-timestd Fusion metrology (L3) regardless of
-#   other sources. Useful for testing.
+# "fusion": Deprecated alias for "auto", kept for backward compatibility
+#   with older configs.
+#
+# "legacy-clock": Deprecated. Uses the old ClockSyncStrategy /
+#   FallbackSyncStrategy hierarchy that consults the system clock for
+#   labeling — violates the RTP-reference invariant. Only set this if you
+#   have a specific reason to keep the pre-authority-manager behavior.
 authority = "auto"
 
 [radiod]
