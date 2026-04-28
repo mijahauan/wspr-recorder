@@ -21,7 +21,7 @@ import signal
 import sys
 from pathlib import Path
 
-SUBCOMMANDS = {"inventory", "validate", "version", "daemon"}
+SUBCOMMANDS = {"inventory", "validate", "version", "daemon", "config"}
 
 DEFAULT_CONFIG_PATH = Path(
     os.environ.get("WSPR_RECORDER_CONFIG", "/etc/wspr-recorder/config.toml")
@@ -96,6 +96,19 @@ def main(argv: list[str] | None = None) -> None:
     sub_daemon = subparsers.add_parser("daemon")
     _add_common(sub_daemon)
 
+    # Configuration interview (CONTRACT-v0.5 §14).
+    sub_cfg = subparsers.add_parser("config")
+    cfg_sub = sub_cfg.add_subparsers(dest="config_command")
+
+    sub_init = cfg_sub.add_parser("init")
+    sub_init.add_argument("--reconfig", action="store_true")
+    sub_init.add_argument("--non-interactive", action="store_true")
+    _add_common(sub_init)
+
+    sub_edit = cfg_sub.add_parser("edit")
+    sub_edit.add_argument("--non-interactive", action="store_true")
+    _add_common(sub_edit)
+
     args = parser.parse_args(argv)
 
     if args.log_level and not quiet:
@@ -111,9 +124,23 @@ def main(argv: list[str] | None = None) -> None:
         _handle_version(args)
     elif args.command == "daemon":
         _handle_daemon(args)
+    elif args.command == "config":
+        _handle_config(args)
     else:  # pragma: no cover
         parser.print_help()
         sys.exit(1)
+
+
+def _handle_config(args) -> None:
+    from . import configurator
+
+    sub = getattr(args, "config_command", None)
+    if sub == "init":
+        sys.exit(configurator.cmd_config_init(args))
+    if sub == "edit":
+        sys.exit(configurator.cmd_config_edit(args))
+    print("usage: wspr-recorder config {init|edit} [--non-interactive]")
+    sys.exit(2)
 
 
 def _config_path(args) -> Path:

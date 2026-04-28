@@ -4,6 +4,15 @@ version          = "0.1.0"
 contract_version = "0.4"
 license          = "MIT"
 
+# Configuration interview (CONTRACT-v0.5 §14).  Sigmond invokes
+# wspr-recorder's own argparse subcommands.  Only [radiod].status_address
+# is written here; reporter callsign/grid live in wsprdaemon-client (or
+# coordination.toml [host]) since wspr-recorder's schema has no
+# [station] block.
+[contract.config]
+init = ["/usr/local/bin/wspr-recorder", "config", "init"]
+edit = ["/usr/local/bin/wspr-recorder", "config", "edit"]
+
 [build]
 steps = [
     "python3 -m venv /opt/wspr-recorder/venv",
