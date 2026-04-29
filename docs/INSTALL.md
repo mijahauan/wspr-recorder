@@ -47,10 +47,10 @@ does not invoke them.
 
 ## First-run install: `install.sh`
 
-From a clone at `/opt/git/wspr-recorder`:
+From a clone at `/opt/git/sigmond/wspr-recorder`:
 
 ```bash
-sudo /opt/git/wspr-recorder/install.sh
+sudo /opt/git/sigmond/wspr-recorder/install.sh
 ```
 
 The script is idempotent (re-running upgrades in place, including
@@ -62,7 +62,7 @@ The script is idempotent (re-running upgrades in place, including
 2. **Pattern A check** — verifies `wsprrec` can read
    `<repo>/wspr_recorder/__init__.py`. Fails loudly if the repo lives
    under a mode-700 home directory. Canonical location:
-   `/opt/git/wspr-recorder`. Contract v0.4 §12.5.
+   `/opt/git/sigmond/wspr-recorder`. Contract v0.4 §12.5.
 3. **Venv** — creates `/opt/wspr-recorder/venv` (or upgrades in
    place). Python ≥ 3.9.
 4. **Editable install** — `pip install` of the repo into the venv,
@@ -96,7 +96,7 @@ sudo systemctl enable --now wspr-recorder@<radiod_id>
 ## Upgrade
 
 ```bash
-cd /opt/git/wspr-recorder && sudo git pull
+cd /opt/git/sigmond/wspr-recorder && sudo git pull
 sudo ./install.sh
 sudo systemctl restart wspr-recorder@<radiod_id>
 ```
@@ -104,11 +104,11 @@ sudo systemctl restart wspr-recorder@<radiod_id>
 ## Uninstall
 
 ```bash
-sudo /opt/git/wspr-recorder/install.sh --uninstall
+sudo /opt/git/sigmond/wspr-recorder/install.sh --uninstall
 ```
 
 Prompts before removing `/etc/wspr-recorder` and the `wsprrec` user.
-The repo at `/opt/git/wspr-recorder` is untouched.
+The repo at `/opt/git/sigmond/wspr-recorder` is untouched.
 
 ## File and path layout
 
@@ -119,7 +119,7 @@ The repo at `/opt/git/wspr-recorder` is untouched.
 | `/etc/sigmond/coordination.env` | Sigmond cross-client env (optional) | root |
 | `/etc/systemd/system/wspr-recorder@.service` | Templated unit (canonical) | root |
 | `/etc/tmpfiles.d/wspr-recorder.conf` | Declares runtime dirs | root |
-| `/opt/git/wspr-recorder/` | Source checkout | repo owner; readable by `wsprrec` |
+| `/opt/git/sigmond/wspr-recorder/` | Source checkout | repo owner; readable by `wsprrec` |
 | `/opt/wspr-recorder/venv/` | Python venv | `wsprrec:wsprrec` |
 | `/dev/shm/wspr-recorder/<band>/` | WAV + JSON sidecar output (tmpfs) | `wsprrec` |
 | `/var/log/wspr-recorder/<instance>.log` | Process log (appended by systemd) | `wsprrec` |
@@ -140,7 +140,7 @@ The service user (`wsprrec`) must be able to traverse the repo path.
 Homedirs with mode 0700 break this even if individual files are
 world-readable. The fix is one of:
 
-- Place the repo at `/opt/git/wspr-recorder` (group-readable path).
+- Place the repo at `/opt/git/sigmond/wspr-recorder` (group-readable path).
 - `chmod g+rx` each path component and add `wsprrec` to the owning
   group.
 

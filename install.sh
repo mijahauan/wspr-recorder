@@ -100,7 +100,7 @@ create_user() {
 
 check_pattern_a() {
     # Contract v0.4 §12.5: the repo must be traversable by the service
-    # user. The canonical location is /opt/git/wspr-recorder (group-readable);
+    # user. The canonical location is /opt/git/sigmond/wspr-recorder (group-readable);
     # repos under a mode-700 home directory are unreachable even if
     # individual files are world-readable.
     local repo_root
@@ -108,7 +108,7 @@ check_pattern_a() {
     local marker="$repo_root/wspr_recorder/__init__.py"
     if ! sudo -u "$SERVICE_USER" test -r "$marker"; then
         error "Service user $SERVICE_USER cannot read $marker — Pattern A violation.
-    Fix: place the repo at /opt/git/wspr-recorder (not under a mode-700 home),
+    Fix: place the repo at /opt/git/sigmond/wspr-recorder (not under a mode-700 home),
     or: chmod g+rx the path and add $SERVICE_USER to the owner's group."
     fi
     info "Pattern A check passed ($SERVICE_USER can traverse $repo_root)"

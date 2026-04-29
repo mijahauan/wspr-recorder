@@ -30,8 +30,8 @@ instance id is derived from `status_address` by stripping
 ## Quickstart
 
 ```bash
-git clone https://github.com/mijahauan/wspr-recorder /opt/git/wspr-recorder
-sudo /opt/git/wspr-recorder/install.sh
+git clone https://github.com/mijahauan/wspr-recorder /opt/git/sigmond/wspr-recorder
+sudo /opt/git/sigmond/wspr-recorder/install.sh
 sudoedit /etc/wspr-recorder/config.toml   # set status_address, bands
 sudo systemctl start wspr-recorder@<radiod_id>
 journalctl -fu wspr-recorder@<radiod_id>

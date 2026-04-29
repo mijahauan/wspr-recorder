@@ -17,7 +17,7 @@ edit = ["/usr/local/bin/wspr-recorder", "config", "edit"]
 steps = [
     "python3 -m venv /opt/wspr-recorder/venv",
     "/opt/wspr-recorder/venv/bin/pip install --upgrade pip setuptools wheel",
-    "/opt/wspr-recorder/venv/bin/pip install -e /opt/git/wspr-recorder",
+    "/opt/wspr-recorder/venv/bin/pip install -e /opt/git/sigmond/wspr-recorder",
 ]
 produces = [
     "/opt/wspr-recorder/venv/bin/wspr-recorder",

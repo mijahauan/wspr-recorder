@@ -19,7 +19,7 @@
 set -euo pipefail
 
 SERVICE_USER="wsprrec"
-REPO_SOURCE="/opt/git/wspr-recorder"
+REPO_SOURCE="/opt/git/sigmond/wspr-recorder"
 VENV_DIR="/opt/wspr-recorder/venv"
 
 ui_info()  { echo "[INFO]  $*"; }

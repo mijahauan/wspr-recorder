@@ -294,7 +294,7 @@ does not apply here.
 ### §12.5 Pattern A canonical layout (SHOULD) — implemented
 
 Deploy target is `/opt/wspr-recorder/venv` (installed by deploy.toml)
-with the source checkout at `/opt/git/wspr-recorder`. `install.sh`'s
+with the source checkout at `/opt/git/sigmond/wspr-recorder`. `install.sh`'s
 `check_pattern_a` helper enforces this with a `sudo -u <user> test -r
 <repo>/wspr_recorder/__init__.py` traversability check before
 provisioning the venv — the service user can't traverse a mode-700

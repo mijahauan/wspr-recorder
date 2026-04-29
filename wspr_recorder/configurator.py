@@ -35,7 +35,7 @@ DEFAULT_CONFIG_PATH = Path(
 def _find_template() -> Optional[Path]:
     candidates = [
         Path(__file__).resolve().parent.parent / "config.toml.example",
-        Path("/opt/git/wspr-recorder/config.toml.example"),
+        Path("/opt/git/sigmond/wspr-recorder/config.toml.example"),
         Path("/usr/local/share/wspr-recorder/config.toml.example"),
     ]
     for p in candidates:
