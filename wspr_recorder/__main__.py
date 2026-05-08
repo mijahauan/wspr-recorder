@@ -135,6 +135,54 @@ class WsprRecorder:
                 max_files_per_band=self.config.recorder.max_files_per_band,
             )
     
+    def _lifetime_refresh_pass(self) -> None:
+        """One pass of LIFETIME keep-alive across every (multi, ssrc)
+        entry.  Per-call failures (radiod restart, network blip) are
+        logged but don't propagate — the next pass retries.  Pulled out
+        of the async loop so tests can drive it directly without
+        fighting the asyncio.sleep cadence.
+        """
+        if self.receiver_manager is None:
+            return
+        rlf = self.config.processing.radiod_lifetime_frames
+        for multi, ssrc in self.receiver_manager._lifetime_entries:
+            try:
+                multi.set_channel_lifetime(ssrc, rlf)
+            except Exception as exc:
+                logger.warning(
+                    "lifetime keepalive failed (ssrc=%s): %s", ssrc, exc,
+                )
+
+    async def _lifetime_keepalive_loop(self) -> None:
+        """Refresh radiod's LIFETIME on every active SSRC.
+
+        Cadence is (radiod_lifetime_frames / 50 / 4) seconds — 4× safety
+        margin against radiod self-destruct if a single refresh is
+        missed.  No-op when no channels opted in (lifetime configured
+        as 0) or before provisioning completes.  MultiStream's
+        drop/restore path re-applies the slot's lifetime on its own.
+        """
+        if (
+            self.receiver_manager is None
+            or not self.receiver_manager._lifetime_entries
+        ):
+            return
+        rlf = self.config.processing.radiod_lifetime_frames
+        # Floor at 1 s so absurd configs don't busy-loop.
+        interval = max(rlf / 50.0 / 4.0, 1.0)
+        logger.info(
+            "lifetime keepalive: %d channels, %d frames, refresh every %.1fs",
+            len(self.receiver_manager._lifetime_entries), rlf, interval,
+        )
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+                self._lifetime_refresh_pass()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Lifetime keepalive loop error: {e}")
+
     async def _cleanup_loop(self) -> None:
         """Periodically clean up old WAV files."""
         while self._running:
@@ -456,21 +504,24 @@ class WsprRecorder:
             status_task = asyncio.create_task(self._status_loop())
             health_task = asyncio.create_task(self._health_check_loop())
             memprofile_task = asyncio.create_task(self._memprofile_loop())
-            
+            lifetime_task = asyncio.create_task(self._lifetime_keepalive_loop())
+
             logger.info("WSPR recorder running")
-            
+
             # Wait for shutdown signal
             await self._shutdown_event.wait()
-            
+
             # Cancel background tasks
             cleanup_task.cancel()
             status_task.cancel()
             health_task.cancel()
             memprofile_task.cancel()
+            lifetime_task.cancel()
 
             try:
                 await asyncio.gather(
                     cleanup_task, status_task, health_task, memprofile_task,
+                    lifetime_task,
                     return_exceptions=True,
                 )
             except Exception:

@@ -173,6 +173,22 @@ class TimingConfig:
     """Timing source configuration."""
     authority: str = "auto"  # "rtp", "fusion", "auto"
 
+
+@dataclass
+class ProcessingConfig:
+    """Processing-side options that don't fit channel/recorder/timing.
+
+    radiod_lifetime_frames opts every channel into ka9q-radio's LIFETIME
+    self-destruct timer (ka9q-python ≥3.13.0, radiod ≥0f8b622).  Channels
+    auto-destruct after this many radiod main-loop frames (~50 Hz at the
+    default 20 ms blocktime, so 6000 ≈ 2 min).  The recorder refreshes
+    lifetime on every active SSRC every (frames / 4) seconds while
+    running, so a crashed/killed recorder leaves no residual channels
+    on radiod within ~2 min.  0 = infinite (no LIFETIME tag, no
+    keep-alive — radiod owns the channel for its full template default).
+    """
+    radiod_lifetime_frames: int = 6000
+
 @dataclass
 class BandConfig:
     """Per-band configuration with decode modes."""
@@ -220,6 +236,7 @@ class Config:
     recorder: RecorderConfig = field(default_factory=RecorderConfig)
     timing: TimingConfig = field(default_factory=TimingConfig)
     radiod: RadiodConfig = field(default_factory=RadiodConfig)
+    processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     channel_defaults: ChannelDefaults = field(default_factory=ChannelDefaults)
     frequencies: List[int] = field(default_factory=list)
     bands: List[BandConfig] = field(default_factory=list)
@@ -262,6 +279,14 @@ class Config:
             errors.append(
                 f"Invalid timing authority: {self.timing.authority!r}, "
                 f"must be one of {valid_authorities}"
+            )
+
+        # Validate radiod lifetime frames
+        rlf = self.processing.radiod_lifetime_frames
+        if not isinstance(rlf, int) or rlf < 0:
+            errors.append(
+                f"processing.radiod_lifetime_frames must be a non-negative "
+                f"int (frames; ~50 Hz at default blocktime); got {rlf!r}"
             )
 
         # Validate band configs
@@ -339,6 +364,16 @@ def load_config(config_path: str) -> Config:
         tim = data["timing"]
         config.timing = TimingConfig(
             authority=tim.get("authority", config.timing.authority),
+        )
+
+    # Parse processing section
+    if "processing" in data:
+        proc = data["processing"]
+        config.processing = ProcessingConfig(
+            radiod_lifetime_frames=proc.get(
+                "radiod_lifetime_frames",
+                config.processing.radiod_lifetime_frames,
+            ),
         )
     
     

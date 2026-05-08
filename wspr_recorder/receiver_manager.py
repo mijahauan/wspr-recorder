@@ -118,6 +118,9 @@ class ReceiverManager:
         )
         self._control: Optional[RadiodControl] = None
         self._multi_by_group: Dict[Tuple[str, int], MultiStream] = {}
+        # (MultiStream, ssrc) pairs for LIFETIME keep-alive — populated
+        # at provisioning, consumed by an async loop in __main__.
+        self._lifetime_entries: List[Tuple[MultiStream, int]] = []
 
     def connect(self) -> bool:
         """Provision all channels and register them with MultiStream(s)."""
@@ -147,6 +150,11 @@ class ReceiverManager:
         defaults = self.config.channel_defaults
         encoding_int = _resolve_encoding(defaults.encoding)
 
+        # `lifetime=None` when configured to 0 — distinguishes "no
+        # LIFETIME tag at all" from "finite N frames".
+        rlf = self.config.processing.radiod_lifetime_frames
+        lifetime_arg: Optional[int] = rlf if rlf > 0 else None
+
         try:
             info = self._control.ensure_channel(
                 frequency_hz=float(freq_hz),
@@ -155,6 +163,7 @@ class ReceiverManager:
                 agc_enable=1 if defaults.agc else 0,
                 gain=defaults.gain,
                 encoding=encoding_int,
+                lifetime=lifetime_arg,
             )
             self._control.set_filter(
                 ssrc=info.ssrc,
@@ -192,7 +201,10 @@ class ReceiverManager:
                 on_samples=sink.on_samples,
                 on_stream_dropped=sink.on_stream_dropped,
                 on_stream_restored=sink.on_stream_restored,
+                lifetime=lifetime_arg,
             )
+            if lifetime_arg is not None:
+                self._lifetime_entries.append((multi, info.ssrc))
 
             logger.info(
                 f"Created: {band_name} ({freq_hz} Hz) -> "
