@@ -21,6 +21,7 @@ Channel auto-recovery on stream drops is handled inside MultiStream.
 """
 
 import logging
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -31,6 +32,132 @@ from ka9q.discovery import ChannelInfo
 from .config import Config, freq_to_band_name
 
 logger = logging.getLogger(__name__)
+
+
+# Settled-capture gate (V1 fix, mirrors psk-recorder and
+# hf-timestd CoreRecorderV2; see
+# hf-timestd/docs/TIMING-PIPELINE-WIRING.md §6.6).  BandRecorder
+# captures ``_first_wallclock = datetime.now(utc)`` the first time
+# samples arrive on a freshly-synced minute boundary
+# (band_recorder.py:252).  Subsequent per-minute WAV timestamps are
+# computed by grid propagation: ``first_wallclock + N*60s``.  If
+# chrony has not settled when that first sample arrives, every
+# downstream WAV inherits the ε_0 offset forever, silently
+# corrupting WSPR spot UTCs.  Gating ``connect()`` (and therefore
+# stream start) on chrony's ``Last offset`` being within threshold
+# for ``SETTLE_REQUIRED_CYCLES`` consecutive readings keeps
+# ε_0 ≈ 0.
+SETTLE_MAX_OFFSET_S = 0.0001        # 100 µs
+SETTLE_REQUIRED_CYCLES = 3
+SETTLE_POLL_SEC = 5.0
+SETTLE_TIMEOUT_SEC = 60.0
+
+
+def _parse_chronyc_last_offset(text: str) -> Optional[float]:
+    """Parse ``Last offset`` (seconds) from ``chronyc tracking``."""
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s.startswith("Last offset"):
+            _, _, val = s.partition(":")
+            val = val.strip()
+            if not val:
+                return None
+            token = val.split()[0]
+            try:
+                return float(token)
+            except ValueError:
+                return None
+    return None
+
+
+def _wait_for_chrony_settled() -> bool:
+    """Block until chrony has been within ``SETTLE_MAX_OFFSET_S`` for
+    ``SETTLE_REQUIRED_CYCLES`` consecutive readings.  Returns True if
+    settled, False on timeout or if chronyc is unavailable (degraded
+    mode, logged loudly).
+    """
+    try:
+        subprocess.run(["chronyc", "-h"], capture_output=True, timeout=2.0)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        logger.warning(
+            "wspr-recorder settled-capture gate: chronyc unavailable — "
+            "first_wallclock will be captured without verification "
+            "(ε_0 may be non-zero, V1 not prevented; WAV minute "
+            "timestamps may be silently wrong)"
+        )
+        return False
+
+    consecutive = 0
+    wait_start = time.monotonic()
+    deadline = wait_start + SETTLE_TIMEOUT_SEC
+    logger.info(
+        "wspr-recorder settled-capture gate: waiting for chrony "
+        "(threshold |Last offset| <= %.0f µs, need %d consecutive readings, "
+        "timeout %.0fs)",
+        SETTLE_MAX_OFFSET_S * 1e6,
+        SETTLE_REQUIRED_CYCLES,
+        SETTLE_TIMEOUT_SEC,
+    )
+    while time.monotonic() < deadline:
+        try:
+            proc = subprocess.run(
+                ["chronyc", "-n", "tracking"],
+                capture_output=True, text=True, timeout=5.0,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.debug("wspr-recorder settled-capture: chronyc failed: %s", exc)
+            time.sleep(SETTLE_POLL_SEC)
+            consecutive = 0
+            continue
+        if proc.returncode != 0:
+            time.sleep(SETTLE_POLL_SEC)
+            consecutive = 0
+            continue
+
+        last_offset = _parse_chronyc_last_offset(proc.stdout)
+        if last_offset is None:
+            logger.debug(
+                "wspr-recorder settled-capture: could not parse "
+                "Last offset from chronyc tracking output"
+            )
+            time.sleep(SETTLE_POLL_SEC)
+            consecutive = 0
+            continue
+
+        if abs(last_offset) <= SETTLE_MAX_OFFSET_S:
+            consecutive += 1
+            logger.info(
+                "wspr-recorder settled-capture: chrony Last offset "
+                "%+.1f µs OK (%d/%d)",
+                last_offset * 1e6,
+                consecutive,
+                SETTLE_REQUIRED_CYCLES,
+            )
+            if consecutive >= SETTLE_REQUIRED_CYCLES:
+                elapsed = time.monotonic() - wait_start
+                logger.info(
+                    "wspr-recorder settled-capture: chrony settled after "
+                    "%.1fs — proceeding to provision channels", elapsed,
+                )
+                return True
+        else:
+            if consecutive > 0:
+                logger.info(
+                    "wspr-recorder settled-capture: chrony Last offset "
+                    "%+.1f µs > threshold; resetting counter",
+                    last_offset * 1e6,
+                )
+            consecutive = 0
+        time.sleep(SETTLE_POLL_SEC)
+
+    logger.warning(
+        "wspr-recorder settled-capture: timeout after %.0fs — "
+        "proceeding with degraded first_wallclock capture "
+        "(WAV minute timestamps may be wrong if chrony eventually "
+        "moves the system clock by >>100 µs)",
+        SETTLE_TIMEOUT_SEC,
+    )
+    return False
 
 
 def _resolve_encoding(enc_str: str) -> int:
@@ -125,6 +252,12 @@ class ReceiverManager:
     def connect(self) -> bool:
         """Provision all channels and register them with MultiStream(s)."""
         try:
+            # V1 fix layer 1: gate ensure_channel() / stream start on
+            # chrony being settled so the first_wallclock captured
+            # downstream in BandRecorder inherits ε_0 ≈ 0.  See module
+            # docstring at top of file.
+            _wait_for_chrony_settled()
+
             logger.info(f"Connecting to radiod at {self.config.radiod.status_address}")
             self._control = RadiodControl(self.config.radiod.status_address)
             self.state.connected = True
