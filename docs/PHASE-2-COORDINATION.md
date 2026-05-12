@@ -112,6 +112,70 @@ Files:
 
 Default-off; no deployment risk to land it.
 
+## Bring-up results from B4-100 (2026-05-12 20:18-20:32 UTC)
+
+I did a live test on B4-100 to flush out deployment issues before
+asking you to review.  Four problems surfaced and were fixed on
+this branch (now `pipeline-v2/phase-2` HEAD):
+
+1. **wspr-recorder venv missing sigmond on PYTHONPATH.**
+   `from sigmond.hamsci_ch import Writer` fails — psk-recorder's
+   venv has a `.pth` file that adds `/opt/git/sigmond/sigmond/lib`;
+   wspr-recorder's doesn't.  Workaround for the test: dropped a
+   `sigmond-local.pth` into the venv.  **Action for production:**
+   either wspr-recorder's install.sh needs the same `.pth` setup, or
+   pyproject.toml needs sigmond as an editable sibling install.
+
+2. **WAV filename incompatible with wsprd.**  `WavWriter` produces
+   `YYYYMMDDTHHMMSSZ_<freq>_usb_<period>.wav` — wsprd parses date+time
+   from the filename prefix, doesn't recognize that shape, and writes
+   garbage like `'600_us'` as the YYMMDD.  Legacy `wd-decode` bash
+   chain works around this by `cp`-ing every WAV to a short
+   `YYMMDD_HHMM.wav` name.  This PR adds a `_wsprd_compatible_wav()`
+   helper in `__main__.py` that symlinks to a wsprd-friendly name
+   inside `<band>/.phase2/` before invoking the decoder.  **The
+   cleaner long-term fix is in WavWriter or DecoderRunner** — let me
+   know which side you'd prefer to own it.
+
+3. **DecoderRunner's defaults assume wsprd / jt9 are in PATH.**
+   Real binaries are at `/opt/wsprdaemon-client/bin/decoders/wsprd-<arch>-v27`.
+   Added `_resolve_decoder_binaries()` that arch-detects and points
+   DecoderRunner at the right files (mirrors the legacy `wd-decode`
+   bash arch-switch).
+
+4. **`hamsci_ch.Writer` silently noops when producer user can't
+   write `/var/lib/sigmond/sink.db`.**  This is the "SQLite Writer
+   silent-noop trap" Rob already noted in his memory file.  My
+   SpotSink now checks `writer.is_noop` and refuses to enable +
+   logs a clear warning identifying the user.  **Action for
+   production:** wspr-recorder's install.sh needs to (a) add the
+   `wsprdaemon` user to the `sigmond` group, (b) chgrp/g+w the
+   sink + setgid the directory.  Exact steps used in the test:
+
+   ```bash
+   usermod -a -G sigmond wsprdaemon
+   chgrp sigmond /var/lib/sigmond /var/lib/sigmond/sink.db*
+   chmod g+ws /var/lib/sigmond
+   chmod g+w /var/lib/sigmond/sink.db*
+   ```
+
+5. **(Open — sigmond bug, not this PR's)** `sigmond.hamsci_ch.SqliteWriter`
+   isn't thread-safe.  `BandRecorder` dispatches `_on_period_complete`
+   via a thread pool, so per-band threads race to write.  Visible in
+   the journal as `SQLite objects created in a thread can only be
+   used in that same thread`.  Despite the warnings, rows DO land
+   (the writer must have a retry path I haven't traced), but the
+   path is noisy.  Suggested follow-up in sigmond: open the
+   connection with `check_same_thread=False` and serialize via the
+   writer's existing lock.  My SpotSink already wraps `insert()` in
+   a `threading.Lock` to bound the race window.
+
+With all of the above applied, the test produced **39 wspr.spots
+rows in 2 cycles** across 7 bands (10/12/15/17/20/30/40), with row
+fields matching the Phase-1 schema (band, callsign, grid, snr_db,
+dt, frequency_hz, radiod_id, time).  After flipping the env flag
+back off the daemon resumed the legacy chain unchanged.
+
 ## Three questions for you
 
 1. **Is decode-in-process the direction you want?**  Your current

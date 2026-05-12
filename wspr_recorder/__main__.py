@@ -162,29 +162,121 @@ class WsprRecorder:
 
         self._run_decoders_for(request, wav_path)
 
+    def _resolve_decoder_binaries(self) -> tuple:
+        """Locate (wsprd_path, wsprd_spread_path, jt9_path) for this host.
+
+        Mirrors the legacy wd-decode bash arch-switch: binaries live at
+        /opt/wsprdaemon-client/bin/decoders/{wsprd,jt9}-<arch>-vNN.
+        Falls back to PATH lookup if the decoder dir is absent (e.g.
+        test rigs, kiwi-only deployments).  The spreading variant
+        isn't shipped as a separate binary today; DecoderRunner
+        handles a missing spread path by silently no-op'ing the
+        second pass and using the standard pass alone.
+        """
+        import platform
+        arch = platform.machine()
+        decoder_dir = Path("/opt/wsprdaemon-client/bin/decoders")
+        wsprd_name = {
+            "x86_64":  "wsprd-x86-v27",
+            "aarch64": "wsprd-arm64-v27",
+            "armv7l":  "wsprd-armhf-v26",
+            "armhf":   "wsprd-armhf-v26",
+        }.get(arch)
+        jt9_name = {
+            "x86_64":  "jt9-x86-v27",
+            "aarch64": "jt9-arm64-v27",
+            "armv7l":  "jt9-arm32-v26",
+            "armhf":   "jt9-arm32-v26",
+        }.get(arch)
+        if wsprd_name and (decoder_dir / wsprd_name).exists():
+            wsprd_path = str(decoder_dir / wsprd_name)
+        else:
+            wsprd_path = "wsprd"   # last-resort PATH lookup
+        if jt9_name and (decoder_dir / jt9_name).exists():
+            jt9_path = str(decoder_dir / jt9_name)
+        else:
+            jt9_path = "jt9"
+        # Spreading-variant binary isn't shipped today.  Keep the
+        # DecoderRunner default so its FileNotFoundError handler
+        # cleanly skips the second pass; merge then uses only the
+        # standard pass.
+        wsprd_spread = "wsprd.spreading"
+        return wsprd_path, wsprd_spread, jt9_path
+
     def _resolve_decoder(self, band_name: str, frequency_hz: int) -> Optional[DecoderRunner]:
         """Get-or-build a DecoderRunner for one band.
 
-        Per-band working directory inside the recorder's own
-        output_dir/<band>/ — same place WavWriter puts the WAVs, so
-        the legacy `wd-decode@*` chain's ALL_WSPR.TXT / hashtable
-        artefacts coexist with our reads.  Returns None if components
-        aren't initialized (test-time safety net).
+        Per-band working directory is `<output_dir>/<band>/.phase2/`
+        — a hidden subdir under the band's WAV recording dir, kept
+        separate from the legacy `wd-decode@*` chain's ALL_WSPR.TXT /
+        hashtable.txt artefacts so the two pipelines can run side-by-
+        side during the dual-write observation window without one
+        clobbering the other's state.  When Phase 4 retires the bash
+        chain, the `.phase2` segment can be dropped.
         """
         if self.callsign_db is None or self.wav_writer is None:
             return None
         runner = self._decoders.get(band_name)
         if runner is not None:
             return runner
-        work_dir = self.wav_writer.output_dir / band_name
+        wsprd_path, wsprd_spread, jt9_path = self._resolve_decoder_binaries()
+        work_dir = self.wav_writer.output_dir / band_name / ".phase2"
+        work_dir.mkdir(parents=True, exist_ok=True)
         runner = DecoderRunner(
             band_name=band_name,
             frequency_hz=frequency_hz,
             work_dir=work_dir,
             callsign_db=self.callsign_db,
+            wsprd_path=wsprd_path,
+            wsprd_spread_path=wsprd_spread,
+            jt9_path=jt9_path,
         )
         self._decoders[band_name] = runner
         return runner
+
+    @staticmethod
+    def _wsprd_compatible_wav(wav_path: Path, work_dir: Path) -> Optional[Path]:
+        """Create a wsprd-readable symlink for `wav_path`.
+
+        wsprd parses date/time from the FILENAME PREFIX (it expects
+        `YYMMDD_HHMM.wav` or similar).  wspr-recorder's WavWriter
+        produces `20260512T201400Z_<freq>_usb_<period>.wav` — wsprd
+        scans that for digits and lands on garbage like `'600_us'`
+        for the date, producing bogus rows.  The legacy bash
+        `wd-decode` chain works around this by `cp`-ing every WAV
+        to a `YYMMDD_HHMM.wav` short name before invoking wsprd.
+
+        We do the same with a symlink (cheap; no I/O), inside the
+        `.phase2` work_dir so the bash chain's same-named copies
+        in the parent band dir don't collide with ours.
+
+        Returns the symlink path, or None if the source filename
+        doesn't match wspr-recorder's expected pattern (in which
+        case the caller should skip decode for this WAV).
+        """
+        import re as _re
+        # wspr-recorder writes "YYYYMMDDTHHMMSS Z _<freq>_..._<period>.wav".
+        m = _re.match(
+            r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z_.*\.wav$",
+            wav_path.name,
+        )
+        if not m:
+            return None
+        yyyy, mm, dd, hh, mn, _ss = m.groups()
+        yy = f"{int(yyyy) % 100:02d}"
+        short = f"{yy}{mm}{dd}_{hh}{mn}.wav"
+        target = work_dir / short
+        try:
+            if target.is_symlink() or target.exists():
+                target.unlink()
+            target.symlink_to(wav_path)
+        except OSError as exc:
+            logger.warning(
+                "phase2: could not create wsprd symlink %s -> %s: %s",
+                target, wav_path, exc,
+            )
+            return None
+        return target
 
     def _run_decoders_for(self, request: DecodeRequest, wav_path: Path) -> None:
         """Decode the WAV for every mode the period covers and
@@ -194,16 +286,27 @@ class WsprRecorder:
         runner = self._resolve_decoder(request.band_name, request.frequency_hz)
         if runner is None:
             return
-        # radiod_id from the host's primary radiod identity — same
-        # value sigmond uses to disambiguate multi-radiod stations.
+        # wsprd / jt9 both extract date+time from the WAV filename's
+        # prefix.  WavWriter's `YYYYMMDDTHHMMSSZ_<freq>_usb_<N>.wav`
+        # format isn't wsprd-compatible (it ends up parsing freq
+        # digits as the date — produces bogus YYMMDD like '600_us').
+        # Symlink to a wsprd-friendly short name inside the .phase2
+        # work_dir before invoking the decoder.
+        decoder_wav = self._wsprd_compatible_wav(wav_path, runner.work_dir)
+        if decoder_wav is None:
+            logger.warning(
+                "phase2: %s: WAV %s has no wsprd-compatible name; skipping decode",
+                request.band_name, wav_path.name,
+            )
+            return
         radiod_id = self.config.radiod.status_address
         for mode in request.modes:
             try:
                 if mode == DecodeMode.W2:
-                    spots = runner.decode_wspr(wav_path)
+                    spots = runner.decode_wspr(decoder_wav)
                 else:
                     spots = runner.decode_fst4w(
-                        wav_path,
+                        decoder_wav,
                         period=request.period_seconds,
                         mode=mode,
                     )

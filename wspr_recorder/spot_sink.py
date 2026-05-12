@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import threading
 from datetime import datetime, timezone
 from typing import Iterable, Optional
 
@@ -47,6 +48,17 @@ _PKT_MODE_TO_TOKEN = {
 def _enabled() -> bool:
     """True if the operator opted into DB-direct decode writes."""
     return os.environ.get("WD_DECODE_VIA_DB", "0").strip() not in ("", "0")
+
+
+def _whoami() -> str:
+    """Best-effort uname for the silent-noop diagnostic.  Falls back
+    to UID when getpwuid would block (NSS lookup on container hosts
+    with no network)."""
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return f"uid={os.getuid()}"
 
 
 def resolve_reporter_identity(env=None):
@@ -204,6 +216,21 @@ class SpotSink:
         self._writer = writer if enabled else None
         if enabled and self._writer is None:
             self._writer = _resolve_writer()
+        # Writer.from_env() returns a NO-OP writer (is_noop=True) when
+        # the producer user can't write to the sink — e.g. wsprdaemon
+        # has no g+w on /var/lib/sigmond/sink.db.  Without this check,
+        # `enabled` would be True, the recorder would loudly report
+        # "enabled — writing to wspr", and every submit_batch would
+        # silently discard rows.  Treat is_noop as disabled.
+        if (self._writer is not None
+                and getattr(self._writer, "is_noop", False)):
+            logger.warning(
+                "spot_sink: sigmond.hamsci_ch.Writer returned a no-op "
+                "instance — likely the producer user (%s) lacks g+w on "
+                "/var/lib/sigmond/sink.db.  DB writes disabled.",
+                _whoami(),
+            )
+            self._writer = None
         self.enabled = self._writer is not None
 
         if self.enabled:
@@ -215,6 +242,14 @@ class SpotSink:
         # Counters surfaced for the cycle-summary log line + observability.
         self.rows_written = 0
         self.rows_dropped = 0
+
+        # BandRecorder dispatches _on_period_complete via a thread
+        # pool — multiple bands' submit_batch calls can race.  Python's
+        # sqlite3.Connection isn't thread-safe by default (a connection
+        # opened in thread A can't be used by thread B without
+        # check_same_thread=False), so we serialize Writer access here.
+        # Inserts are fast (~ms) so the lock is not a throughput bottleneck.
+        self._insert_lock = threading.Lock()
 
     def submit_batch(
         self,
@@ -251,18 +286,19 @@ class SpotSink:
                 self.rows_dropped += 1
         if not rows:
             return 0
-        try:
-            self._writer.insert(rows)
-        except Exception as exc:
-            logger.error(
-                "spot_sink: hamsci_ch.insert failed on %s "
-                "(%d rows): %s — they will not be retried, "
-                "the legacy bash chain remains the system of record "
-                "until Phase 3.", band, len(rows), exc,
-            )
-            self.rows_dropped += len(rows)
-            return 0
-        self.rows_written += len(rows)
+        with self._insert_lock:
+            try:
+                self._writer.insert(rows)
+            except Exception as exc:
+                logger.error(
+                    "spot_sink: hamsci_ch.insert failed on %s "
+                    "(%d rows): %s — they will not be retried, "
+                    "the legacy bash chain remains the system of record "
+                    "until Phase 3.", band, len(rows), exc,
+                )
+                self.rows_dropped += len(rows)
+                return 0
+            self.rows_written += len(rows)
         return len(rows)
 
     def flush(self) -> None:
