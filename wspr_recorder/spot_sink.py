@@ -49,6 +49,31 @@ def _enabled() -> bool:
     return os.environ.get("WD_DECODE_VIA_DB", "0").strip() not in ("", "0")
 
 
+def resolve_reporter_identity(env=None):
+    """Resolve (rx_call, rx_grid) from the recorder's environment.
+
+    wsprdaemon-client's envgen already populates `WD_RECEIVER_CALL`
+    and `WD_RECEIVER_GRID` in the wd-ka9q-record systemd unit's
+    EnvironmentFile (see wsprdaemon-client/lib/wdlib/envgen.py).
+    Phase 2 reuses those existing vars rather than introducing a
+    separate pair — one less thing for sigmond's envgen to track.
+
+    `WD_RX_CALL` / `WD_RX_GRID` remain accepted as an override so
+    test rigs (and any future tooling that wants to attach to a
+    running recorder with a different reporter identity) can
+    inject their own values without touching the unit env.
+
+    Returns ('', '') when neither pair is set — the sink still
+    runs in that case; rows ship with empty rx_* fields and the
+    downstream uploader logs a warning at startup.
+    """
+    if env is None:
+        env = os.environ
+    rx_call = env.get("WD_RX_CALL") or env.get("WD_RECEIVER_CALL", "")
+    rx_grid = env.get("WD_RX_GRID") or env.get("WD_RECEIVER_GRID", "")
+    return rx_call, rx_grid
+
+
 def _resolve_writer():
     """Return a sigmond.hamsci_ch.Writer, or None.
 

@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 from wspr_recorder.decoder import RawSpot
 from wspr_recorder.spot_sink import (
-    SpotSink, SCHEMA_VERSION, spot_to_row,
+    SpotSink, SCHEMA_VERSION, spot_to_row, resolve_reporter_identity,
 )
 
 
@@ -133,6 +133,47 @@ class TestSpotToRow(unittest.TestCase):
         self.assertTrue(row["time"].endswith("Z"))
         # Parses back without error.
         datetime.strptime(row["time"], "%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestResolveReporterIdentity(unittest.TestCase):
+    """Reporter identity (rx_call, rx_grid) comes from the envgen-
+    populated WD_RECEIVER_* vars by default, with WD_RX_* as a test-
+    rig override.  This wiring matters because it's what lets Phase 2
+    work on existing deployments without any envgen change."""
+
+    def test_falls_back_to_wd_receiver_vars(self):
+        env = {"WD_RECEIVER_CALL": "AC0G/B4", "WD_RECEIVER_GRID": "EM38ww"}
+        self.assertEqual(
+            resolve_reporter_identity(env),
+            ("AC0G/B4", "EM38ww"),
+        )
+
+    def test_wd_rx_overrides_wd_receiver(self):
+        """An operator/test rig can inject a different identity by
+        setting WD_RX_CALL/WD_RX_GRID — those win."""
+        env = {
+            "WD_RECEIVER_CALL": "AC0G/B4", "WD_RECEIVER_GRID": "EM38ww",
+            "WD_RX_CALL": "TEST/1",        "WD_RX_GRID": "AA00aa",
+        }
+        self.assertEqual(
+            resolve_reporter_identity(env),
+            ("TEST/1", "AA00aa"),
+        )
+
+    def test_returns_empty_strings_when_unset(self):
+        """No reporter identity → empty strings, never None.
+        Downstream code can still write rows; consumers fill in
+        rx_* fields from the local config if they care."""
+        self.assertEqual(resolve_reporter_identity({}), ("", ""))
+
+    def test_partial_set_uses_what_it_has(self):
+        """If only call is set (or only grid), return that field
+        and an empty string for the other — don't drop the known
+        value just because its sibling is missing."""
+        self.assertEqual(
+            resolve_reporter_identity({"WD_RECEIVER_CALL": "AC0G"}),
+            ("AC0G", ""),
+        )
 
 
 class TestSpotSinkGating(unittest.TestCase):

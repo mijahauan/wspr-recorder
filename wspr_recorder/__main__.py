@@ -30,7 +30,7 @@ from .ipc_server import IPCServer
 from .decode_mode import DecodeMode
 from .decoder import DecoderRunner
 from .callsign_db import CallsignDB
-from .spot_sink import SpotSink
+from .spot_sink import SpotSink, resolve_reporter_identity
 
 logger = logging.getLogger(__name__)
 
@@ -568,14 +568,10 @@ class WsprRecorder:
         )
 
         # Pipeline-v2 DB-direct decode bring-up (no-op when
-        # WD_DECODE_VIA_DB is unset/0).  rx_call / rx_grid come from
-        # wsprdaemon-client's per-station env file — set there because
-        # the reporter identity lives with the uploader, not the
-        # recorder (see wsprdaemon-client envgen.py).  If they aren't
-        # set, the sink still works but spots ship with empty rx_*
-        # fields; downstream hs-uploader will fill them in.
-        rx_call = os.environ.get("WD_RX_CALL", "")
-        rx_grid = os.environ.get("WD_RX_GRID", "")
+        # WD_DECODE_VIA_DB is unset/0).  Reporter identity comes from
+        # wsprdaemon-client's envgen — see resolve_reporter_identity()
+        # for the var precedence + fallback.
+        rx_call, rx_grid = resolve_reporter_identity()
         self.spot_sink = SpotSink(rx_call=rx_call, rx_grid=rx_grid)
         if self.spot_sink.enabled:
             self.callsign_db = CallsignDB()
