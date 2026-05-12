@@ -159,16 +159,25 @@ this branch (now `pipeline-v2/phase-2` HEAD):
    chmod g+w /var/lib/sigmond/sink.db*
    ```
 
-5. **(Open — sigmond bug, not this PR's)** `sigmond.hamsci_ch.SqliteWriter`
-   isn't thread-safe.  `BandRecorder` dispatches `_on_period_complete`
-   via a thread pool, so per-band threads race to write.  Visible in
-   the journal as `SQLite objects created in a thread can only be
-   used in that same thread`.  Despite the warnings, rows DO land
-   (the writer must have a retry path I haven't traced), but the
-   path is noisy.  Suggested follow-up in sigmond: open the
-   connection with `check_same_thread=False` and serialize via the
-   writer's existing lock.  My SpotSink already wraps `insert()` in
-   a `threading.Lock` to bound the race window.
+5. **~~Sigmond bug~~ → solved here by `CycleBatcher`.**
+   `BandRecorder` dispatches `_on_period_complete` via a thread
+   pool which used to race on a single `sqlite3.Connection` and
+   spam `objects created in a thread can only be used in that same
+   thread` warnings.  Rather than patch sigmond's writer (a
+   cross-repo surface-area change), this PR adds a `CycleBatcher`
+   in `spot_sink.py`:
+     - Band threads call `batcher.add(cycle_key, band, spots, ...)`
+       which just appends to a per-cycle dict under a mutex;
+     - A dedicated writer thread (`cycle-batcher`) polls deadlines
+       and flushes ready cycles to the underlying `SpotSink`, so the
+       SQLite connection lives entirely on that one thread.
+   Bonus: ONE `Writer.insert()` per cycle (all bands together)
+   instead of 13 — matches WSPR's natural atomic unit and gives one
+   clean per-cycle log line.  Live test 2026-05-12 20:52 UTC:
+
+       cycle UTC 20:52 → 24 spots in wspr.spots (4 bands, write 6 ms)
+
+   Zero threading warnings, 24 rows in a single 6 ms transaction.
 
 With all of the above applied, the test produced **39 wspr.spots
 rows in 2 cycles** across 7 bands (10/12/15/17/20/30/40), with row

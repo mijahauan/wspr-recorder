@@ -205,6 +205,11 @@ class TestSpotSinkGating(unittest.TestCase):
         """When `enabled=True` and a writer is passed in, the sink
         uses that writer regardless of hamsci_ch installation."""
         mock_writer = MagicMock()
+        # MagicMock attributes default to truthy mocks; the sink's
+        # silent-noop guard reads `writer.is_noop` and would treat a
+        # raw MagicMock as a noop writer.  Tests explicitly say "not
+        # a noop."
+        mock_writer.is_noop = False
         sink = SpotSink(
             rx_call="A", rx_grid="EM",
             enabled=True, writer=mock_writer,
@@ -216,6 +221,10 @@ class TestSpotSinkSubmitBatch(unittest.TestCase):
 
     def _make_sink(self) -> tuple[SpotSink, MagicMock]:
         writer = MagicMock()
+        # MagicMock auto-creates truthy attributes; the silent-noop
+        # guard would otherwise treat .is_noop as a real MagicMock
+        # (truthy) and disable the sink.
+        writer.is_noop = False
         sink = SpotSink(
             rx_call="AC0G/B4", rx_grid="EM38ww",
             enabled=True, writer=writer,

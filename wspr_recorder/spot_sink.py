@@ -22,8 +22,9 @@ import logging
 import os
 import socket
 import threading
+import time
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional, Tuple
 
 from .decoder import RawSpot
 
@@ -132,8 +133,12 @@ def spot_to_row(
         host_id = socket.gethostname()
 
     # spot.date is YYMMDD; spot.time is HHMM.  wsprd writes both in UTC.
+    # Local variable named `ts` (not `time`) to avoid shadowing the
+    # `time` module imported at the top — CycleBatcher needs
+    # time.monotonic() and the module reference must stay visible
+    # at module scope.
     try:
-        time = datetime.strptime(
+        ts = datetime.strptime(
             spot.date + spot.time, "%y%m%d%H%M",
         ).replace(tzinfo=timezone.utc)
     except ValueError:
@@ -144,7 +149,7 @@ def spot_to_row(
             "spot_sink: bad timestamp %r %r on %s spot, using now",
             spot.date, spot.time, band,
         )
-        time = datetime.now(timezone.utc).replace(microsecond=0)
+        ts = datetime.now(timezone.utc).replace(microsecond=0)
 
     grid = spot.grid if spot.grid and spot.grid != "none" else ""
 
@@ -160,7 +165,7 @@ def spot_to_row(
         pass
 
     return {
-        "time":            time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "time":            ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "band":            band,
         "mode":            mode,
         "radiod_id":       radiod_id,
@@ -301,6 +306,58 @@ class SpotSink:
             self.rows_written += len(rows)
         return len(rows)
 
+    def submit_batches(
+        self,
+        items: Iterable[Tuple[str, Iterable[RawSpot]]],
+        *,
+        radiod_id: str,
+    ) -> int:
+        """Write a whole cycle's spots across multiple bands in ONE
+        transaction.  Same semantics as `submit_batch` but groups
+        many (band, [spots]) pairs into a single Writer.insert() —
+        which matches WSPR's natural data unit (one cycle = one
+        atomic observation) and lets the upload side query per-cycle
+        without race against partial commits.
+
+        Failures still don't propagate; rows_dropped accounts them."""
+        if not self.enabled or self._writer is None:
+            return 0
+        rows = []
+        for band, spots in items:
+            for s in spots:
+                try:
+                    rows.append(spot_to_row(
+                        s,
+                        band=band,
+                        radiod_id=radiod_id,
+                        rx_call=self.rx_call,
+                        rx_grid=self.rx_grid,
+                        host_id=self.host_id,
+                        decoder_depth=self.decoder_depth,
+                    ))
+                except Exception as exc:
+                    logger.warning(
+                        "spot_sink: skipping malformed spot on %s: %s",
+                        band, exc,
+                    )
+                    self.rows_dropped += 1
+        if not rows:
+            return 0
+        with self._insert_lock:
+            try:
+                self._writer.insert(rows)
+            except Exception as exc:
+                logger.error(
+                    "spot_sink: hamsci_ch.insert failed for cycle batch "
+                    "(%d rows): %s — they will not be retried, "
+                    "the legacy bash chain remains the system of record "
+                    "until Phase 4.", len(rows), exc,
+                )
+                self.rows_dropped += len(rows)
+                return 0
+            self.rows_written += len(rows)
+        return len(rows)
+
     def flush(self) -> None:
         """Force-flush the underlying writer (for orderly shutdown)."""
         if self._writer is not None:
@@ -317,3 +374,179 @@ class SpotSink:
                 logger.warning("spot_sink: close failed: %s", exc)
             self._writer = None
             self.enabled = False
+
+
+# ----------------------------------------------------------------------
+# Cycle batcher — collect spots per WSPR cycle, write once per cycle
+# from a dedicated thread.  Sidesteps sqlite3's thread-affinity check.
+# ----------------------------------------------------------------------
+
+class _CycleBatch:
+    """One WSPR cycle's accumulated spots, awaiting flush.
+
+    Lives entirely under CycleBatcher's lock; not thread-safe on its
+    own.  Tracked by (date, time) cycle key matching wsprd output.
+    """
+
+    __slots__ = ("cycle_key", "deadline", "bands", "radiod_id")
+
+    def __init__(self, cycle_key: Tuple[str, str], deadline: float):
+        self.cycle_key = cycle_key
+        self.deadline = deadline
+        self.bands: dict = {}      # band_name -> List[RawSpot]
+        self.radiod_id: str = ""
+
+    def add(self, band: str, spots: Iterable[RawSpot]) -> None:
+        self.bands.setdefault(band, []).extend(spots)
+
+    def items(self) -> List[Tuple[str, List[RawSpot]]]:
+        return [(b, s) for b, s in self.bands.items()]
+
+
+class CycleBatcher:
+    """Collect decoded spots per cycle, flush once per cycle on a
+    dedicated thread.
+
+    Why: `BandRecorder` dispatches `_on_period_complete` via a
+    `ThreadPoolExecutor`, so per-band decodes run on different
+    worker threads.  `sqlite3.Connection` is bound to the thread
+    that opened it — direct writes from band threads would
+    intermittently raise `SQLite objects created in a thread can
+    only be used in that same thread`.  This batcher accepts spots
+    from any thread (via a mutex-protected dict) and forwards them
+    to the underlying `SpotSink` only from its own writer thread,
+    so the sqlite connection stays in one thread.
+
+    Flush trigger: per-cycle deadline (default 30 s after the first
+    add() for that cycle).  We don't wait for "all bands reported"
+    because some bands legitimately produce zero spots in a cycle
+    and would never call add() — the deadline-only model handles
+    that naturally.  The 30 s window matches the upload side's
+    `min_age_sec` so the upload pipeline doesn't ship a cycle
+    before its batch lands.
+
+    Bonus: one Writer.insert() per cycle instead of per-band ≅
+    13× fewer SQLite transactions per WSPR period.
+    """
+
+    def __init__(
+        self,
+        sink: "SpotSink",
+        *,
+        deadline_sec: float = 30.0,
+    ):
+        self._sink = sink
+        self._deadline_sec = float(deadline_sec)
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._batches: dict = {}   # (date, hhmm) -> _CycleBatch
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="cycle-batcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    # --- producer side ---------------------------------------------------
+
+    def add(
+        self,
+        cycle_key: Tuple[str, str],
+        band: str,
+        spots: Iterable[RawSpot],
+        *,
+        radiod_id: str,
+    ) -> None:
+        """Enqueue spots for `cycle_key`.  Called from band threads.
+
+        Cheap: just appends to a dict under a mutex.  No DB activity
+        here.  The writer thread picks the batch up at the deadline.
+        Empty `spots` is a no-op (don't create a batch for it —
+        otherwise a band with zero decodes would keep us from ever
+        flushing the cycle).
+        """
+        spots = list(spots)
+        if not spots:
+            return
+        with self._cond:
+            batch = self._batches.get(cycle_key)
+            if batch is None:
+                batch = _CycleBatch(
+                    cycle_key=cycle_key,
+                    deadline=time.monotonic() + self._deadline_sec,
+                )
+                batch.radiod_id = radiod_id
+                self._batches[cycle_key] = batch
+            batch.add(band, spots)
+            self._cond.notify()
+
+    # --- consumer side ---------------------------------------------------
+
+    def _run(self) -> None:
+        """Writer-thread loop.  Wakes on add() or on the nearest
+        deadline; flushes any batch whose deadline has passed.
+        Sink writes happen only here, so the underlying sqlite3
+        connection stays in this thread."""
+        while not self._stop.is_set():
+            ready: List[_CycleBatch] = []
+            with self._cond:
+                now = time.monotonic()
+                wait_until: Optional[float] = None
+                for k in list(self._batches.keys()):
+                    b = self._batches[k]
+                    if now >= b.deadline:
+                        ready.append(b)
+                        del self._batches[k]
+                    else:
+                        wait_until = (b.deadline if wait_until is None
+                                      else min(wait_until, b.deadline))
+                if not ready:
+                    # Wait for the nearest deadline OR a notify().
+                    # 5 s ceiling lets stop() unblock quickly.
+                    timeout = (max(0.05, wait_until - now)
+                               if wait_until is not None else 5.0)
+                    self._cond.wait(timeout=timeout)
+                    continue
+            # Flush outside the lock so add() doesn't block on SQLite.
+            for batch in ready:
+                self._flush(batch)
+
+    def _flush(self, batch: _CycleBatch) -> None:
+        date, hhmm = batch.cycle_key
+        wall_start = time.monotonic()
+        n = self._sink.submit_batches(
+            batch.items(),
+            radiod_id=batch.radiod_id,
+        )
+        if n == 0 and not self._sink.enabled:
+            # Disabled sink — silent.  Avoids a log line per cycle
+            # on hosts that don't have the env flag set.
+            return
+        elapsed_ms = int((time.monotonic() - wall_start) * 1000)
+        logger.info(
+            "cycle UTC %s:%s → %d spots in wspr.spots "
+            "(%d bands, write %d ms)",
+            hhmm[:2], hhmm[2:], n, len(batch.bands), elapsed_ms,
+        )
+
+    # --- lifecycle -------------------------------------------------------
+
+    def stop(self, timeout: float = 10.0) -> None:
+        """Stop the writer thread and drain any pending batches.
+
+        Called by SpotSink.close() (which `__main__._shutdown` calls
+        on orderly shutdown).  Anything still buffered when stop()
+        is called gets one final flush attempt — better to ship a
+        partial cycle than to lose the rows.
+        """
+        self._stop.set()
+        with self._cond:
+            self._cond.notify_all()
+        self._thread.join(timeout=timeout)
+        with self._lock:
+            leftover = list(self._batches.values())
+            self._batches.clear()
+        for batch in leftover:
+            self._flush(batch)
+

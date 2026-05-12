@@ -30,7 +30,7 @@ from .ipc_server import IPCServer
 from .decode_mode import DecodeMode
 from .decoder import DecoderRunner
 from .callsign_db import CallsignDB
-from .spot_sink import SpotSink, resolve_reporter_identity
+from .spot_sink import SpotSink, CycleBatcher, resolve_reporter_identity
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,7 @@ class WsprRecorder:
         # docs/PIPELINE-V2-DESIGN.md in wsprdaemon-client.
         self.callsign_db: Optional[CallsignDB] = None
         self.spot_sink: Optional[SpotSink] = None
+        self.cycle_batcher: Optional[CycleBatcher] = None
         # band_name -> DecoderRunner; lazily built on first decode for
         # a given band so we don't pay the work_dir/hashtable setup
         # cost on bands with no slots completed yet.
@@ -300,6 +301,13 @@ class WsprRecorder:
             )
             return
         radiod_id = self.config.radiod.status_address
+        # Cycle key from the slot's wall-clock start — deterministic
+        # regardless of decoder kind (FST4 spots leave date/time empty
+        # in RawSpot since jt9 doesn't print them).
+        cycle_key = (
+            request.start_wallclock.strftime("%y%m%d"),
+            request.start_wallclock.strftime("%H%M"),
+        )
         for mode in request.modes:
             try:
                 if mode == DecodeMode.W2:
@@ -318,12 +326,24 @@ class WsprRecorder:
                 continue
             if not spots:
                 continue
-            n = self.spot_sink.submit_batch(
-                spots, band=request.band_name, radiod_id=radiod_id,
+            # FST4 spots have empty date/time on the RawSpot — fill
+            # from cycle context so spot_to_row's strptime succeeds.
+            for s in spots:
+                if not s.date:
+                    s.date = cycle_key[0]
+                if not s.time:
+                    s.time = cycle_key[1]
+            # Enqueue to the cycle batcher — does NOT write to SQLite
+            # here.  All Writer.insert() calls happen on the batcher's
+            # dedicated thread; this avoids the sqlite cross-thread
+            # restriction that band-pool workers would otherwise hit.
+            self.cycle_batcher.add(
+                cycle_key, request.band_name, spots,
+                radiod_id=radiod_id,
             )
-            logger.info(
-                "%s %s: %d spots → wspr.spots",
-                request.band_name, mode.value, n,
+            logger.debug(
+                "%s %s: %d spots → cycle batcher (key=%s)",
+                request.band_name, mode.value, len(spots), cycle_key,
             )
     
     def _lifetime_refresh_pass(self) -> None:
@@ -678,6 +698,12 @@ class WsprRecorder:
         self.spot_sink = SpotSink(rx_call=rx_call, rx_grid=rx_grid)
         if self.spot_sink.enabled:
             self.callsign_db = CallsignDB()
+            # CycleBatcher collects per-band spots into a single
+            # per-cycle wspr.spots write on a dedicated writer
+            # thread.  Sidesteps SQLite's thread-affinity check
+            # (BandRecorder's executor runs decodes on per-band
+            # worker threads, but only this thread touches the DB).
+            self.cycle_batcher = CycleBatcher(self.spot_sink)
             logger.info(
                 "pipeline-v2 decode pool enabled (rx_call=%r, rx_grid=%r)",
                 rx_call, rx_grid,
@@ -757,10 +783,23 @@ class WsprRecorder:
         # Shutdown thread pool
         self.executor.shutdown(wait=True, cancel_futures=False)
 
+        # Drain the cycle batcher BEFORE closing the sink — its
+        # stop() flushes any pending cycle's spots through to the
+        # underlying Writer.  Ordering is critical:
+        #   1. executor.shutdown (above) drains in-flight
+        #      _on_period_complete jobs; the last spots get
+        #      cycle_batcher.add()ed.
+        #   2. cycle_batcher.stop() joins the writer thread and
+        #      flushes any cycle whose deadline hasn't yet hit.
+        #   3. spot_sink.close() then commits + closes the
+        #      hamsci_ch.Writer.
+        if self.cycle_batcher is not None:
+            try:
+                self.cycle_batcher.stop()
+            except Exception as e:
+                logger.error(f"Error stopping cycle batcher: {e}")
         # Flush + close the pipeline-v2 sink so any buffered rows
-        # land on disk before the process exits.  Ordering matters:
-        # executor.shutdown drains pending _on_period_complete jobs,
-        # so the sink sees every successful decode's spots first.
+        # land on disk before the process exits.
         if self.spot_sink is not None:
             try:
                 self.spot_sink.flush()
