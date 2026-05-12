@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -27,6 +28,9 @@ from .wav_writer import WavWriter
 from .timing_service import TimingService
 from .ipc_server import IPCServer
 from .decode_mode import DecodeMode
+from .decoder import DecoderRunner
+from .callsign_db import CallsignDB
+from .spot_sink import SpotSink
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +71,19 @@ class WsprRecorder:
         self.timing_service: Optional[TimingService] = None
         self.ipc_server: Optional[IPCServer] = None
         self.band_recorders: Dict[int, BandRecorder] = {}  # ssrc -> BandRecorder
-        
+
+        # Pipeline v2 — DB-direct decode + SpotSink.  Off by default;
+        # enabled by `WD_DECODE_VIA_DB=1` in the unit's env.  When off,
+        # _on_period_complete behaves exactly as it did pre-v2 and the
+        # legacy `wd-decode@*` bash chain is unchanged.  See
+        # docs/PIPELINE-V2-DESIGN.md in wsprdaemon-client.
+        self.callsign_db: Optional[CallsignDB] = None
+        self.spot_sink: Optional[SpotSink] = None
+        # band_name -> DecoderRunner; lazily built on first decode for
+        # a given band so we don't pay the work_dir/hashtable setup
+        # cost on bands with no slots completed yet.
+        self._decoders: Dict[str, DecoderRunner] = {}
+
         # Thread pool for disk I/O
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wav_writer")
         
@@ -127,12 +143,84 @@ class WsprRecorder:
         """
         Called when a decode period completes.
 
-        Writes period-length WAV file (runs in thread pool via BandRecorder).
+        Writes period-length WAV file (runs in thread pool via
+        BandRecorder).  When pipeline-v2 DB-direct decode is enabled,
+        also runs wsprd / jt9 on the WAV and pushes the resulting
+        spots into the canonical hamsci_ch sink (`wspr.spots`).
         """
-        if self.wav_writer:
-            self.wav_writer.write_period(
-                request,
-                max_files_per_band=self.config.recorder.max_files_per_band,
+        if not self.wav_writer:
+            return
+        wav_path = self.wav_writer.write_period(
+            request,
+            max_files_per_band=self.config.recorder.max_files_per_band,
+        )
+        if wav_path is None:
+            return  # WAV write failed; nothing to decode
+
+        if self.spot_sink is None or not self.spot_sink.enabled:
+            return  # legacy path — `wd-decode@*` bash chain handles decode
+
+        self._run_decoders_for(request, wav_path)
+
+    def _resolve_decoder(self, band_name: str, frequency_hz: int) -> Optional[DecoderRunner]:
+        """Get-or-build a DecoderRunner for one band.
+
+        Per-band working directory inside the recorder's own
+        output_dir/<band>/ — same place WavWriter puts the WAVs, so
+        the legacy `wd-decode@*` chain's ALL_WSPR.TXT / hashtable
+        artefacts coexist with our reads.  Returns None if components
+        aren't initialized (test-time safety net).
+        """
+        if self.callsign_db is None or self.wav_writer is None:
+            return None
+        runner = self._decoders.get(band_name)
+        if runner is not None:
+            return runner
+        work_dir = self.wav_writer.output_dir / band_name
+        runner = DecoderRunner(
+            band_name=band_name,
+            frequency_hz=frequency_hz,
+            work_dir=work_dir,
+            callsign_db=self.callsign_db,
+        )
+        self._decoders[band_name] = runner
+        return runner
+
+    def _run_decoders_for(self, request: DecodeRequest, wav_path: Path) -> None:
+        """Decode the WAV for every mode the period covers and
+        publish results to the SpotSink.  Per-mode failures are
+        logged but don't propagate — one bad decode doesn't kill
+        the rest of the cycle."""
+        runner = self._resolve_decoder(request.band_name, request.frequency_hz)
+        if runner is None:
+            return
+        # radiod_id from the host's primary radiod identity — same
+        # value sigmond uses to disambiguate multi-radiod stations.
+        radiod_id = self.config.radiod.status_address
+        for mode in request.modes:
+            try:
+                if mode == DecodeMode.W2:
+                    spots = runner.decode_wspr(wav_path)
+                else:
+                    spots = runner.decode_fst4w(
+                        wav_path,
+                        period=request.period_seconds,
+                        mode=mode,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "%s %s: decode failed (%s); skipping batch",
+                    request.band_name, mode.value, exc,
+                )
+                continue
+            if not spots:
+                continue
+            n = self.spot_sink.submit_batch(
+                spots, band=request.band_name, radiod_id=radiod_id,
+            )
+            logger.info(
+                "%s %s: %d spots → wspr.spots",
+                request.band_name, mode.value, n,
             )
     
     def _lifetime_refresh_pass(self) -> None:
@@ -478,6 +566,23 @@ class WsprRecorder:
             sample_format=self.config.recorder.sample_format,
             timing_service=self.timing_service,
         )
+
+        # Pipeline-v2 DB-direct decode bring-up (no-op when
+        # WD_DECODE_VIA_DB is unset/0).  rx_call / rx_grid come from
+        # wsprdaemon-client's per-station env file — set there because
+        # the reporter identity lives with the uploader, not the
+        # recorder (see wsprdaemon-client envgen.py).  If they aren't
+        # set, the sink still works but spots ship with empty rx_*
+        # fields; downstream hs-uploader will fill them in.
+        rx_call = os.environ.get("WD_RX_CALL", "")
+        rx_grid = os.environ.get("WD_RX_GRID", "")
+        self.spot_sink = SpotSink(rx_call=rx_call, rx_grid=rx_grid)
+        if self.spot_sink.enabled:
+            self.callsign_db = CallsignDB()
+            logger.info(
+                "pipeline-v2 decode pool enabled (rx_call=%r, rx_grid=%r)",
+                rx_call, rx_grid,
+            )
         
         self.receiver_manager = ReceiverManager(
             config=self.config,
@@ -552,6 +657,17 @@ class WsprRecorder:
         
         # Shutdown thread pool
         self.executor.shutdown(wait=True, cancel_futures=False)
+
+        # Flush + close the pipeline-v2 sink so any buffered rows
+        # land on disk before the process exits.  Ordering matters:
+        # executor.shutdown drains pending _on_period_complete jobs,
+        # so the sink sees every successful decode's spots first.
+        if self.spot_sink is not None:
+            try:
+                self.spot_sink.flush()
+                self.spot_sink.close()
+            except Exception as e:
+                logger.error(f"Error closing spot sink: {e}")
 
         if self._memprofile and tracemalloc.is_tracing():
             tracemalloc.stop()
