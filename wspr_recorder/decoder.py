@@ -67,7 +67,7 @@ class DecoderRunner:
         work_dir: Path,
         callsign_db: CallsignDB,
         wsprd_path: str = "wsprd",
-        wsprd_spread_path: str = "wsprd.spreading",
+        wsprd_spread_path: Optional[str] = None,
         jt9_path: str = "jt9",
     ):
         self.band_name = band_name
@@ -105,10 +105,15 @@ class DecoderRunner:
             wav_path, self.wsprd_path, spreading=False,
         )
 
-        # Run spreading pass
-        spreading_spots = self._run_wsprd(
-            wav_path, self.wsprd_spread_path, spreading=True,
-        )
+        # Run spreading pass — skipped when no spreading binary was
+        # found on this host (wsprd_spread_path=None).  Returns the
+        # standard spots unchanged from the merge step in that case.
+        if self.wsprd_spread_path:
+            spreading_spots = self._run_wsprd(
+                wav_path, self.wsprd_spread_path, spreading=True,
+            )
+        else:
+            spreading_spots = []
 
         # Merge
         merged = self._merge_wspr_passes(standard_spots, spreading_spots)

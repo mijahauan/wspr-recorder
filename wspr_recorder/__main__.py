@@ -216,11 +216,24 @@ class WsprRecorder:
             jt9_path = str(decoder_dir / jt9_name)
         else:
             jt9_path = "jt9"
-        # Spreading-variant binary isn't shipped today.  Keep the
-        # DecoderRunner default so its FileNotFoundError handler
-        # cleanly skips the second pass; merge then uses only the
-        # standard pass.
-        wsprd_spread = "wsprd.spreading"
+        # Spreading-variant binary isn't shipped today.  Probe for it
+        # at the usual locations; if not present, return None so the
+        # DecoderRunner skips the second pass entirely (no per-cycle
+        # FileNotFoundError noise in the journal).  Auto-enables when
+        # someone drops a spreading binary into the decoder dir or
+        # onto PATH — no code change needed at that point.
+        wsprd_spread: Optional[str] = None
+        for candidate in (
+            decoder_dir / "wsprd.spreading",
+            decoder_dir / f"wsprd.spreading-{arch}",
+            decoder_dir / "wsprd-spread",
+        ):
+            if candidate.exists():
+                wsprd_spread = str(candidate)
+                break
+        if wsprd_spread is None:
+            import shutil
+            wsprd_spread = shutil.which("wsprd.spreading")
         return wsprd_path, wsprd_spread, jt9_path
 
     def _resolve_decoder(self, band_name: str, frequency_hz: int) -> Optional[DecoderRunner]:
