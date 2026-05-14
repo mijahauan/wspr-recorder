@@ -31,6 +31,7 @@ from .decode_mode import DecodeMode
 from .decoder import DecoderRunner
 from .callsign_db import CallsignDB
 from .spot_sink import SpotSink, CycleBatcher, resolve_reporter_identity
+from .noise import compute_noise
 
 logger = logging.getLogger(__name__)
 
@@ -344,6 +345,16 @@ class WsprRecorder:
             try:
                 if mode == DecodeMode.W2:
                     spots = runner.decode_wspr(decoder_wav)
+                    # wsprd's `-c` flag wrote the C2 file in the same
+                    # work_dir.  Compute per-cycle noise immediately so
+                    # we don't race the next decode that would overwrite
+                    # it.  Only W2 decodes produce C2 — F-modes use
+                    # jt9 without C2 output, and they share the same
+                    # cycle so this single noise reading covers them.
+                    self._submit_noise_for_cycle(
+                        request, decoder_wav, runner.work_dir,
+                        radiod_id=radiod_id, cycle_key=cycle_key,
+                    )
                 else:
                     spots = runner.decode_fst4w(
                         decoder_wav,
@@ -378,6 +389,74 @@ class WsprRecorder:
                 request.band_name, mode.value, len(spots), cycle_key,
             )
     
+    def _submit_noise_for_cycle(
+        self,
+        request: 'DecodeRequest',
+        decoder_wav: Path,
+        work_dir: Path,
+        *,
+        radiod_id: str,
+        cycle_key: tuple,
+    ) -> None:
+        """Compute and enqueue one NoiseMeasurement for this (band, cycle).
+
+        RMS side reads the decoder WAV directly; FFT side reads
+        wsprd's `<stem>.c2` file written to the work_dir by the
+        `-c` flag.  All errors are swallowed — noise is an enrichment,
+        not a primary product; missing it just emits zeros.
+        """
+        if self.cycle_batcher is None:
+            return
+        # Load audio samples — mono int16 at sample_rate.  Convert to
+        # float32 normalized to [-1, 1] for parity with v1's sox-based
+        # measurement (which works on float internally).
+        try:
+            import wave
+            with wave.open(str(decoder_wav), "rb") as wf:
+                sr = wf.getframerate()
+                n = wf.getnframes()
+                raw = wf.readframes(n)
+        except Exception as exc:
+            logger.debug(
+                "noise: cannot read WAV %s: %s — skipping rms half",
+                decoder_wav.name, exc,
+            )
+            sr = 0
+            samples = None
+        else:
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        # wsprd writes <stem>.c2 next to the input WAV.  Most-recent
+        # *.c2 in work_dir is a safe fallback if the naming differs.
+        c2_candidate = work_dir / f"{decoder_wav.stem}.c2"
+        if not c2_candidate.exists():
+            c2_files = sorted(
+                work_dir.glob("*.c2"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            c2_candidate = c2_files[-1] if c2_files else None
+        try:
+            measurement = compute_noise(
+                samples=samples,
+                sample_rate=sr,
+                c2_path=c2_candidate,
+            )
+        except Exception as exc:                # noqa: BLE001
+            logger.warning(
+                "%s: compute_noise raised: %s — skipping",
+                request.band_name, exc,
+            )
+            return
+        self.cycle_batcher.add_noise(
+            cycle_key, request.band_name, measurement,
+            radiod_id=radiod_id,
+        )
+        logger.debug(
+            "%s: noise rms=%.1f dBm fft=%.1f dBm → cycle batcher (key=%s)",
+            request.band_name,
+            measurement.rms_noise_dbm, measurement.fft_noise_dbm,
+            cycle_key,
+        )
+
     def _lifetime_refresh_pass(self) -> None:
         """One pass of LIFETIME keep-alive across every (multi, ssrc)
         entry.  Per-call failures (radiod restart, network blip) are

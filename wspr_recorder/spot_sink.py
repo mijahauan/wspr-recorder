@@ -27,11 +27,13 @@ from datetime import datetime, timezone
 from typing import Iterable, List, Optional, Tuple
 
 from .decoder import RawSpot
+from .noise import NoiseMeasurement
 
 logger = logging.getLogger(__name__)
 
 
 SCHEMA_VERSION = 2  # tracks wdlib/spots/row.py:SCHEMA_VERSION
+NOISE_SCHEMA_VERSION = 1  # wspr.noise rows (rms+fft+overload per cycle)
 # v2 adds the 8 wsprd-internal fields needed to reconstruct
 # wsprdaemon.org's 34-field extended _wd_spots.txt format from
 # sink.db rows alone (no file fallback): cycles, jitter, blocksize,
@@ -211,6 +213,53 @@ def spot_to_row(
     }
 
 
+def noise_to_row(
+    noise: NoiseMeasurement,
+    *,
+    band: str,
+    cycle_key: Tuple[str, str],
+    radiod_id: str,
+    rx_call: str,
+    rx_grid: str,
+    host_id: Optional[str] = None,
+) -> dict:
+    """Convert a per-(band, cycle) NoiseMeasurement → row dict for
+    sink.db's wspr.noise table.
+
+    Mirrors the noise side of v1's 34-field extended _wd_spots.txt:
+    one row per (band, cycle).  The hs-uploader wsprdaemon transport
+    pulls these and serializes them as ``_noise.txt`` files in the
+    tar, matching the wsprdaemon/noise/RX_SITE/RECEIVER/BAND/...
+    arcname layout v1 produced.
+    """
+    if host_id is None:
+        host_id = socket.gethostname()
+    date, hhmm = cycle_key
+    try:
+        ts = datetime.strptime(date + hhmm, "%y%m%d%H%M").replace(
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        logger.warning(
+            "noise_to_row: bad cycle_key %r%r on %s, using now",
+            date, hhmm, band,
+        )
+        ts = datetime.now(timezone.utc).replace(microsecond=0)
+    return {
+        "time":            ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "band":            band,
+        "radiod_id":       radiod_id,
+        "host_id":         host_id,
+        "rx_call":         rx_call,
+        "rx_grid":         rx_grid,
+        "rms_noise_dbm":   float(noise.rms_noise_dbm),
+        "fft_noise_dbm":   float(noise.fft_noise_dbm),
+        "overload_count":  int(noise.overload_count),
+        "schema_version":  NOISE_SCHEMA_VERSION,
+        "uploaded_at":     None,
+    }
+
+
 class SpotSink:
     """Writer-facade that converts RawSpot batches → hamsci_ch rows.
 
@@ -278,6 +327,10 @@ class SpotSink:
         # check_same_thread=False), so we serialize Writer access here.
         # Inserts are fast (~ms) so the lock is not a throughput bottleneck.
         self._insert_lock = threading.Lock()
+        # Second Writer for wspr.noise table — built lazily on first
+        # `submit_noise_batches` call.  Lazy so stations that don't
+        # ship noise pay nothing.
+        self._noise_writer = None
 
     def submit_batch(
         self,
@@ -381,6 +434,72 @@ class SpotSink:
             self.rows_written += len(rows)
         return len(rows)
 
+    def submit_noise_batches(
+        self,
+        items: Iterable[Tuple[str, NoiseMeasurement]],
+        *,
+        cycle_key: Tuple[str, str],
+        radiod_id: str,
+    ) -> int:
+        """Write a cycle's per-band noise measurements to wspr.noise.
+
+        One row per band, written in ONE transaction.  hs-uploader's
+        wsprdaemon transport reads these rows separately from the spot
+        rows; the SqliteSource side uses a different `table=` so the
+        per-(database,table) cursor in pending_uploads stays disjoint.
+
+        Falls back to a no-op when the sink is disabled — same shape
+        as `submit_batches` for spots.
+        """
+        if not self.enabled or self._writer is None:
+            return 0
+        # Open a second writer for the wspr.noise table.  hamsci_ch's
+        # Writer holds (mode, table) state, so spots and noise need
+        # their own Writer instance.  Built lazily on first noise flush
+        # to keep startup cost zero on stations that don't ship noise.
+        if self._noise_writer is None:
+            from sigmond.hamsci_ch import Writer  # type: ignore
+            try:
+                self._noise_writer = Writer.from_env(
+                    mode="wspr", table="noise",
+                    schema_version=NOISE_SCHEMA_VERSION,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "spot_sink: noise Writer.from_env failed: %s — "
+                    "noise rows will be dropped this cycle", exc,
+                )
+                return 0
+            if getattr(self._noise_writer, "is_noop", False):
+                self._noise_writer = None
+                return 0
+        rows = []
+        for band, noise in items:
+            try:
+                rows.append(noise_to_row(
+                    noise,
+                    band=band, cycle_key=cycle_key, radiod_id=radiod_id,
+                    rx_call=self.rx_call, rx_grid=self.rx_grid,
+                    host_id=self.host_id,
+                ))
+            except Exception as exc:
+                logger.warning(
+                    "spot_sink: skipping malformed noise on %s: %s",
+                    band, exc,
+                )
+        if not rows:
+            return 0
+        with self._insert_lock:
+            try:
+                self._noise_writer.insert(rows)
+            except Exception as exc:
+                logger.error(
+                    "spot_sink: noise insert failed (%d rows): %s",
+                    len(rows), exc,
+                )
+                return 0
+        return len(rows)
+
     def flush(self) -> None:
         """Force-flush the underlying writer (for orderly shutdown)."""
         if self._writer is not None:
@@ -388,6 +507,11 @@ class SpotSink:
                 self._writer.flush()
             except Exception as exc:
                 logger.warning("spot_sink: flush failed: %s", exc)
+        if self._noise_writer is not None:
+            try:
+                self._noise_writer.flush()
+            except Exception as exc:
+                logger.warning("spot_sink: noise flush failed: %s", exc)
 
     def close(self) -> None:
         if self._writer is not None:
@@ -397,6 +521,12 @@ class SpotSink:
                 logger.warning("spot_sink: close failed: %s", exc)
             self._writer = None
             self.enabled = False
+        if self._noise_writer is not None:
+            try:
+                self._noise_writer.close()
+            except Exception as exc:
+                logger.warning("spot_sink: noise close failed: %s", exc)
+            self._noise_writer = None
 
 
 # ----------------------------------------------------------------------
@@ -405,25 +535,35 @@ class SpotSink:
 # ----------------------------------------------------------------------
 
 class _CycleBatch:
-    """One WSPR cycle's accumulated spots, awaiting flush.
+    """One WSPR cycle's accumulated spots + per-band noise, awaiting flush.
 
     Lives entirely under CycleBatcher's lock; not thread-safe on its
     own.  Tracked by (date, time) cycle key matching wsprd output.
     """
 
-    __slots__ = ("cycle_key", "deadline", "bands", "radiod_id")
+    __slots__ = ("cycle_key", "deadline", "bands", "noise", "radiod_id")
 
     def __init__(self, cycle_key: Tuple[str, str], deadline: float):
         self.cycle_key = cycle_key
         self.deadline = deadline
         self.bands: dict = {}      # band_name -> List[RawSpot]
+        self.noise: dict = {}      # band_name -> NoiseMeasurement
         self.radiod_id: str = ""
 
     def add(self, band: str, spots: Iterable[RawSpot]) -> None:
         self.bands.setdefault(band, []).extend(spots)
 
+    def add_noise(self, band: str, noise: NoiseMeasurement) -> None:
+        # Last write wins — re-decode of the same cycle simply replaces
+        # the previous noise reading.  In practice we observe one
+        # NoiseMeasurement per (band, cycle).
+        self.noise[band] = noise
+
     def items(self) -> List[Tuple[str, List[RawSpot]]]:
         return [(b, s) for b, s in self.bands.items()]
+
+    def noise_items(self) -> List[Tuple[str, NoiseMeasurement]]:
+        return [(b, n) for b, n in self.noise.items()]
 
 
 class CycleBatcher:
@@ -504,6 +644,32 @@ class CycleBatcher:
             batch.add(band, spots)
             self._cond.notify()
 
+    def add_noise(
+        self,
+        cycle_key: Tuple[str, str],
+        band: str,
+        noise: NoiseMeasurement,
+        *,
+        radiod_id: str,
+    ) -> None:
+        """Enqueue per-band noise for `cycle_key`.  Same shape as add()
+        but for the noise channel — a band can report noise even with
+        zero spots, so we create the batch even if `add()` hasn't
+        been called yet (deadline starts ticking, the cycle will flush
+        and emit a noise-only batch to wspr.noise).
+        """
+        with self._cond:
+            batch = self._batches.get(cycle_key)
+            if batch is None:
+                batch = _CycleBatch(
+                    cycle_key=cycle_key,
+                    deadline=time.monotonic() + self._deadline_sec,
+                )
+                batch.radiod_id = radiod_id
+                self._batches[cycle_key] = batch
+            batch.add_noise(band, noise)
+            self._cond.notify()
+
     # --- consumer side ---------------------------------------------------
 
     def _run(self) -> None:
@@ -542,15 +708,26 @@ class CycleBatcher:
             batch.items(),
             radiod_id=batch.radiod_id,
         )
-        if n == 0 and not self._sink.enabled:
+        # Noise has its own cadence (one row per band per cycle, even
+        # when spots=0), so always try to flush it whenever the batch
+        # has noise readings.
+        n_noise = 0
+        if batch.noise:
+            n_noise = self._sink.submit_noise_batches(
+                batch.noise_items(),
+                cycle_key=batch.cycle_key,
+                radiod_id=batch.radiod_id,
+            )
+        if n == 0 and n_noise == 0 and not self._sink.enabled:
             # Disabled sink — silent.  Avoids a log line per cycle
             # on hosts that don't have the env flag set.
             return
         elapsed_ms = int((time.monotonic() - wall_start) * 1000)
         logger.info(
-            "cycle UTC %s:%s → %d spots in wspr.spots "
-            "(%d bands, write %d ms)",
-            hhmm[:2], hhmm[2:], n, len(batch.bands), elapsed_ms,
+            "cycle UTC %s:%s → %d spots in wspr.spots, "
+            "%d noise rows in wspr.noise (%d bands, write %d ms)",
+            hhmm[:2], hhmm[2:], n, n_noise,
+            len(batch.bands) or len(batch.noise), elapsed_ms,
         )
 
     # --- lifecycle -------------------------------------------------------
