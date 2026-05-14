@@ -85,7 +85,26 @@ class DriftTracker:
         )
         self._observations.append(obs)
 
-        if abs(delta_ms) > 100:
+        # Threshold raised 100 ms → 1000 ms on 2026-05-14 after a probe on
+        # bee1 showed:
+        #   - drift_tracker reads steady -200 ms / min on a healthy host
+        #   - radiod's GPS_TIME/RTP_TIMESNAP anchors agree to ~11 ppm
+        #     (= 0.66 ms / min, three orders of magnitude tighter than the
+        #     drift_tracker reading)
+        #   - the actual WAV files produced are exactly 120.000 s long
+        #     and land at the correct wall-clock minute boundary
+        #   - PSK + WSPR decode rates were 100% during the warning storm
+        # So 100 ms was below the noise floor of this measurement — every
+        # boundary emitted a WARNING that didn't correspond to any
+        # observable timing problem.  1000 ms still catches real failure
+        # modes (system clock step, sustained packet loss accumulating
+        # into a real grid offset) without crying wolf on a steady host.
+        # If you find this catching too many real problems, the right
+        # next step is to fix WHAT drift_tracker actually measures
+        # (likely a `_first_wallclock` capture-time artifact, not a
+        # threshold problem) — see investigation notes in TIMING-
+        # PIPELINE-WIRING when written up.
+        if abs(delta_ms) > 1000:
             logger.warning(
                 "Large drift: delta=%.1fms cumulative=%.1fms at minute %d",
                 delta_ms, self._cumulative_drift_ms, self._minute_count,
