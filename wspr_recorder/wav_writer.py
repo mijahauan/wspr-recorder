@@ -377,9 +377,6 @@ class WavWriter:
                 "completeness_pct": round(completeness_pct, 2),
             }
 
-            if request.drift_observation:
-                sidecar["drift"] = request.drift_observation.to_dict()
-
             if timing_dict:
                 sidecar["timing"] = timing_dict
 

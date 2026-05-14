@@ -20,17 +20,8 @@ from .decode_mode import (
     DecodeMode, DECODE_MODE_PERIODS,
     modes_completing_at_minute, max_period_seconds, group_modes_by_period,
 )
-from .drift_tracker import DriftTracker, DriftObservation
 
 logger = logging.getLogger(__name__)
-
-# Gross-error tripwire — keep the existing 1s log as an early warning,
-# but exit at 2s after this many consecutive sustained minutes so
-# systemd can restart with a fresh anchor.  WSPR has ~±2s tolerance,
-# so a sustained 2s drift means the decode rate is already zero.
-GROSS_DRIFT_SEC = 2.0
-GROSS_TRIPS_FOR_EXIT = 2     # 2 consecutive minutes — 1 could be a transient
-GROSS_EXIT_CODE = 75         # EX_TEMPFAIL — systemd Restart=always handles it
 
 
 @dataclass
@@ -55,7 +46,6 @@ class DecodeRequest:
     start_wallclock: datetime
     start_rtp_timestamp: int
     end_rtp_timestamp: int
-    drift_observation: Optional[DriftObservation] = None
 
 
 PeriodCompleteCallback = Callable[[DecodeRequest], None]
@@ -171,20 +161,10 @@ class BandRecorder:
             sample_rate=sample_rate,
         )
 
-        # Drift tracker
-        self._drift_tracker = DriftTracker(sample_rate)
-
         # Grid state — minute count and first-sync timestamps
         self._minute_count: int = 0
         self._first_wallclock: Optional[datetime] = None
         self._first_rtp_timestamp: Optional[int] = None
-
-        # Gross-error tripwire: consecutive minutes with |drift| >
-        # GROSS_DRIFT_SEC.  When this hits GROSS_TRIPS_FOR_EXIT we
-        # sys.exit() so systemd can restart the recorder with a fresh
-        # anchor.  WSPR's ±2s tolerance means a sustained 2-second drift
-        # has zeroed our decode rate; we exit before it goes any wider.
-        self._gross_trips: int = 0
 
     def on_samples(self, samples: np.ndarray, quality) -> None:
         """Process samples from ka9q-python MultiStream callback.
@@ -295,58 +275,16 @@ class BandRecorder:
         """Called when samples_per_minute samples have been written."""
         self._minute_count += 1
 
-        # Compute this minute's wallclock and RTP timestamp via grid propagation
+        # Compute this minute's wallclock and RTP timestamp via grid propagation.
+        # The anchor (`_first_wallclock`) is whatever the sync strategy set at
+        # startup — typically rtp+offset via AuthorityReader.  After that, the
+        # grid is GPSDO-disciplined: minute N is anchor + N*60s, full stop.
+        # No wall-clock-now() comparison — METROLOGY.md §4.5 RTP-reference
+        # invariant: timing is hf-timestd's job, not the client's.
         minute_wallclock = self._first_wallclock + timedelta(seconds=60 * self._minute_count)
         minute_rtp = (
             (self._first_rtp_timestamp + self._minute_count * self._samples_per_minute) & 0xFFFFFFFF
         )
-
-        # Observe drift — wall-clock read for OBSERVATION only.  The
-        # anchor (self._first_wallclock) is never updated by what we
-        # observe here; this is purely a sanity check on the projection.
-        actual_wallclock = datetime.now(timezone.utc)
-        drift_obs = self._drift_tracker.observe(minute_wallclock, actual_wallclock)
-
-        # Two-tier check:
-        #   ≥ 1.0s : early-warning log line (existing behavior)
-        #   ≥ GROSS_DRIFT_SEC for GROSS_TRIPS_FOR_EXIT consecutive
-        #            minutes : sys.exit() so systemd restarts with a
-        #            fresh anchor.
-        if abs(drift_obs.delta_ms) >= 1000.0:
-            logger.error(
-                "%s: CLOCK ERROR: system clock is %.1fs off from RTP-derived "
-                "UTC (cumulative drift %.1fs). WAV timestamps are wrong — "
-                "WSPR decode rate will be zero. Fix NTP/chrony and restart.",
-                self.band_name,
-                drift_obs.delta_ms / 1000.0,
-                drift_obs.cumulative_drift_ms / 1000.0,
-            )
-
-        if abs(drift_obs.delta_ms) >= GROSS_DRIFT_SEC * 1000.0:
-            self._gross_trips += 1
-            logger.error(
-                "%s: gross-error trip %d/%d: delta %.2fs exceeds %ss "
-                "threshold (anchor stale; restart needed)",
-                self.band_name, self._gross_trips, GROSS_TRIPS_FOR_EXIT,
-                drift_obs.delta_ms / 1000.0, GROSS_DRIFT_SEC,
-            )
-            if self._gross_trips >= GROSS_TRIPS_FOR_EXIT:
-                logger.error(
-                    "%s: gross-error tripped %d consecutive minutes "
-                    "— exiting %d for systemd restart",
-                    self.band_name, self._gross_trips, GROSS_EXIT_CODE,
-                )
-                import sys
-                sys.exit(GROSS_EXIT_CODE)
-        else:
-            if self._gross_trips > 0:
-                logger.info(
-                    "%s: gross-error counter cleared after %d trip(s) "
-                    "(delta back to %.2fs)",
-                    self.band_name, self._gross_trips,
-                    drift_obs.delta_ms / 1000.0,
-                )
-            self._gross_trips = 0
 
         # Close the minute in the ring buffer
         self._ring.close_minute(minute_wallclock, minute_rtp)
@@ -383,7 +321,6 @@ class BandRecorder:
                 start_wallclock=start_wc,
                 start_rtp_timestamp=start_rtp,
                 end_rtp_timestamp=end_rtp,
-                drift_observation=drift_obs,
             )
 
             self.stats.samples_written += len(samples)
@@ -413,7 +350,6 @@ class BandRecorder:
         """Get recorder statistics."""
         stats = self.stats.to_dict()
         stats["ring_buffer"] = self._ring.to_dict()
-        stats["drift"] = self._drift_tracker.to_dict()
         stats["synced"] = self._synced
         stats["sync_strategy"] = self.sync_strategy.__class__.__name__
         stats["sync_tier"] = getattr(self.sync_strategy, 'tier', None)
@@ -435,5 +371,4 @@ class BandRecorder:
             capacity_seconds=capacity,
             sample_rate=self.sample_rate,
         )
-        self._drift_tracker = DriftTracker(self.sample_rate)
         self.stats = BandRecorderStats()

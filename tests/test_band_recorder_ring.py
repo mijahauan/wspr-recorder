@@ -325,30 +325,8 @@ class TestGapInRing:
         assert w2[0].gaps[0].duration_samples == 480
 
 
-class TestDriftObservation:
-    def test_drift_included_in_request(self):
-        """Verify drift observation is attached to decode requests."""
-        results = []
-        start_wc = datetime(2026, 4, 8, 0, 0, 0, tzinfo=timezone.utc)
-        rate = 1200
-        sync = FakeSync(sample_rate=rate, minute_wallclock=start_wc)
-
-        rec = BandRecorder(
-            ssrc=1, frequency_hz=14095600, band_name="20",
-            sample_rate=rate, decode_modes=[DecodeMode.W2],
-            on_period_complete=lambda r: results.append(r),
-            sync_strategy=sync,
-        )
-
-        feed_minutes(rec, 2, rate)
-
-        w2 = [r for r in results if DecodeMode.W2 in r.modes]
-        assert len(w2) >= 1
-        assert w2[0].drift_observation is not None
-
-
 class TestGetStats:
-    def test_stats_include_ring_and_drift(self):
+    def test_stats_include_ring_and_modes(self):
         sync = FakeSync(sample_rate=1200)
         rec = BandRecorder(
             ssrc=1, frequency_hz=14095600, band_name="20",
@@ -357,7 +335,6 @@ class TestGetStats:
         )
         stats = rec.get_stats()
         assert "ring_buffer" in stats
-        assert "drift" in stats
         assert "decode_modes" in stats
         assert stats["decode_modes"] == ["W2", "F5"]
         assert stats["synced"] is False
