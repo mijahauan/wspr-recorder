@@ -171,17 +171,28 @@ class WsprRecorder:
         """
         if not self.wav_writer:
             return
-        wav_path = self.wav_writer.write_period(
-            request,
-            max_files_per_band=self.config.recorder.max_files_per_band,
-        )
-        if wav_path is None:
-            return  # WAV write failed; nothing to decode
+        try:
+            wav_path = self.wav_writer.write_period(
+                request,
+                max_files_per_band=self.config.recorder.max_files_per_band,
+            )
+            if wav_path is None:
+                return  # WAV write failed; nothing to decode
 
-        if self.spot_sink is None or not self.spot_sink.enabled:
-            return  # legacy path — `wd-decode@*` bash chain handles decode
+            if self.spot_sink is None or not self.spot_sink.enabled:
+                return  # legacy path — `wd-decode@*` bash chain handles decode
 
-        self._run_decoders_for(request, wav_path)
+            self._run_decoders_for(request, wav_path)
+        finally:
+            # Release the per-period 5.76 MB (W2/F2) or 14.4 MB (F5/F15/F30)
+            # NumPy slice copy + decoder-subprocess C buffers back to the OS.
+            # Without this glibc keeps freed pages in its arena and RSS
+            # climbs hundreds of MB/hour even though tracemalloc shows the
+            # Python heap is stable — was the underlying reason the
+            # historical `RuntimeMaxSec=45min` was needed.  See
+            # _malloc_trim.py for the full rationale.
+            from ._malloc_trim import trim
+            trim()
 
     def _resolve_decoder_binaries(self) -> tuple:
         """Locate (wsprd_path, wsprd_spread_path, jt9_path) for this host.
@@ -1013,9 +1024,34 @@ Examples:
     )
     
     args = parser.parse_args()
-    
+
+    # WD_MEMPROFILE=1 in the env file is equivalent to --memprofile on
+    # the command line.  The wd-ka9q-record systemd wrapper has no flag
+    # passthrough, so this env-var knob is the way to enable tracemalloc
+    # without editing the wrapper.  Unset / 0 / empty / "false" all leave
+    # it off.
+    if not args.memprofile:
+        env_val = os.environ.get("WD_MEMPROFILE", "").strip().lower()
+        if env_val in ("1", "true", "yes", "on"):
+            args.memprofile = True
+
     # Setup logging
     setup_logging(verbose=args.verbose, log_file=args.log_file)
+
+    # Disable transparent huge pages (THP) for this process.  Default
+    # THP behavior caused RSS to climb ~40 MB/min on a 13-band station
+    # because per-cycle numpy slice copies (5.76 MB / 14.4 MB each) get
+    # mmap-backed by 2 MB pages that the kernel only releases when the
+    # entire 2 MB region is free — fragmentation prevents that.  With
+    # THP off, allocations use 4 KiB pages that are returned to the OS
+    # individually on munmap.  See _malloc_trim.disable_transparent_hugepages
+    # for the full rationale; this is what made the historical
+    # `RuntimeMaxSec=45min` restart unnecessary.
+    from ._malloc_trim import disable_transparent_hugepages
+    if disable_transparent_hugepages():
+        logger.info("disabled transparent hugepages for this process "
+                    "(prevents RSS growth from per-cycle numpy slice "
+                    "fragmentation)")
     
     # Load configuration
     try:
