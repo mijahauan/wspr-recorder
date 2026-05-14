@@ -122,6 +122,33 @@ class TestSpotToRow(unittest.TestCase):
         # pkt_mode != 2, so decoder_kind defaults to jt9
         self.assertEqual(row["decoder_kind"], "jt9")
 
+    def test_schema_v2_carries_wsprd_internal_fields(self):
+        """v2 rows carry the 8 wsprd-internal fields needed for
+        wsprdaemon.org's 34-field extended _wd_spots.txt format —
+        cycles, jitter, blocksize, metric, decodetype, ipass, nhardmin,
+        pkt_mode.  hs-uploader's wsprdaemon transport reads these
+        directly from sink.db; no file fallback required."""
+        spot = _make_spot(
+            cycles=11, jitter=3, blocksize=2, metric=0.32,
+            decodetype=3, ipass=1, nhardmin=4, pkt_mode=2,
+        )
+        row = spot_to_row(
+            spot, band="20", radiod_id="rx",
+            rx_call="A", rx_grid="EM",
+        )
+        self.assertEqual(row["schema_version"], 2)
+        self.assertEqual(row["cycles"], 11)
+        self.assertEqual(row["jitter"], 3)
+        self.assertEqual(row["blocksize"], 2)
+        # metric stays a float — extended-format builder rounds to int
+        # via metric*1000 cast.
+        self.assertAlmostEqual(row["metric"], 0.32)
+        self.assertIsInstance(row["metric"], float)
+        self.assertEqual(row["decodetype"], 3)
+        self.assertEqual(row["ipass"], 1)
+        self.assertEqual(row["nhardmin"], 4)
+        self.assertEqual(row["pkt_mode"], 2)
+
     def test_bad_timestamp_falls_back_to_now(self):
         """A malformed wsprd timestamp shouldn't drop the spot."""
         spot = _make_spot(date="badbad", time="??")

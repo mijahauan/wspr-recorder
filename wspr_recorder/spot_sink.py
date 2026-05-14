@@ -31,7 +31,14 @@ from .decoder import RawSpot
 logger = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 1  # tracks wdlib/spots/row.py:SCHEMA_VERSION
+SCHEMA_VERSION = 2  # tracks wdlib/spots/row.py:SCHEMA_VERSION
+# v2 adds the 8 wsprd-internal fields needed to reconstruct
+# wsprdaemon.org's 34-field extended _wd_spots.txt format from
+# sink.db rows alone (no file fallback): cycles, jitter, blocksize,
+# metric, decodetype, ipass, nhardmin, pkt_mode_int.
+# Geodesy (distance, az, lat/lon) is computed downstream by
+# hs-uploader's wsprdaemon transport from grid pairs — no need
+# to denormalise it here.
 
 # Map wsprd-style pkt_mode → wsprdaemon mode token.  Keep this aligned
 # with decode_mode.DECODE_MODE_PKT_MODES; we keep our own table so this
@@ -183,6 +190,22 @@ def spot_to_row(
         "type_2_3":        int(spot.decodetype),
         "rx_call":         rx_call,
         "rx_grid":         rx_grid,
+        # v2 — wsprd-internal fields for wsprdaemon.org extended-format
+        # tar regeneration directly from sink.db.  Defaults match the
+        # zero-value RawSpot fields so v1-shaped producers stay
+        # backwards-compatible.
+        "cycles":          int(spot.cycles),
+        "jitter":          int(spot.jitter),
+        "blocksize":       int(spot.blocksize),
+        # `metric` is wsprd's spreading float (e.g. 0.32).  The 34-field
+        # extended uploader cast it to int after `spreading * 1000`;
+        # we store the raw value here so the extended-format builder
+        # (and any future analytics consumer) can do its own rounding.
+        "metric":          float(spot.metric),
+        "decodetype":      int(spot.decodetype),
+        "ipass":           int(spot.ipass),
+        "nhardmin":        int(spot.nhardmin),
+        "pkt_mode":        int(spot.pkt_mode),
         "schema_version":  SCHEMA_VERSION,
         "uploaded_at":     None,
     }
