@@ -155,12 +155,24 @@ class CallsignDB:
             calls_and_grids: List of (callsign, grid) tuples
             band: Band name for tracking
 
-        Returns number of new callsigns added.
+        Returns number of new callsigns added.  If any were added AND
+        ``db_path`` is configured, writes the table to disk so the
+        learning survives recorder restarts (Phase 7 — pre-fix the
+        cache was lost on every restart, and the first decode cycles
+        after restart couldn't resolve any prior type-3 hashes).
         """
         new_count = 0
         for call, grid in calls_and_grids:
             if self.add_callsign(call, grid=grid, band=band):
                 new_count += 1
+        if new_count > 0 and self._db_path is not None:
+            try:
+                self.save()
+            except Exception as exc:                # noqa: BLE001
+                logger.warning(
+                    "callsign_db: save to %s failed: %s",
+                    self._db_path, exc,
+                )
         return new_count
 
     # ------------------------------------------------------------------
