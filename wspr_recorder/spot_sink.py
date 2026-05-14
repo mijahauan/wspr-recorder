@@ -120,6 +120,33 @@ def _resolve_writer():
     )
 
 
+def _strip_resolved_brackets(call: str) -> str:
+    """Drop wsprd's angle-bracket marker from RESOLVED hash callsigns.
+
+    wsprd outputs ``<K1ABC>`` / ``<W1/AJ8S>`` when a type-3 hash was
+    resolved via its session table (or our CallsignDB):  the bracket
+    is wsprd's diagnostic signal "this came from a hash, not fresh
+    plaintext".  Downstream (wsprdaemon.org, wsprnet.org) strip them
+    server-side anyway; we strip here so the brackets never enter
+    sink.db or hit the wire — the stored callsign is the canonical
+    plaintext form regardless of how wsprd derived it.
+
+    Preserved as-is (not stripped):
+      * ``<...>`` — the literal unresolved-hash sentinel.  Means
+        wsprd received a 15-bit hash whose plaintext form we've
+        never heard.  Downstream consumers filter these.
+      * ``<NNNNNNN>`` — numeric type-3 hash that even our CallsignDB
+        couldn't resolve.  The brackets + digits encode the hash
+        value; stripping would yield a meaningless integer.
+    """
+    if not (len(call) >= 3 and call.startswith("<") and call.endswith(">")):
+        return call
+    inner = call[1:-1]
+    if not inner or inner == "..." or inner.isdigit():
+        return call
+    return inner
+
+
 def spot_to_row(
     spot: RawSpot,
     *,
@@ -165,13 +192,7 @@ def spot_to_row(
     mode = _PKT_MODE_TO_TOKEN.get(spot.pkt_mode, f"PKT{spot.pkt_mode}")
     decoder_kind = "wsprd" if spot.pkt_mode == 2 else "jt9"
 
-    callsign = spot.call
-    if spot.hash22 is not None and callsign.startswith("<") \
-            and "/" not in callsign:
-        # Type-3 hashed call we couldn't resolve to a real callsign —
-        # keep the angle-bracket form so the consumer can tell it apart
-        # from a regular plain call.
-        pass
+    callsign = _strip_resolved_brackets(spot.call)
 
     return {
         "time":            ts.strftime("%Y-%m-%dT%H:%M:%SZ"),

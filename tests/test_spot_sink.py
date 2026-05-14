@@ -64,7 +64,8 @@ class TestSpotToRow(unittest.TestCase):
         self.assertEqual(row["radiod_id"], "rx888mk2-A")
         self.assertEqual(row["host_id"], "bee1")
         self.assertEqual(row["frequency_hz"], 14_097_138)
-        self.assertEqual(row["callsign"], "<KM4BWW>")
+        # Brackets stripped from resolved hash callsigns (Phase 7+).
+        self.assertEqual(row["callsign"], "KM4BWW")
         self.assertEqual(row["grid"], "EM60OJ")
         self.assertEqual(row["snr_db"], -12)
         self.assertEqual(row["dt"], -1.94)
@@ -121,6 +122,54 @@ class TestSpotToRow(unittest.TestCase):
         self.assertEqual(row["mode"], "PKT99")
         # pkt_mode != 2, so decoder_kind defaults to jt9
         self.assertEqual(row["decoder_kind"], "jt9")
+
+    def test_bracket_stripped_from_resolved_call(self):
+        """``<AK4MI>`` is wsprd's "resolved-from-hash" marker.  Strip it
+        before storage — downstream consumers want the canonical
+        plaintext form."""
+        spot = _make_spot(call="<AK4MI>")
+        row = spot_to_row(
+            spot, band="20", radiod_id="rx",
+            rx_call="A", rx_grid="EM",
+        )
+        self.assertEqual(row["callsign"], "AK4MI")
+
+    def test_bracket_stripped_from_compound_call(self):
+        spot = _make_spot(call="<W1/AJ8S>")
+        row = spot_to_row(
+            spot, band="20", radiod_id="rx",
+            rx_call="A", rx_grid="EM",
+        )
+        self.assertEqual(row["callsign"], "W1/AJ8S")
+
+    def test_unresolved_sentinel_preserved(self):
+        """``<...>`` stays as-is — it's the "I couldnt resolve this"
+        signal and downstream consumers filter on it."""
+        spot = _make_spot(call="<...>")
+        row = spot_to_row(
+            spot, band="20", radiod_id="rx",
+            rx_call="A", rx_grid="EM",
+        )
+        self.assertEqual(row["callsign"], "<...>")
+
+    def test_numeric_hash_brackets_preserved(self):
+        """``<2288505>`` (all-digit) means CallsignDB couldnt resolve
+        the type-3 hash.  Stripping would yield a misleading
+        integer-as-callsign; keep brackets so consumers can tell."""
+        spot = _make_spot(call="<2288505>", hash22=2288505)
+        row = spot_to_row(
+            spot, band="20", radiod_id="rx",
+            rx_call="A", rx_grid="EM",
+        )
+        self.assertEqual(row["callsign"], "<2288505>")
+
+    def test_plain_callsign_unchanged(self):
+        spot = _make_spot(call="K1ABC")
+        row = spot_to_row(
+            spot, band="20", radiod_id="rx",
+            rx_call="A", rx_grid="EM",
+        )
+        self.assertEqual(row["callsign"], "K1ABC")
 
     def test_schema_v2_carries_wsprd_internal_fields(self):
         """v2 rows carry the 8 wsprd-internal fields needed for
@@ -268,7 +317,8 @@ class TestSpotSinkSubmitBatch(unittest.TestCase):
         rows = writer.insert.call_args[0][0]
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["radiod_id"], "rx888mk2-A")
-        self.assertEqual(rows[0]["callsign"], "<KM4BWW>")
+        # Brackets stripped from resolved hash callsigns (Phase 7+).
+        self.assertEqual(rows[0]["callsign"], "KM4BWW")
         self.assertEqual(rows[1]["callsign"], "K9XX")
         self.assertEqual(sink.rows_written, 2)
         self.assertEqual(sink.rows_dropped, 0)
