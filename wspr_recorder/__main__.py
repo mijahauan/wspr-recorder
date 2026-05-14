@@ -85,8 +85,27 @@ class WsprRecorder:
         # cost on bands with no slots completed yet.
         self._decoders: Dict[str, DecoderRunner] = {}
 
-        # Thread pool for disk I/O
-        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wav_writer")
+        # Thread pool for WAV writes + per-period decoder dispatch
+        # (wsprd / jt9 subprocesses are spawned from inside this pool
+        # by `_on_period_complete` → `_run_decoders_for`).  Size = the
+        # number of CPUs available to *this* process, as already
+        # constrained by systemd's CPUAffinity/AllowedCPUs drop-in.
+        # On B4-100 that's 12 cores (radiod owns 0-1, this service
+        # gets 2-13); on a smaller host it's whatever the operator
+        # configured via `smd diag cpu-affinity`.  Matching the pool
+        # to the affinity set fires every enabled band's wsprd in
+        # parallel at cycle boundary (instead of queueing them four
+        # at a time as the old size-4 pool did) without bumping into
+        # the radiod-reserved cores.  `len(os.sched_getaffinity(0))`
+        # is Linux-only; fall back to os.cpu_count() elsewhere.
+        try:
+            _allowed_cpus = len(os.sched_getaffinity(0))
+        except AttributeError:                       # non-Linux
+            _allowed_cpus = os.cpu_count() or 4
+        self.executor = ThreadPoolExecutor(
+            max_workers=max(2, _allowed_cpus),
+            thread_name_prefix="wav_decoder",
+        )
         
         # State
         self._running = False
