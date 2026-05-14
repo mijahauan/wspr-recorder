@@ -164,71 +164,39 @@ class CallsignDB:
         return new_count
 
     # ------------------------------------------------------------------
-    # Hash algorithms
+    # Hash algorithms — delegated to the canonical `callhash` library
+    # (github.com/mijahauan/callhash, also used by psk-recorder +
+    # wsprdaemon-client) for cross-tool consistency.  The pre-Phase-7
+    # in-tree implementation produced DIFFERENT hash22 values from
+    # callhash and wsprd's own internal hash — verified KX6H giving
+    # 2909634 (in-tree, wrong) vs 3206159 (callhash, matches wsprd).
+    # That mismatch was the root cause of the ~4% unresolved-callsign
+    # rate (<...> / <CALLSIGN>) observed in spots.
     # ------------------------------------------------------------------
 
     @staticmethod
     def nhash15(callsign: str) -> int:
+        """wsprd's 15-bit Jenkins lookup3 hash (seed 146).
+
+        Delegates to ``callhash.hash15`` for parity with the shared
+        library.  Callsign is upper-cased first since wsprd's hash
+        table is keyed by the canonical (upper-case) form — callhash
+        itself is case-sensitive by design.
         """
-        Compute wsprd's 15-bit hash (Jenkins lookup3, seed 146).
-
-        Reimplements nhash() from nhash.c in the WSJT-X codebase.
-        Bob Jenkins' lookup3 hashlittle algorithm.
-        """
-        key = callsign.encode('ascii')
-        length = len(key)
-        a = b = c = (0xdeadbeef + length + 146) & _MASK32
-
-        i = 0
-        while length > 12:
-            a = (a + key[i] + (key[i+1] << 8) + (key[i+2] << 16) + (key[i+3] << 24)) & _MASK32
-            b = (b + key[i+4] + (key[i+5] << 8) + (key[i+6] << 16) + (key[i+7] << 24)) & _MASK32
-            c = (c + key[i+8] + (key[i+9] << 8) + (key[i+10] << 16) + (key[i+11] << 24)) & _MASK32
-            # mix
-            a, b, c = _jenkins_mix(a, b, c)
-            i += 12
-            length -= 12
-
-        # Handle remaining bytes
-        if length >= 12: c = (c + (key[i+11] << 24)) & _MASK32
-        if length >= 11: c = (c + (key[i+10] << 16)) & _MASK32
-        if length >= 10: c = (c + (key[i+9] << 8)) & _MASK32
-        if length >= 9:  c = (c + key[i+8]) & _MASK32
-        if length >= 8:  b = (b + (key[i+7] << 24)) & _MASK32
-        if length >= 7:  b = (b + (key[i+6] << 16)) & _MASK32
-        if length >= 6:  b = (b + (key[i+5] << 8)) & _MASK32
-        if length >= 5:  b = (b + key[i+4]) & _MASK32
-        if length >= 4:  a = (a + (key[i+3] << 24)) & _MASK32
-        if length >= 3:  a = (a + (key[i+2] << 16)) & _MASK32
-        if length >= 2:  a = (a + (key[i+1] << 8)) & _MASK32
-        if length >= 1:  a = (a + key[i]) & _MASK32
-
-        if length == 0:
-            return c & 32767
-
-        # final
-        a, b, c = _jenkins_final(a, b, c)
-        return c & 32767
+        from callhash import hash15
+        return hash15(callsign.upper())
 
     @staticmethod
     def ihash22(callsign: str) -> int:
-        """
-        Compute jt9's 22-bit hash (base-38 multiplicative).
+        """jt9's 22-bit hash.
 
-        Reimplements ihashcall() from packjt77.f90:
-          - Pad callsign to 11 chars
-          - Encode as base-38 using character set " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/"
-          - Multiply by 47055833459, right-shift by 42 bits
+        Delegates to ``callhash.hash22``.  Upper-cases the input so
+        legacy callers that passed lower-case strings get the same
+        value the original in-tree implementation produced (after
+        its own upper-case step).
         """
-        call = callsign.upper().ljust(11)[:11]
-        n8 = 0
-        for ch in call:
-            j = _BASE38_CHARS.index(ch) if ch in _BASE38_CHARS else 0
-            n8 = 38 * n8 + j
-
-        # 64-bit multiplication then right shift
-        result = (47055833459 * n8) >> 42
-        return result & 0x3FFFFF  # 22 bits
+        from callhash import hash22
+        return hash22(callsign.upper())
 
     # ------------------------------------------------------------------
     # Persistence

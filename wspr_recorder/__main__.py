@@ -808,7 +808,24 @@ class WsprRecorder:
         rx_call, rx_grid = resolve_reporter_identity()
         self.spot_sink = SpotSink(rx_call=rx_call, rx_grid=rx_grid)
         if self.spot_sink.enabled:
-            self.callsign_db = CallsignDB()
+            # Persist the callsign-hash table to disk so the (call,
+            # hash) mappings learned from <call> announcements survive
+            # restarts.  Pre-Phase-7 the DB was in-memory only — every
+            # restart lost the cumulative cache, so type-3 spots
+            # weren't resolved until the same announcement was
+            # observed again.  Path is per-station (shared across
+            # bands by design; CallsignDB is itself a singleton).
+            callsign_path = Path("/var/lib/wsprdaemon-client/callhash") \
+                / "wspr-callhash.json"
+            try:
+                callsign_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "callsign_db: cannot create %s (%s) — running in-memory",
+                    callsign_path.parent, exc,
+                )
+                callsign_path = None
+            self.callsign_db = CallsignDB(db_path=callsign_path)
             # CycleBatcher collects per-band spots into a single
             # per-cycle wspr.spots write on a dedicated writer
             # thread.  Sidesteps SQLite's thread-affinity check

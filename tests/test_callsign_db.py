@@ -13,8 +13,12 @@ class TestIHash22:
     """Test the 22-bit hash (jt9/packjt77 algorithm)."""
 
     def test_k9an_known_value(self):
-        """K9AN → 2774015 (documented in WSJT-X hash22calc output)."""
-        assert CallsignDB.ihash22("K9AN") == 2774015
+        """K9AN → 2288505 — matches the canonical ``callhash.hash22``
+        which is what wsprd actually uses (verified against wsprd's
+        own hashtable.txt output on bee1).  The prior in-tree
+        implementation gave 2774015 — wrong, the root cause of the
+        ~4% unresolved-callsign rate before Phase 7."""
+        assert CallsignDB.ihash22("K9AN") == 2288505
 
     def test_case_insensitive(self):
         """Hash should be the same for upper/lower case."""
@@ -43,6 +47,17 @@ class TestIHash22:
         for call in ["A1A", "ZZ9ZZZ", "K9AN", "W1AW"]:
             h = CallsignDB.ihash22(call)
             assert 0 <= h <= 4194303
+
+    def test_parity_with_callhash_library(self):
+        """The in-tree wrappers must produce identical values to
+        ``callhash.hash22`` / ``callhash.hash15``.  Regression guard
+        in case the wrappers ever drift away from the shared library
+        (e.g. by reverting to a local implementation).  Any drift here
+        manifests as a ~4% jump in unresolved <CALLSIGN> spots."""
+        from callhash import hash15, hash22
+        for call in ["K9AN", "KX6H", "W1AW", "VK2ABC", "JA1XYZ"]:
+            assert CallsignDB.ihash22(call) == hash22(call)
+            assert CallsignDB.nhash15(call) == hash15(call)
 
 
 class TestNHash15:
@@ -100,12 +115,16 @@ class TestCallsignDB:
         assert db.size == 2
 
     def test_cross_decoder_resolution(self):
-        """A callsign learned from wsprd can resolve a jt9 -Y hash."""
+        """A callsign learned from wsprd can resolve a jt9 -Y hash.
+
+        Uses the canonical ``callhash.hash22`` value for K9AN
+        (2288505) — same algorithm wsprd uses internally.
+        """
         db = CallsignDB()
         # wsprd decoded K9AN as type-1 → add to DB
         db.add_callsign("K9AN", grid="EN50", band="20")
-        # jt9 -Y decoded <2774015> → resolve via DB
-        resolved = db.resolve_hash22(2774015)
+        # jt9 -Y decoded <2288505> → resolve via DB
+        resolved = db.resolve_hash22(2288505)
         assert resolved == "K9AN"
 
     def test_ingest_spots(self):

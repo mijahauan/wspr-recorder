@@ -188,13 +188,16 @@ class TestHash22Resolution:
         # Simulate: wsprd decoded K9AN
         db.add_callsign("K9AN", grid="EN50")
 
-        # Parse a jt9 -Y line with the numeric hash
+        # Parse a jt9 -Y line with the numeric hash (canonical
+        # callhash.hash22('K9AN') = 2288505 — what wsprd actually
+        # emits for the K9AN hash; the prior in-tree value 2774015
+        # was wrong, see test_callsign_db.test_parity_with_callhash_library).
         spot = runner._parse_fst4_line(
             "  1   1   12    0    0   85    1   50   18"
             "    3   0.50   0  0  0.85  -15  0.10  14097200  0.30"
-            "  <2774015> EN50WA 23"
+            "  <2288505> EN50WA 23"
         )
-        assert spot.hash22 == 2774015
+        assert spot.hash22 == 2288505
 
         # Resolve
         resolved = db.resolve_hash22(spot.hash22)
