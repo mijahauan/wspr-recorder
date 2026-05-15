@@ -779,7 +779,7 @@ class CycleBatcher:
         elapsed_ms = int((time.monotonic() - wall_start) * 1000)
         logger.info(
             "cycle UTC %s:%s → %d spots in wspr.spots, "
-            "%d noise rows in wspr.noise (%d bands, write %d ms)",
+            "%d noise rows in wspr.noise (%d bands, sqlite write %d ms)",
             hhmm[:2], hhmm[2:], n, n_noise,
             len(batch.bands) or len(batch.noise), elapsed_ms,
         )
