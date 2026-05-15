@@ -151,8 +151,34 @@ class WsprRecorder:
             channel_state.drop_count += 1
 
         def on_stream_restored(channel_info):
-            logger.info(f"{channel_state.band_name}: Stream restored")
+            # MultiStream only fires this after _drop_timeout_sec (default
+            # 15s) of silence + successful ensure_channel() — a real
+            # radiod restart, not a transient packet hiccup.
+            #
+            # Empirically (B4-100 2026-05-14) an in-place reset of the
+            # BandRecorder + sync_strategy isn't sufficient: bands
+            # produce full-size WAVs after re-sync but wsprd decodes
+            # zero spots, because the partial samples accumulated
+            # mid-outage leave the ring buffer's minute alignment off
+            # by an unknowable offset.  A fresh process restart syncs
+            # cleanly on the next minute boundary and decoding resumes
+            # in the following cycle, so trade the heavier-hammer
+            # restart for guaranteed correct timing.  Systemd's
+            # ``Restart=always`` (already set on wd-ka9q-record@) brings
+            # us back within RestartSec=5.
+            logger.warning(
+                f"{channel_state.band_name}: Stream restored after "
+                f"radiod outage — exiting so systemd can restart us for "
+                f"a clean re-sync (in-place recovery produces "
+                f"timing-misaligned WAVs that wsprd rejects)"
+            )
             channel_state.restore_count += 1
+            # Exit code 75 = EX_TEMPFAIL (transient failure, please retry).
+            # os._exit bypasses Python finalizers — necessary because we
+            # may be inside a MultiStream callback thread holding locks
+            # that sys.exit's normal teardown would deadlock on.
+            import os as _os
+            _os._exit(75)
 
         return ChannelSink(
             on_samples=on_samples,
