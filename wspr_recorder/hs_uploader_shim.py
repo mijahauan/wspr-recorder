@@ -6,22 +6,23 @@ lifted in-process for v3 Phase A (wsprdaemon-client dissolution).
 
 Pipelines run inside one ``Uploader``:
 
-  * **wsprdaemon-tar (spots)** — ``SqliteSource`` on ``wspr.spots`` →
-    ``WsprdaemonTarSftp`` → wsprdaemon.org via SFTP.  The transport
-    rebuilds the v3 wire-format tar (byte-identical to v1) from
-    SqliteSource row payloads.  Optional ``FileTreeSource`` fallback
-    over the legacy spool dir for pre-cutover hosts.
-  * **wsprdaemon-tar (noise)** — ``SqliteSource`` on ``wspr.noise`` →
-    same ``WsprdaemonTarSftp`` transport (detects ``table`` attribute
-    and emits ``wsprdaemon/noise/...`` arcnames).
+  * **wsprdaemon-tar (cycle)** — ``WsprCycleSource`` on
+    ``(wspr.spots, wspr.noise)`` → ``WsprdaemonTarSftp`` →
+    wsprdaemon.org via SFTP.  Yields one tar per WSPR 2-min cycle
+    containing parallel ``wsprdaemon/spots/...`` and
+    ``wsprdaemon/noise/...`` subtrees, matching the legacy v3 server's
+    expected tar layout.  Tar filename is cycle-time-derived
+    (``YYMMDD_HHMM``) so concurrent pumps can't race on rename.
   * **wsprnet** — ``SqliteSource`` on ``wspr.spots`` → ``WsprNet`` →
     wsprnet.org via HTTP multipart POST.  Identical MEPT line format
     to the legacy uploader.
 
-Why three pipelines: the same ``wspr.spots`` queue feeds wsprdaemon.org
-(tar/SFTP) and wsprnet.org (HTTP MEPT) — each pipeline has its own
-watermark so both consumers track independently.  Noise rows ship
-separately because ``SqliteSource`` is single-table.
+Why two pipelines: wsprdaemon.org wants one cycle-aligned tar (spots
++ noise bundled), wsprnet.org wants individual spot rows posted as
+they decode.  Each pipeline has its own watermark.  The previous
+three-pipeline design (separate spots-tar + noise-tar + wsprnet)
+violated wsprdaemon.org's one-tar-per-cycle ingest model and caused
+intermittent rename collisions on the gateway side.
 
 Feature flag ``WSPR_USE_HS_UPLOADER=1`` gates the uploader.  Off (or
 unset) → uploader does not start; the operator is presumably running a
@@ -210,24 +211,23 @@ class WsprUploaderHs:
         identity.grid = self._grid
         pipelines = []
 
-        # --- pipeline 1: wsprdaemon.org via tar/SFTP (spots) ---
-        wsprd_pipe = self._build_wsprdaemon_pipeline(
+        # --- pipeline 1: wsprdaemon.org via tar/SFTP (cycle-aligned) ---
+        # One tar per WSPR cycle containing parallel wsprdaemon/spots/...
+        # and wsprdaemon/noise/... subtrees, matching the v3 server's
+        # expected tar layout (it parses the tar contents, not the
+        # filename, and extracts reporter+grid from each record's
+        # RX_SITE directory).  Replaces the previous two-pipeline design
+        # (spots + noise as separate SqliteSources) which raced on the
+        # SFTP filename — both pipelines pumping within the same
+        # second produced two ``.tbz``s with the same upload-time name
+        # and the second's rename collided with the first's already-
+        # ingested file.
+        wsprd_pipe = self._build_wsprdaemon_cycle_pipeline(
             identity=identity, watermark=watermark,
         )
         if wsprd_pipe is not None:
             pipelines.append(wsprd_pipe[0])
             self._transports.append(wsprd_pipe[1])
-
-        # --- pipeline 2: wsprdaemon.org via tar/SFTP (noise) ---
-        # Separate pipeline because SqliteSource is single-table.
-        # WsprdaemonTarSftp routes records by their `table` attribute:
-        # wspr.noise rows produce wsprdaemon/noise/... arcnames.
-        wsprd_noise_pipe = self._build_wsprdaemon_noise_pipeline(
-            identity=identity, watermark=watermark,
-        )
-        if wsprd_noise_pipe is not None:
-            pipelines.append(wsprd_noise_pipe[0])
-            self._transports.append(wsprd_noise_pipe[1])
 
         # --- pipeline 3: wsprnet.org via HTTP MEPT ---
         wsprnet_pipe = self._build_wsprnet_pipeline(
@@ -455,121 +455,41 @@ class WsprUploaderHs:
             receiver=receiver,
         )
 
-    def _build_wsprdaemon_pipeline(self, *, identity, watermark):
+    def _build_wsprdaemon_cycle_pipeline(self, *, identity, watermark):
+        """Cycle-aligned single tar per WSPR 2-min cycle.
+
+        Reads BOTH wspr.spots and wspr.noise from sink.db via
+        ``WsprCycleSource``, yields one batch per cycle, and ships
+        one tar containing parallel ``wsprdaemon/spots/...`` and
+        ``wsprdaemon/noise/...`` subtrees plus ``client_upload_info.txt``
+        at the tar root.  Tar filename: ``{UPLOAD_ID}_YYMMDD_HHMM.tbz``
+        (cycle time, not upload time) so concurrent pumps can't race
+        on the SFTP rename.  Matches the legacy v3 server's tar layout.
+        """
         if not self._sftp_servers:
             logger.warning(
                 "wspr-uploader-hs: WD_SFTP_SERVERS unset — skipping "
                 "wsprdaemon.org pipeline"
             )
             return None
-        from hs_uploader import Pipeline, RetryPolicy
-        from hs_uploader.transports.wsprdaemon import WsprdaemonTarSftp
-
-        # Prefer SqliteSource (sink.db wspr/spots) — this matches the
-        # post-Pipeline-v2 wspr-recorder world where decoded spots
-        # land directly in sink.db rather than the legacy spool dir.
-        # WsprdaemonTarSftp's SqliteSource branch rebuilds the v3
-        # wsprdaemon.org wire-format tar (byte-identical to v1) from
-        # row payloads — see hs-uploader commit f6aea7c.
-        source = self._build_wsprdaemon_source()
-        if source is None:
+        if not self._sink_db.exists():
             logger.info(
-                "wspr-uploader-hs: no usable wsprdaemon source — skipping "
-                "wsprdaemon.org pipeline"
+                "wspr-uploader-hs: sink.db not present at %s — skipping "
+                "wsprdaemon cycle pipeline", self._sink_db,
             )
             return None
-
-        receiver = os.environ.get("WD_RECEIVER_NAME", "") or self._instance_name
-        fallback_ftp = self._build_wsprdaemon_ftp_fallback(
-            spool_root=self._wsprdaemon_dir, receiver=receiver,
-        )
-        transport = WsprdaemonTarSftp(
-            servers=[_server_host(s) for s in self._sftp_servers],
-            spool_root=self._wsprdaemon_dir,   # legacy file path, optional
-            sftp_user=self._sftp_user,
-            version=self._version,
-            upload_id=self._upload_id,
-            receiver=receiver,                  # required for SqliteSource path
-            fallback_ftp=fallback_ftp,
-        )
-        pipeline = Pipeline(
-            name=f"wsprdaemon-tar-{self._instance_name}",
-            source=source,
-            transport=transport,
-            watermark=watermark,
-            identity=identity,
-            retry=RetryPolicy.exponential(base=2.0, cap_sec=900.0),
-            batch_limit=10_000,
-        )
-        return (pipeline, transport)
-
-    def _build_wsprdaemon_source(self):
-        """Prefer SqliteSource (sink.db wspr/spots) over FileTreeSource.
-
-        The post-v2 wspr-recorder world writes spots only to sink.db;
-        the legacy spool dir stays drained.  Falls back to the file
-        path when no sink.db is present (offline / pre-migration hosts)
-        so this shim continues to work on installs that haven't cut
-        over yet.
-        """
         try:
-            from hs_uploader.sources.sqlite import SqliteSource, HEALTH_NOOP
+            from hs_uploader.sources.wspr_cycle import WsprCycleSource
         except ImportError as exc:
             logger.warning(
-                "wspr-uploader-hs: SqliteSource import failed for "
-                "wsprdaemon pipeline: %s", exc,
+                "wspr-uploader-hs: WsprCycleSource import failed: %s "
+                "— skipping wsprdaemon cycle pipeline", exc,
             )
-            return self._build_wsprdaemon_file_source()
-        if self._sink_db.exists():
-            sqlite_source = SqliteSource.from_env(
-                database="wspr",
-                table="spots",
-                accepted_schema_versions=[1, 2],   # both pre/post v2 cutover
-                start_at="now",
-                # Don't delete on ack — the wsprnet pipeline shares this
-                # same (database, table) queue.  Whichever pipeline acks
-                # first would race-delete the other's pending rows.
-                # `smd storage trim` (24h wspr retention) cleans up.
-                delete_on_commit=False,
-            )
-            if sqlite_source.health() != HEALTH_NOOP:
-                logger.info(
-                    "wspr-uploader-hs: using SqliteSource for "
-                    "wsprdaemon (sink at %s)", self._sink_db,
-                )
-                return sqlite_source
-        # Fallback: legacy file path.  Only useful on pre-cutover hosts
-        # where wd-post is still populating the spool dir.
-        return self._build_wsprdaemon_file_source()
-
-    def _build_wsprdaemon_noise_pipeline(self, *, identity, watermark):
-        """Per-cycle noise rows → wsprdaemon.org via tar/SFTP.
-
-        Reads sink.db `wspr.noise` (produced by wspr-recorder's
-        in-process noise measurement, Phase 2 of the cutover).  Same
-        WsprdaemonTarSftp transport as the spots pipeline; the
-        transport detects records with `table=="wspr.noise"` and
-        builds noise-only tars with `wsprdaemon/noise/...` arcnames.
-        """
-        if not self._sftp_servers or not self._sink_db.exists():
-            return None
-        try:
-            from hs_uploader.sources.sqlite import SqliteSource, HEALTH_NOOP
-        except ImportError:
             return None
         from hs_uploader import Pipeline, RetryPolicy
         from hs_uploader.transports.wsprdaemon import WsprdaemonTarSftp
 
-        source = SqliteSource.from_env(
-            database="wspr",
-            table="noise",
-            accepted_schema_versions=[1],
-            start_at="now",
-            delete_on_commit=True,    # single consumer; safe to delete on ack
-        )
-        if source.health() == HEALTH_NOOP:
-            return None
-
+        source = WsprCycleSource(db_path=self._sink_db)
         receiver = os.environ.get("WD_RECEIVER_NAME", "") or self._instance_name
         fallback_ftp = self._build_wsprdaemon_ftp_fallback(
             spool_root=None, receiver=receiver,
@@ -581,11 +501,15 @@ class WsprUploaderHs:
             version=self._version,
             upload_id=self._upload_id,
             receiver=receiver,
-            name=f"wsprdaemon-tar-sftp-noise:{','.join(_server_host(s) for s in self._sftp_servers)}",
             fallback_ftp=fallback_ftp,
+            # Cycle-aligned source — give the watermark its own key
+            # so it doesn't collide with raw-table pipelines (wsprnet
+            # still uses SqliteSource on wspr.spots, watermark key
+            # "wspr.spots").
+            primary_table_name="wspr.cycle",
         )
         pipeline = Pipeline(
-            name=f"wsprdaemon-noise-{self._instance_name}",
+            name=f"wsprdaemon-tar-{self._instance_name}",
             source=source,
             transport=transport,
             watermark=watermark,
@@ -594,26 +518,10 @@ class WsprUploaderHs:
             batch_limit=10_000,
         )
         logger.info(
-            "wspr-uploader-hs: using SqliteSource for wsprdaemon noise "
+            "wspr-uploader-hs: using WsprCycleSource for wsprdaemon "
             "(sink at %s)", self._sink_db,
         )
         return (pipeline, transport)
-
-    def _build_wsprdaemon_file_source(self):
-        """Legacy spool-dir path: wd-post → _wd_spots.txt files."""
-        if self._wsprdaemon_dir is None:
-            return None
-        from hs_uploader.sources.files import FileSpec, FileTreeSource
-        return FileTreeSource(
-            root=self._wsprdaemon_dir,
-            specs=[FileSpec(
-                pattern="*_wd_spots.txt",
-                parser=None,
-                table="wspr.spots",
-            )],
-            retention=FileTreeSource.DELETE_ON_ACK,
-            source_id=f"wsprdaemon-spool:{self._instance_name}",
-        )
 
     def _build_wsprnet_pipeline(self, *, identity, watermark):
         # WsprNet reads record.columns — natural fit for SqliteSource
