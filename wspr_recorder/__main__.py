@@ -807,6 +807,51 @@ class WsprRecorder:
         await self.ipc_server.start()
         logger.info(f"IPC server started: {self.config.recorder.ipc_socket}")
     
+    @staticmethod
+    def _sd_notify(message: bytes) -> None:
+        """Send one datagram to systemd's notify socket (Type=notify).
+
+        No-op when not running under systemd.  Dependency-free — the
+        same stdlib-socket pattern psk-recorder / hfdl-recorder use,
+        so wspr-recorder needs no `sdnotify`/`systemd` package.
+        """
+        addr = os.environ.get("NOTIFY_SOCKET")
+        if not addr:
+            return
+        try:
+            import socket
+            # Abstract-namespace sockets arrive '@'-prefixed in the env.
+            if addr.startswith("@"):
+                addr = "\0" + addr[1:]
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+                sock.connect(addr)
+                sock.sendall(message)
+        except Exception:
+            logger.debug("sd_notify %r failed (not under systemd?)", message)
+
+    async def _watchdog_loop(self) -> None:
+        """Pet the systemd watchdog (WATCHDOG=1) while running.
+
+        wspr-recorder@.service is Type=notify with WatchdogSec set;
+        systemd kills and restarts us if the pings stop.  Ping at half
+        the watchdog interval (WATCHDOG_USEC / 2), matching
+        psk-recorder / hfdl-recorder.  No-op when the unit has no
+        watchdog (WATCHDOG_USEC unset).
+        """
+        watchdog_usec = os.environ.get("WATCHDOG_USEC")
+        if not watchdog_usec:
+            return
+        try:
+            interval = max(int(watchdog_usec) / 1_000_000 / 2, 1.0)
+        except ValueError:
+            return
+        while self._running:
+            self._sd_notify(b"WATCHDOG=1")
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+
     async def run(self) -> None:
         """
         Run the WSPR recorder.
@@ -914,8 +959,15 @@ class WsprRecorder:
             health_task = asyncio.create_task(self._health_check_loop())
             memprofile_task = asyncio.create_task(self._memprofile_loop())
             lifetime_task = asyncio.create_task(self._lifetime_keepalive_loop())
+            watchdog_task = asyncio.create_task(self._watchdog_loop())
 
             logger.info("WSPR recorder running")
+
+            # Tell systemd start-up succeeded (Type=notify).  Until this
+            # READY=1 the unit sits in `activating`; without it systemd
+            # times out at TimeoutStartSec and restarts us in a loop.
+            self._sd_notify(b"READY=1")
+            logger.info("sd_notify READY=1 sent")
 
             # Wait for shutdown signal
             await self._shutdown_event.wait()
@@ -926,6 +978,7 @@ class WsprRecorder:
             health_task.cancel()
             memprofile_task.cancel()
             lifetime_task.cancel()
+            watchdog_task.cancel()
 
             try:
                 await asyncio.gather(

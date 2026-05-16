@@ -94,11 +94,10 @@ def build_inventory(config: Config, config_path: Path) -> dict:
         "chain_delay_ns_applied": _chain_delay_ns(instance_id),
     }
 
-    log_paths: dict[str, Any] = {
-        instance_id: {
-            "process": f"{log_dir}/{instance_id}.log",
-        }
-    }
+    # The process log goes to the systemd journal
+    # (StandardOutput=journal) — see it via `smd log wspr-recorder`.
+    # wspr-recorder writes no other file-based logs.
+    log_paths: dict[str, Any] = {instance_id: {}}
 
     effective_level = logging.getLogger().getEffectiveLevel()
     log_level_name = logging.getLevelName(effective_level)

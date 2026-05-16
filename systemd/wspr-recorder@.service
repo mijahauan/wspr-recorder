@@ -35,12 +35,17 @@ ExecStartPre=+/usr/bin/chown -R wsprrec:wsprrec /var/log/wspr-recorder
 ExecStart=/opt/wspr-recorder/venv/bin/python3 -m wspr_recorder.cli daemon \
     --config /etc/wspr-recorder/config.toml
 
-TimeoutStartSec=60
+# Generous: connecting to radiod + provisioning ~17 WSPR band
+# channels before the daemon sends sd_notify READY=1.  Matches
+# psk-recorder@.service.
+TimeoutStartSec=180
 
 Restart=always
 RestartSec=5
 
-StandardOutput=append:/var/log/wspr-recorder/%i.log
+# Logs go to the systemd journal (sigmond standard) — query with
+# `journalctl -u wspr-recorder@%i` or `smd wspr-watch`.
+StandardOutput=journal
 StandardError=inherit
 SyslogIdentifier=wspr-recorder@%i
 
