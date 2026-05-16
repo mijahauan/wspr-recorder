@@ -138,11 +138,20 @@ EnvironmentFile=-/etc/sigmond/coordination.env
 EnvironmentFile=-/etc/wspr-recorder/env/%i.env
 ```
 
-The unit uses `Type=notify` with `WatchdogSec=180`; the daemon pings
-the watchdog from its main loop so a wedged recorder is restarted
-rather than silently stalling. Memory is capped at `MemoryMax=1G`
-with `MALLOC_ARENA_MAX=2` to suppress glibc arena fragmentation from
-F15/F30 slice allocations (see unit comment).
+The unit uses `Type=notify` with `WatchdogSec=180` and
+`TimeoutStartSec=180`. The daemon sends `sd_notify` `READY=1` once all
+radiod channels are provisioned (until then the unit sits in
+`activating`), then pings `WATCHDOG=1` on a loop so a wedged recorder
+is restarted rather than silently stalling. `sd_notify` is a
+dependency-free stdlib `AF_UNIX` `SOCK_DGRAM` send and a no-op when
+`NOTIFY_SOCKET` is unset, so the same binary runs standalone. Logs go
+to the journal (`StandardOutput=journal`). Memory is capped at
+`MemoryMax=1G` with `MALLOC_ARENA_MAX=2` to suppress glibc arena
+fragmentation from F15/F30 slice allocations (see unit comment).
+`ProtectSystem=strict` with `ReadWritePaths` covering the tmpfs
+spool, `/run`, the log dir, and — for full-pipeline mode — the SQLite
+sink (`/var/lib/sigmond`) and the uploader watermark store
+(`/var/lib/hs-uploader`).
 
 Sigmond is welcome to drop CPU-affinity files at
 `/etc/systemd/system/wspr-recorder@<id>.service.d/10-sigmond-cpu-affinity.conf`;
@@ -154,18 +163,21 @@ wspr-recorder writes nothing under that path itself. Full unit at
 [`deploy.toml`](../deploy.toml) at the repo root declares
 `contract_version = "0.4"`, the venv build, the binary symlinks
 (`wspr-recorder`, `wspr-ctl` to `/usr/local/bin/`), the systemd unit,
-the rendered config, and external deps (`ka9q-python` from PyPI,
-`wsjtx` from apt for `jt9`). Sigmond uses this to install/upgrade
+the rendered config, and external deps (`ka9q-python` and `numpy` from
+PyPI, `wsjtx` from apt for `jt9`). Sigmond uses this to install/upgrade
 wspr-recorder without carrying any wspr-recorder-specific knowledge
 in its own code.
 
 The standalone-safe equivalent is [`install.sh`](../install.sh) —
-same production layout, no sigmond required.
+same production layout, no sigmond required. `install.sh` additionally
+pre-installs the sibling repos `callhash` and `hs-uploader` (not yet
+on PyPI) from local paths.
 
-External decoders (`wsprd`, `wsprd.spread`) come from the
-`wsprdaemon` checkout, not from this deploy; they are runtime deps
-declared by operator convention, not by the wspr-recorder deploy
-manifest.
+External decoders (`wsprd`, `wsprd.spreading`) used by full-pipeline
+decode are runtime deps resolved at startup from
+`/opt/wsprdaemon-client/bin/decoders/` (falling back to `PATH`); they
+are declared by operator convention, not by the wspr-recorder deploy
+manifest. `jt9` comes from the `wsjtx` apt package.
 
 ## §6 — Talking to radiod
 
@@ -216,26 +228,26 @@ The value is **not** subtracted from sample-to-UTC timestamps.
 WSPR / FST4W decoders operate on 120–1800 s integration windows and
 are slot-quantized to minute boundaries, so chain delay
 (sub-millisecond) is far below the relevant scale. The contract hook
-is wired so a future tightening (sub-second drift studies via
-`drift_tracker.py`, which already logs ppm per minute) can consume
-hf-timestd's calibration output without further contract work; the
-application point would be in
-[wspr_recorder/timing_service.py](../wspr_recorder/timing_service.py).
+is wired so a future tightening can consume hf-timestd's calibration
+output without further contract work; the application point would be
+in [wspr_recorder/timing_service.py](../wspr_recorder/timing_service.py).
 
 ## §10 — Logging discipline
 
-- Process logs go to `/var/log/wspr-recorder/<instance>.log` via the
-  unit's `StandardOutput=append:`. This duplicates the journal but
-  keeps a self-contained per-instance file, matching the sigmond
-  conventions.
-- There is no separate spot-log file (unlike psk-recorder): WSPR
-  spots flow to `wsprdaemon-client` via the WAV spool; the decoder
-  JSON sidecars are the spot-level record.
-- The process log path is surfaced in `inventory --json` under the
-  top-level `log_paths` object, keyed by instance id.
-- Override the log directory with `WSPR_RECORDER_LOG_DIR=/path`
-  (used by both the `_log_dir` helper in contract.py and any
-  unit-level redirect).
+- Process logs go to the systemd journal — the unit sets
+  `StandardOutput=journal` (sigmond standard), queried with
+  `journalctl -u wspr-recorder@<id>`. There is no separate
+  `/var/log/wspr-recorder/<instance>.log` file.
+- There is no separate spot-log file (unlike psk-recorder). In
+  recorder-only mode the WAV JSON sidecars are the period-level
+  record; in full-pipeline mode (`WD_DECODE_VIA_DB=1`) the spot-level
+  record is the `wspr.spots` rows in the SQLite sink, and the journal
+  carries a per-cycle summary line.
+- `inventory --json` still surfaces a `log_paths` object keyed by
+  instance id (the `/var/log/wspr-recorder/<instance>.log` path the
+  `_log_dir` helper computes), even though the daemon itself no longer
+  writes that file — it documents where a redirect would land.
+- Override the log directory with `WSPR_RECORDER_LOG_DIR=/path`.
 
 ## §11 — Runtime log level
 
@@ -284,12 +296,14 @@ loaded after env-var and CLI-flag resolution. See
 ### §12.4 Decoder-spool mutation (SHOULD) — N/A
 
 wspr-recorder owns the WAV spool and its lifetime (atomic rename,
-tmpfs auto-cleanup by max age and max files per band). The
-downstream decoders (`wsprd`, `jt9`) operate on the spool's
-published files as consumers — they do not mutate wspr-recorder's
-bookkeeping. The `decode_ft8`-class hazard from psk-recorder's §12.4
-(decoder unlinks the file it just decoded, defeating `keep_wav`)
-does not apply here.
+tmpfs auto-cleanup by max age and max files per band). In recorder-only
+mode an external consumer reads the published files; in full-pipeline
+mode wspr-recorder's own in-process decoder reads them — but via a
+symlink in the band's hidden `.phase2/` work_dir, so the decoder never
+unlinks or renames a spool WAV. Either way the WAV bookkeeping is not
+mutated by the decode step. The `decode_ft8`-class hazard from
+psk-recorder's §12.4 (decoder unlinks the file it just decoded,
+defeating `keep_wav`) does not apply here.
 
 ### §12.5 Pattern A canonical layout (SHOULD) — implemented
 
@@ -321,10 +335,11 @@ sync with the `>=X.Y.Z` pin in `pyproject.toml`.
 2. **Chain-delay surfaced but not applied.** See §8 — wired for
    future drift-study work, but WSPR's minute-quantized timestamps
    make sub-ms correction moot today.
-3. **No separate spot-log file.** WSPR spots flow through the WAV
-   spool to `wsprdaemon-client`; wspr-recorder has no equivalent to
-   psk-recorder's `-ft8.log` / `-ft4.log` append files. The spot
-   record is the per-period JSON sidecar next to each WAV.
+3. **No separate spot-log file.** wspr-recorder has no equivalent to
+   psk-recorder's `-ft8.log` / `-ft4.log` append files. In
+   recorder-only mode the per-period JSON sidecar next to each WAV is
+   the period-level record; in full-pipeline mode the spot-level
+   record is the `wspr.spots` rows in the SQLite sink.
 
 ## What sigmond promises in return
 

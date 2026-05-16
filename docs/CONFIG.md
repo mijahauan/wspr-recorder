@@ -121,6 +121,13 @@ does surface `RADIOD_<ID>_CHAIN_DELAY_NS` in `inventory --json`'s
 
 ## Environment variables honored
 
+Pipeline-v2 behaviour (decode, sink, upload) is driven entirely by
+environment variables — there is no TOML key for it. In production
+these come from the unit's `EnvironmentFile`s
+(`/etc/sigmond/coordination.env`, `/etc/wspr-recorder/env/<id>.env`).
+
+### Recorder + contract
+
 | Var | Purpose |
 |---|---|
 | `WSPR_RECORDER_CONFIG` | Default config path (`/etc/wspr-recorder/config.toml`). |
@@ -129,6 +136,45 @@ does surface `RADIOD_<ID>_CHAIN_DELAY_NS` in `inventory --json`'s
 | `WSPR_RECORDER_LOG_DIR` | Log directory (default `/var/log/wspr-recorder`). Surfaces in `inventory --json`. |
 | `RADIOD_<ID>_STATUS` | mDNS status name for that radiod. Overrides config. |
 | `RADIOD_<ID>_CHAIN_DELAY_NS` | Chain-delay correction; surfaced in inventory only. |
+| `WD_MEMPROFILE` | Enable tracemalloc allocator profiling (same as `--memprofile`). |
+
+### systemd integration
+
+| Var | Purpose |
+|---|---|
+| `NOTIFY_SOCKET` | Set by systemd `Type=notify`; target for `sd_notify` `READY=1` / `WATCHDOG=1` datagrams. No-op if unset. |
+| `WATCHDOG_USEC` | Set by systemd when `WatchdogSec` is configured; the watchdog loop pings at half this interval. |
+| `MALLOC_ARENA_MAX` | Set to `2` by the unit to suppress glibc arena fragmentation. |
+
+### Full pipeline — decode (`WD_DECODE_VIA_DB`)
+
+| Var | Purpose |
+|---|---|
+| `WD_DECODE_VIA_DB` | `=1` enables in-process decode → SQLite sink. Unset/`0` → recorder-only; legacy `wd-decode@*` chain unaffected. |
+| `WD_RECEIVER_CALL` / `WD_RECEIVER_GRID` | Reporter identity (rx call/grid) for sink rows. Set by wsprdaemon-client's envgen. |
+| `WD_RX_CALL` / `WD_RX_GRID` | Override pair for reporter identity (test rigs). Takes precedence over `WD_RECEIVER_*`. |
+| `SIGMOND_SQLITE_PATH` | Sink DB path (default `/var/lib/sigmond/sink.db`). |
+| `SIGMOND_SQLITE_DB_WSPR` / `SIGMOND_CLICKHOUSE_DB_WSPR` | Per-mode `hamsci_ch` backend overrides. |
+
+### Full pipeline — upload (`WSPR_USE_HS_UPLOADER`)
+
+| Var | Purpose |
+|---|---|
+| `WSPR_USE_HS_UPLOADER` | `=1` enables the in-process `hs-uploader` pump. Unset → no uploads. |
+| `WD_UPLOAD_WSPRDAEMON_DIR` | wsprdaemon.org spool root. Pipeline skipped if unset. |
+| `WD_UPLOAD_WSPRNET_DIR` | wsprnet.org spool root (legacy; SqliteSource used in preference). |
+| `WD_SFTP_SERVERS` / `WD_SFTP_SERVER` | wsprdaemon.org SFTP target(s), `user@host[,user@host…]`. |
+| `WD_SFTP_USER` | Override the SFTP user. |
+| `WD_UPLOAD_ID` | Tar name prefix. |
+| `WD_VERSION` | Embedded in the tar config (default `4.0`). |
+| `WD_INSTANCE` | Uploader instance name. |
+| `WD_VERIFY_FLUSH` | `=1` runs the wsprnet verify-and-flush thread (`wsprnet_verifier.py`). |
+| `WD_FTP_FALLBACK` / `WD_FTP_SERVER(S)` / `WD_FTP_USER` / `WD_FTP_PASSWORD[_FILE]` / `WD_FTP_PATH` | FTP fallback for the wsprdaemon.org transport. |
+| `HS_UPLOADER_SSH_KEY_FILE` | SFTP private key (else `hs-uploader`'s default). |
+
+Each feature flag is independent and each silently no-ops when its
+prerequisites are missing (`sigmond.hamsci_ch`, the `hs-uploader`
+package, reporter-identity vars). The recorder always runs.
 
 CLI `--log-level` overrides env for subcommands. SIGHUP re-reads
 `*_LOG_LEVEL` live ([cli.py:39](../wspr_recorder/cli.py)).

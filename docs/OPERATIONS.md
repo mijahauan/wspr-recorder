@@ -31,17 +31,26 @@ sudo systemctl reset-failed wspr-recorder@<radiod_id>
 
 ## Logs
 
+The process log goes to the systemd journal — the unit sets
+`StandardOutput=journal` (sigmond standard). There is no separate
+`/var/log/wspr-recorder/<instance>.log` file; `journalctl` is the
+single source.
+
 | Stream | Location | Notes |
 |---|---|---|
-| Process log | `/var/log/wspr-recorder/<instance>.log` | `StandardOutput=append:...` — cumulative, rotate with logrotate if needed. |
-| journald | `journalctl -u wspr-recorder@<id>` | Systemd-level events plus stderr. |
+| Process log | `journalctl -u wspr-recorder@<id>` | All daemon output (`StandardOutput=journal`). `SyslogIdentifier=wspr-recorder@<id>`. |
 | Status JSON | `<output_dir>/status.json` | Refreshed every 60 s; mirrors IPC `status`. |
+
+`/var/log/wspr-recorder/` still exists (the unit `mkdir`s it and lists
+it in `ReadWritePaths`) but the daemon does not write a log file
+there.
 
 Useful filters:
 
 ```bash
 journalctl -fu wspr-recorder@bee3 | grep -E 'Stream|sync|memprofile'
-tail -F /var/log/wspr-recorder/bee3.log | grep -vE 'DEBUG'
+journalctl -u wspr-recorder@bee3 --since today | grep -E 'spots|noise|hs-uploader'
+journalctl -fu wspr-recorder@bee3 | grep -E 'READY|sd_notify|watchdog'
 ```
 
 ## Monitoring via `wspr-ctl`
@@ -90,15 +99,6 @@ fields: `batch_gaps` (RTP sequence gaps filled with zeros),
 the ring are rebased into the per-WAV JSON sidecar's `gaps` list and
 reduce `completeness_pct`.
 
-### Drift tracker
-
-`DriftTracker` ([drift_tracker.py](../wspr_recorder/drift_tracker.py))
-compares the grid-propagated expected wall clock against the actual
-wall clock at every minute boundary and logs ppm drift. Surfaced in
-each WAV's JSON sidecar under `drift_observation`. Observe-only — no
-correction. A healthy L3/L4 host runs at < 1 ppm; > 10 ppm indicates
-an undisciplined clock or sample-rate mismatch.
-
 ## Validating and inventorying
 
 ```bash
@@ -135,11 +135,48 @@ wspr-recorder inventory --json | jq '.instances[0] | {radiod_id, ka9q_channels, 
 Each WAV has a matching `.json` sidecar with `frequency_hz`,
 `band_name`, `period_seconds`, `samples`, `start_rtp_timestamp`,
 `gaps`, `completeness_pct`, `int16_scale`, `float32_peak`, `timing`,
-and `decode_modes`. Downstream `wsprdaemon-client` reads the sidecar
-to decide which decoder(s) to run.
+and `decode_modes`. In recorder-only mode an external consumer reads
+the sidecar to decide which decoder(s) to run; in full-pipeline mode
+the recorder consumes its own spool.
+
+In full-pipeline mode (`WD_DECODE_VIA_DB=1`) each band directory also
+contains a hidden `.phase2/` work_dir holding the in-process
+decoder's per-band `ALL_WSPR.TXT` / hashtable artefacts and the
+wsprd-friendly WAV symlinks.
 
 Writes are atomic: `.<name>.tmp` followed by `rename()`, so readers
 never see partial WAVs.
+
+## Decode and upload pipeline (full-pipeline mode)
+
+When `WD_DECODE_VIA_DB=1` is set in the unit's env, every cycle's WAV
+is decoded in-process and the spots land in sigmond's SQLite sink:
+
+```bash
+# spots written this hour:
+sqlite3 /var/lib/sigmond/sink.db \
+  "SELECT count(*) FROM wspr_spots WHERE time > strftime('%s','now','-1 hour')"
+# per-cycle noise rows:
+sqlite3 /var/lib/sigmond/sink.db "SELECT count(*) FROM wspr_noise"
+```
+
+The journal logs one line per cycle, e.g.
+`cycle UTC 20:52 → 24 spots in wspr.spots` and a per-band
+`<band> <mode>: N spots → cycle batcher` line.
+
+When `WSPR_USE_HS_UPLOADER=1` is also set, the in-process uploader
+ships those rows upstream. Watch its progress:
+
+```bash
+journalctl -fu wspr-recorder@<id> | grep hs-uploader
+```
+
+The uploader keeps per-pipeline watermarks under `/var/lib/hs-uploader`.
+If uploads stall, check that pipeline's watermark store and the
+journal for SFTP / HTTP errors. The uploader is non-fatal — if it
+fails to start (missing `WD_RECEIVER_CALL`/`GRID`, `hs-uploader` not
+installed, no SFTP servers) the recorder logs the reason and keeps
+recording.
 
 ## Common failure modes
 
@@ -166,11 +203,13 @@ ip maddr show                  # confirm the host joined the mcast groups
 
 ### `Executor backlog high` in `wspr-ctl health`
 
-The 4-worker WAV-write pool is queueing faster than it drains.
-`tmpfs` is memory-speed so this almost always means CPU contention.
-Check `Nice=5` is not being overridden, and whether another process
-on the box is saturating the core wspr-recorder is pinned to (see
-`run_isolated.sh`).
+The WAV-write/decoder thread pool (sized to the process's
+available-CPU count) is queueing faster than it drains. `tmpfs` is
+memory-speed, so for a recorder-only deployment this almost always
+means CPU contention; in full-pipeline mode it can also mean wsprd /
+jt9 decodes are running long. Check `Nice=5` is not being overridden,
+and whether another process on the box is saturating a core
+wspr-recorder is pinned to (see `run_isolated.sh`).
 
 ### RSS grows steadily, Python heap flat
 

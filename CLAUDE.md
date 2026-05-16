@@ -4,7 +4,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-WSPR audio recorder and decoder pipeline for wsprdaemon v4. Connects to ka9q-radio's `radiod`, records RTP multicast streams from multiple WSPR frequency bands into a per-band ring buffer, and produces period-length WAV files for decoding by wsprd and jt9. Includes a centralized callsign database for cross-decoder type-3 hash resolution, and a spot processing pipeline that produces 34-field enhanced spots for upload.
+WSPR / FST4W recorder, decoder, and uploader for ka9q-radio. Connects
+to `radiod`, records RTP multicast streams from multiple WSPR frequency
+bands into a per-band ring buffer, and produces period-length WAV
+files. When the pipeline-v2 feature flags are set it also decodes
+those WAVs in-process with `wsprd` / `jt9`, writes `wspr.spots` and
+`wspr.noise` rows into sigmond's local SQLite sink, and uploads them to
+wsprnet.org and wsprdaemon.org via an in-process `hs-uploader`. It
+runs as a sigmond client — one `wspr-recorder@<radiod_id>.service`
+per radiod, `Type=notify` with a watchdog.
+
+### Two operating modes (env-flag gated)
+
+- **Recorder-only (default).** No flags set. Records WAV + JSON
+  sidecar pairs to `/dev/shm/wspr-recorder/<band>/`; `_on_period_complete`
+  returns right after the WAV write. A separate consumer handles
+  decode/upload.
+- **Full pipeline.** `WD_DECODE_VIA_DB=1` turns on in-process decode →
+  SQLite sink; `WSPR_USE_HS_UPLOADER=1` additionally turns on the
+  in-process uploader. Each flag is independent; each silently no-ops
+  if its prerequisites are absent (sigmond `hamsci_ch`, `hs-uploader`
+  package, reporter-identity env). The recorder always runs regardless.
+
+With both flags set, wspr-recorder supersedes `wsprdaemon-client`'s
+`wd-decode@*` / `wd-post@*` / `wd-upload-*` units for the WSPR path.
 
 ## Commands
 
@@ -31,7 +54,7 @@ wspr-ctl bands
 
 ## Architecture
 
-The system is a pipeline: RTP multicast packets flow in, get demuxed by SSRC (one per frequency band), buffered in a per-band ring buffer with minute-boundary tracking, then sliced at decode period boundaries (120s, 300s, 900s, 1800s) into WAV files. These are decoded by wsprd and jt9, with spots processed and enhanced for upload.
+The system is a pipeline: RTP multicast packets flow in, get demuxed by SSRC (one per frequency band), buffered in a per-band ring buffer with minute-boundary tracking, then sliced at decode period boundaries (120s, 300s, 900s, 1800s) into WAV files. In recorder-only mode the pipeline ends there. When `WD_DECODE_VIA_DB=1`, each WAV is also decoded in-process by wsprd and jt9 and the spots/noise are written to the SQLite sink; when `WSPR_USE_HS_UPLOADER=1`, the in-process uploader ships them upstream.
 
 ```
 radiod RTP stream (12kHz, wire encoding configurable — default f32)
@@ -39,17 +62,29 @@ radiod RTP stream (12kHz, wire encoding configurable — default f32)
         → per-channel ChannelSink → BandRecorder.on_samples()  [float32]
                                     → float32 ring buffer, decode scheduling
                                         → DecodeRequest (float32 samples)
-                                            → WavWriter.write_period()
-                                              (peak-normalize → int16 WAV)
-                → at period boundary: extract_slice → WAV on tmpfs
+        → at period boundary: extract_slice → WavWriter.write_period()
+              (peak-normalize float32 → int16 WAV + JSON sidecar, atomic)
+                                                       │
+              ── recorder-only mode: pipeline stops here ──
+                                                       │
+              ── WD_DECODE_VIA_DB=1: _on_period_complete continues ──
                     → DecoderRunner (decoder.py)
                         → wsprd (2-pass: standard + spreading, merged)
                         → jt9 -Y --fst4w (with numeric hash output)
-                    → CallsignDB (callsign_db.py)
+                    → CallsignDB (callsign_db.py, persistent JSON)
                         → resolves type-3 hashes across decoders and bands
-                    → SpotProcessor (spot_processor.py)
-                        → filter → dedup → Vincenty geodesic → 34-field enhanced spots
+                    → compute_noise() — per-cycle RMS + FFT noise
+                    → CycleBatcher → SpotSink (spot_sink.py)
+                        → wspr.spots + wspr.noise rows
+                        → /var/lib/sigmond/sink.db via sigmond.hamsci_ch
+                                                       │
+              ── WSPR_USE_HS_UPLOADER=1: in-process uploader ──
+                    → WsprUploaderHs (hs_uploader_shim.py)
+                        → wsprnet.org   (HTTP MEPT)
+                        → wsprdaemon.org (cycle-aligned spots+noise tar / SFTP)
 ```
+
+The `spot_processor.py` module (a separate 34-field enhancer) is not on this path; the SpotSink writes `RawSpot` instances straight to the canonical `hamsci_ch` row shape, and downstream geodesy is computed by the uploader's wsprdaemon transport.
 
 ### Five Decode Modes
 
@@ -65,14 +100,16 @@ All boundaries are epoch-aligned in UTC (`unix_timestamp % period == 0`). Modes 
 
 **Simultaneous emissions.** All four cadences coincide at :00 every hour, and at :30. At :15 and :45, every cadence except F30 coincides. At those ticks, `BandRecorder._on_minute_boundary` dispatches one `DecodeRequest` per distinct period, each producing its own WAV named with the `_Ps.wav` suffix (`_120`, `_300`, `_900`, `_1800`).
 
-**Client protocol.** Downstream consumers (`wsprdaemon-client`) don't need to hardcode these cadences: each WAV's JSON sidecar carries `period_seconds` and `decode_modes`, and the filename suffix is self-describing. The cadence rule is a property of wspr-recorder's output contract, not a shared constant.
+**Spool protocol.** The in-process decoder reads `period_seconds` and `decode_modes` from each cycle's `DecodeRequest`; an external consumer (recorder-only mode) reads the same fields from each WAV's JSON sidecar, with the filename suffix self-describing. The cadence rule is a property of wspr-recorder's output, not a shared constant downstream code must hardcode.
 
 ### Key Components
 
 **Orchestrator**: `WsprRecorder` in `__main__.py` wires everything together via callbacks:
 - `ReceiverManager` connects to radiod; for each frequency calls `ensure_channel()`, keys a `MultiStream` by `(mcast_addr, port)`, and registers the channel on the matching `MultiStream`
 - `_build_sink` (the sink factory) creates the `BandRecorder` and returns a `ChannelSink` holding `on_samples`/`on_stream_dropped`/`on_stream_restored` — passed straight into `MultiStream.add_channel()` at registration (no post-hoc callback wiring)
-- `_on_period_complete` triggers `WavWriter.write_period()` in a thread pool
+- `_on_period_complete` triggers `WavWriter.write_period()` in a thread pool; in full-pipeline mode it then runs `_run_decoders_for()` (wsprd/jt9 + noise + CycleBatcher)
+- `_sd_notify()` / `_watchdog_loop()` integrate with systemd `Type=notify`: `READY=1` is sent once `run()` has provisioned all channels, then `WATCHDOG=1` is pinged at half the `WATCHDOG_USEC` interval. Both are no-ops when `NOTIFY_SOCKET` / `WATCHDOG_USEC` are unset (i.e. not under systemd). Dependency-free — a plain stdlib `AF_UNIX` `SOCK_DGRAM` send, no `sdnotify` package.
+- `_start_uploader()` constructs `WsprUploaderHs.from_env()` and starts its pump thread when `WSPR_USE_HS_UPLOADER=1`; the `CycleBatcher`'s wake callback is wired to `uploader.wake()` so each committed cycle fires the pump within milliseconds
 
 **Ring Buffer** (`ring_buffer.py`): Circular float32 sample buffer per band. Tracks `MinuteMark` positions so multi-minute slices can be extracted. No locking needed — all writes happen in the MultiStream callback thread, `extract_slice` copies data before handing to the thread pool.
 
@@ -89,16 +126,15 @@ The +120 s headroom above the longest period exists so that the W2 cycle that st
 
 **Decode Scheduling** (`decode_mode.py`): `modes_completing_at_minute()` checks which decode modes have a period boundary at each minute. `BandRecorder._on_minute_boundary()` groups completing modes by period and extracts ring buffer slices.
 
-**Drift Tracker** (`drift_tracker.py`): At each minute boundary, compares the grid-propagated expected wall clock against the actual wall clock. Logs drift rate (ppm) in JSON sidecars. Observe-and-log only — no correction yet. (Future home: hf-timestd metrology package.)
+**Callsign Database** (`callsign_db.py`): Maintains a centralized callsign→hash mapping shared across all bands and both decoders. Delegates to the canonical `callhash` library, with a persistent JSON table (auto-saved when `ingest_spots` adds entries) so `(call, hash)` mappings learned from `<call>` announcements survive restarts. The persistent table lives at `/var/lib/wsprdaemon-client/callhash/wspr-callhash.json`; if that directory can't be created the DB falls back to in-memory only. Resolves jt9 `-Y` numeric hashes (`<NNNNNNN>`) after decoding.
 
-**Callsign Database** (`callsign_db.py`): Maintains a centralized callsign→hash mapping shared across all bands and both decoders. Reimplements both hash algorithms in pure Python:
-- wsprd: 15-bit Jenkins lookup3 (seed 146) → writes `hashtable.txt`
-- jt9: 22-bit base-38 multiplicative → writes `fst4w_calls.txt`
-- Resolves jt9 `-Y` numeric hashes (`<NNNNNNN>`) after decoding
+**Decoder Runner** (`decoder.py`): Invokes wsprd (2-pass standard + spreading, merged) and jt9 with `-Y` flag. Parses `ALL_WSPR.TXT` and `fst4_decodes.dat` via line-count diffing. Runs wsprd first to discover callsigns, then jt9 can resolve type-3 hashes from the same cycle. The spreading pass is skipped (standard pass used alone) when no `wsprd.spreading` binary is present. Binaries are arch-resolved by `_resolve_decoder_binaries()` in `__main__.py` from `/opt/wsprdaemon-client/bin/decoders/`, falling back to PATH.
 
-**Decoder Runner** (`decoder.py`): Invokes wsprd (2-pass standard + spreading, merged) and jt9 with `-Y` flag. Parses `ALL_WSPR.TXT` and `fst4_decodes.dat` via line-count diffing. Runs wsprd first to discover callsigns, then jt9 can resolve type-3 hashes from the same cycle.
+**Noise** (`noise.py`): Per-cycle noise measurement. Computes RMS noise from three time windows of the 120 s WAV plus FFT noise from wsprd's `-c` C2 output (Hanning-windowed FFT, bottom 30% of magnitudes in the passband). Produces one `NoiseMeasurement` per (band, cycle), flushed through the `SpotSink` as `wspr.noise` rows. Only W2 decodes produce the C2 file; F-modes share the cycle so one reading covers them.
 
-**Spot Processor** (`spot_processor.py`): Filters unresolved spots, deduplicates per TX call per mode (best SNR), enhances to 34-field format with Vincenty geodesic computation. Outputs both wsprdaemon.org (34-field) and wsprnet.org (11-field MEPT) formats.
+**Spot Sink** (`spot_sink.py`): The producer side of the pipeline-v2 DB-direct path. Gated on `WD_DECODE_VIA_DB=1`. `SpotSink` adapts in-process `RawSpot` instances to the canonical `hamsci_ch` row shape (`SCHEMA_VERSION = 2`) and writes them via `sigmond.hamsci_ch.Writer(mode="wspr", table="spots")`. `CycleBatcher` collects per-band spots into one per-cycle `wspr.spots` write on a dedicated writer thread — this sidesteps SQLite's thread-affinity check (decodes run on per-band worker threads, but only the batcher thread touches the DB) and yields one `Writer.insert()` per cycle instead of one per band. Lazy-imports `hamsci_ch`, so kiwi-only / CI installs with no sigmond run identically with all sink operations no-op'd. `resolve_reporter_identity()` resolves `(rx_call, rx_grid)` from `WD_RX_CALL`/`WD_RX_GRID` or `WD_RECEIVER_CALL`/`WD_RECEIVER_GRID`.
+
+**HS Uploader Shim** (`hs_uploader_shim.py`): In-process uploader, gated on `WSPR_USE_HS_UPLOADER=1`. `WsprUploaderHs` owns two `hs-uploader` pipelines inside one pump thread: (1) **wsprdaemon-tar** — `WsprCycleSource` on `(wspr.spots, wspr.noise)` → `WsprdaemonTarSftp`, one cycle-aligned tar per WSPR 2-min cycle (parallel `wsprdaemon/spots/...` + `wsprdaemon/noise/...` subtrees) shipped to wsprdaemon.org by SFTP; (2) **wsprnet** — `SqliteSource` on `wspr.spots` → `WsprNet`, individual MEPT rows posted to wsprnet.org by HTTP. Each pipeline has its own watermark stored under `/var/lib/hs-uploader`. The pump waits on a wake `Event` or a 60 s `PUMP_INTERVAL_SEC` timeout. Built from env (`WD_RECEIVER_CALL/GRID`, `WD_SFTP_SERVERS`, `WD_UPLOAD_WSPRDAEMON_DIR`, …) via `from_env()`. This absorbs the role of the standalone `wd-upload-hs@.service` (v3 Phase A). Optional `WD_VERIFY_FLUSH=1` runs a verify-and-flush thread (`wsprnet_verifier.py`) that polls wsprnet for accepted spots and deletes confirmed rows from `pending_uploads`.
 
 **Timing**: `TimingService` plays two roles: (1) it attaches quality metadata (source, uncertainty, tier) to each WAV sidecar, and (2) it creates a `SyncStrategy` per BandRecorder that determines how minute boundaries are detected. See `sync_strategy.py` — `RtpSyncStrategy` (L5/L6), `ClockSyncStrategy` (L2-L4), `FallbackSyncStrategy` (L1).
 
@@ -118,10 +154,37 @@ The +120 s headroom above the longest period exists so that the W2 cycle that st
 - **Atomic writes**: WAV files write to `.tmp` then rename, preventing partial reads by downstream consumers.
 - **Output on tmpfs**: Default output is `/dev/shm/wspr-recorder/` with auto-cleanup (max age + max files per band).
 - **Standard ka9q-python stream infrastructure**: Uses `MultiStream` (one per multicast group, shared socket) for all RTP reception, packet resequencing, S16BE decoding, and stream health monitoring — the same infrastructure as psk-recorder and hf-timestd. No custom UDP socket code.
+- **DB-direct decode is feature-flagged and additive**: With `WD_DECODE_VIA_DB` unset/`0`, `_on_period_complete` behaves exactly as it did pre-pipeline-v2 (write WAV, return) — the legacy `wd-decode@*` bash chain is unaffected. With `WD_DECODE_VIA_DB=1` the same process also decodes and writes `wspr.spots`/`wspr.noise` rows. The two pipelines can run side-by-side during a dual-write observation window: the in-process decoder uses a separate per-band `.phase2/` work_dir so its `ALL_WSPR.TXT` / hashtable artefacts don't collide with the bash chain's.
+- **Per-cycle batching for SQLite thread-affinity**: `BandRecorder` dispatches decodes across a per-band thread pool, but SQLite connections are thread-bound. `CycleBatcher` collects each cycle's per-band spots under a mutex and a single dedicated writer thread does all `Writer.insert()` calls — one transaction per WSPR cycle (the natural atomic unit) instead of one per band.
+- **In-process uploader replaces standalone units**: `WSPR_USE_HS_UPLOADER=1` runs the `hs-uploader` pump inside the recorder process (v3 Phase A), absorbing the standalone `wd-upload-hs@.service`. wsprdaemon.org gets one cycle-aligned tar per cycle (spots + noise bundled — its ingest model is one-tar-per-cycle); wsprnet.org gets individual MEPT rows. The `CycleBatcher` wake callback nudges the pump on each commit, cutting decode→ship latency from a 60 s polling tick to a few hundred ms.
+- **sd_notify without a dependency**: The unit is `Type=notify` with `WatchdogSec`. `_sd_notify()` sends `READY=1` / `WATCHDOG=1` datagrams over the `NOTIFY_SOCKET` `AF_UNIX` socket using only stdlib — no `sdnotify`/`systemd` package. Until `READY=1` the unit sits in `activating` and systemd would time it out at `TimeoutStartSec` (180 s); the watchdog ping at `WATCHDOG_USEC/2` lets systemd restart a wedged daemon. Both calls no-op when the env vars are absent, so standalone runs are unaffected. This is the same pattern psk-recorder / hfdl-recorder use. (Before this was implemented, the daemon never notified and systemd crash-looped it.)
+- **Restart-on-stream-restore**: After a real radiod outage, an in-place `BandRecorder` reset leaves ring-buffer minute alignment off by an unknowable offset and wsprd decodes zero spots. `on_stream_restored` instead `os._exit(75)`s so systemd's `Restart=always` brings the process back for a clean re-sync on the next minute boundary.
 
 ## Configuration
 
-See `config.toml.example`. Key sections: `[recorder]` (output), `[radiod]` (connection), `[timing]` (authority), `[channel_defaults]` (sample rate, filters).
+See `config.toml.example`. Key sections: `[recorder]` (output), `[radiod]` (connection), `[timing]` (authority), `[channel_defaults]` (sample rate, filters). Pipeline-v2 behaviour (decode, sink, upload) is driven entirely by **environment variables**, not the TOML — see [docs/CONFIG.md](docs/CONFIG.md) for the full table.
+
+### Environment variables (pipeline-v2 + systemd)
+
+The feature flags and identity inputs come from the unit's `EnvironmentFile`s (`/etc/sigmond/coordination.env`, `/etc/wspr-recorder/env/%i.env`):
+
+| Var | Effect |
+|---|---|
+| `WD_DECODE_VIA_DB` | `=1` enables in-process decode → SQLite sink (`spot_sink.py`). |
+| `WSPR_USE_HS_UPLOADER` | `=1` enables the in-process uploader (`hs_uploader_shim.py`). |
+| `WD_RECEIVER_CALL` / `WD_RECEIVER_GRID` | Reporter identity. Required by the uploader; used as sink rx fields. |
+| `WD_RX_CALL` / `WD_RX_GRID` | Override pair for reporter identity (test rigs). |
+| `WD_SFTP_SERVERS` / `WD_SFTP_SERVER` / `WD_SFTP_USER` | wsprdaemon.org SFTP targets. |
+| `WD_UPLOAD_WSPRDAEMON_DIR` / `WD_UPLOAD_WSPRNET_DIR` | Upload spool roots (pipeline skipped if unset). |
+| `WD_VERIFY_FLUSH` | `=1` runs the wsprnet verify-and-flush thread. |
+| `SIGMOND_SQLITE_PATH` | Sink DB path (default `/var/lib/sigmond/sink.db`). |
+| `NOTIFY_SOCKET` / `WATCHDOG_USEC` | Set by systemd `Type=notify`; consumed by `_sd_notify` / `_watchdog_loop`. |
+| `MALLOC_ARENA_MAX` | Set to `2` by the unit to suppress glibc arena fragmentation. |
+| `WD_MEMPROFILE` | Enables tracemalloc allocator profiling. |
+
+### Systemd unit (`systemd/wspr-recorder@.service`)
+
+`Type=notify`, `WatchdogSec=180`, `TimeoutStartSec=180`, `Restart=always` (`RestartSec=5`), `MemoryMax=1G`. `StandardOutput=journal` — the process log goes to the systemd journal (`journalctl -u wspr-recorder@%i`), not a file. `ProtectSystem=strict` with `ReadWritePaths` covering `/dev/shm/wspr-recorder`, `/var/log/wspr-recorder`, `/run/wspr-recorder`, `/var/lib/sigmond` (the SQLite sink), and `/var/lib/hs-uploader` (the uploader watermark store). The canonical unit is installed by `install.sh` (symlink) and by `deploy.toml`.
 
 ### Band Configuration (v4 format)
 
@@ -144,26 +207,72 @@ Band names in `config.py:WSPR_BANDS` must match wsprdaemon conventions (e.g., "2
 
 ## Testing
 
-pytest with pytest-asyncio (`asyncio_mode = "auto"`). Tests are in `tests/`. 159 tests covering:
+pytest with pytest-asyncio (`asyncio_mode = "auto"`). Tests are in `tests/`, ~258 tests covering:
 
 - `test_decode_mode.py` — scheduling logic, period boundaries, mode grouping
-- `test_drift_tracker.py` — drift measurement, ppm calculation, history
 - `test_ring_buffer.py` — write/extract, wrap-around, gap handling, eviction
-- `test_band_recorder_ring.py` — end-to-end: float32 samples → int16 ring → DecodeRequest, multi-period, gaps, drift
-- `test_callsign_db.py` — both hash algorithms, cross-decoder resolution, persistence
+- `test_band_recorder_ring.py` — end-to-end: float32 samples → int16 ring → DecodeRequest, multi-period, gaps
+- `test_callsign_db.py` — hash resolution, cross-decoder, persistent JSON table
 - `test_decoder.py` — ALL_WSPR.TXT parsing, fst4_decodes.dat parsing, 2-pass merge, -Y hash resolution
-- `test_spot_processor.py` — grid→latlon, Vincenty geodesic, filter/dedup, 34-field and 11-field output
+- `test_noise.py` — RMS + FFT noise measurement against v1 calibration constants
+- `test_spot_sink.py` — RawSpot → row mapping, gating, submit-batch failure modes, multi-receiver distinctness
+- `test_cycle_batcher.py` — per-cycle batching, writer-thread flush, deadline handling
+- `test_hs_uploader_shim.py` — env construction, pipeline build, pump lifecycle, wake
+- `test_spot_processor.py` — grid→latlon, Vincenty geodesic, filter/dedup (the standalone enhancer; not on the v2 path)
 - `test_config.py` — frequency parsing, BandConfig, [[band]] TOML, backward compatibility
 - `test_sync_strategy.py` — RTP correlation, 32-bit wrap, wall-clock sync
+- `test_contract.py` — inventory/validate JSON shape, SSRC-collision and version-lag checks
+- `test_authority_reader.py`, `test_configurator.py`, `test_lifetime.py` — timing authority, config rendering, lifetime keepalive
 
-### Live Decoder Validation
+### Decoder binaries
 
-WAV format confirmed compatible with both decoders via live radiod recording:
-- `wsprd-x86-v27` (in `/home/mjh/git/wsprdaemon/bin/`): accepts 12kHz int16 mono WAV, writes .c2
-- `jt9-x86-v27` with `-Y` flag: accepts same WAV, outputs numeric 22-bit hashes
-- `wsprd.spread-x86-v27`: no-drift behavior built in, does not accept `-n` flag
+In full-pipeline mode `_resolve_decoder_binaries()` arch-resolves the
+decoders from `/opt/wsprdaemon-client/bin/decoders/` (e.g.
+`wsprd-x86-v27`, `jt9-x86-v27`), falling back to a PATH lookup. WAV
+format is compatible with both decoders:
+- `wsprd` (`-c`): accepts 12 kHz int16 mono WAV, writes the `.c2` file used for FFT noise.
+- `jt9` with `-Y`: accepts the same WAV, outputs numeric 22-bit hashes.
+- `wsprd.spreading`: optional second pass; if no spreading binary is found, `DecoderRunner` skips it and uses the standard pass alone.
+
+Note: `wsprd` parses the date/time from the WAV filename prefix.
+`WavWriter` produces `YYYYMMDDTHHMMSSZ_<freq>_..._<period>.wav`, which
+`wsprd` misparses, so `_wsprd_compatible_wav()` symlinks each WAV to a
+short `YYMMDD_HHMM.wav` name inside the band's `.phase2/` work_dir
+before invoking the decoder.
 
 ## Significant Changes
+
+### 2026-05: Full pipeline + first working systemd service
+
+This block of work turned wspr-recorder from a recorder-only daemon
+that had never successfully run as a systemd service into a fully
+operational sigmond client covering record → decode → sink → upload.
+
+- **sd_notify implemented** (`__main__.py`). The daemon now sends
+  `READY=1` once channels are provisioned and pings `WATCHDOG=1` on a
+  loop. Previously it never notified, so systemd timed it out at
+  `TimeoutStartSec` and crash-looped it. `TimeoutStartSec` raised
+  60 → 180; the unit is `Type=notify` with `WatchdogSec=180`.
+- **Logs to the journal.** `StandardOutput=journal` — the process log
+  is the journal, not `/var/log/wspr-recorder/<instance>.log`.
+- **ReadWritePaths widened.** `ProtectSystem=strict` plus
+  `ReadWritePaths` now including `/var/lib/sigmond` (SQLite sink) and
+  `/var/lib/hs-uploader` (uploader watermark store).
+- **DB-direct decode** (`spot_sink.py`, `WD_DECODE_VIA_DB=1`). Decodes
+  in-process and writes `wspr.spots` + `wspr.noise` rows into
+  `/var/lib/sigmond/sink.db` via `sigmond.hamsci_ch`. Per-cycle batched
+  through `CycleBatcher`.
+- **In-process hs-uploader** (`hs_uploader_shim.py`,
+  `WSPR_USE_HS_UPLOADER=1`). Ships spots to wsprnet.org (HTTP MEPT) and
+  a cycle-aligned spots+noise tar to wsprdaemon.org (SFTP), absorbing
+  the standalone `wd-upload-*` units (v3 Phase A).
+- **Per-cycle noise** (`noise.py`). RMS + FFT noise measured per cycle
+  and shipped alongside spots.
+
+Net effect: with both feature flags set, one `wspr-recorder@<id>.service`
+supersedes `wsprdaemon-client`'s WSPR record + decode + upload role.
+See [docs/PHASE-2-COORDINATION.md](docs/PHASE-2-COORDINATION.md) for the
+decision record behind the DB-direct decode work.
 
 ### 2026-04-12: Replace custom RTP ingest with ka9q-python MultiStream
 
