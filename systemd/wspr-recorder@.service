@@ -27,6 +27,14 @@ Environment=MALLOC_ARENA_MAX=2
 
 WorkingDirectory=/opt/wspr-recorder
 
+# /var/lib/wspr-recorder holds the persistent callsign-hash DB
+# (callhash/wspr-callhash.json).  StateDirectory= asks systemd to
+# create /var/lib/wspr-recorder owned by User= and add it to the
+# sandbox's ReadWritePaths.  It also exports $STATE_DIRECTORY, which
+# the daemon reads with a /var/lib/wspr-recorder fallback for
+# standalone runs.
+StateDirectory=wspr-recorder
+
 ExecStartPre=+/bin/mkdir -p /dev/shm/wspr-recorder
 ExecStartPre=+/bin/mkdir -p /var/log/wspr-recorder
 ExecStartPre=+/usr/bin/chown -R wsprrec:wsprrec /dev/shm/wspr-recorder

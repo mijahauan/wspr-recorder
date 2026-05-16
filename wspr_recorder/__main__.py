@@ -859,8 +859,15 @@ class WsprRecorder:
             # weren't resolved until the same announcement was
             # observed again.  Path is per-station (shared across
             # bands by design; CallsignDB is itself a singleton).
-            callsign_path = Path("/var/lib/wsprdaemon-client/callhash") \
-                / "wspr-callhash.json"
+            #
+            # Lives under wspr-recorder's own state directory — created
+            # automatically by systemd via StateDirectory=wspr-recorder
+            # in the canonical unit, which also adds it to the sandbox's
+            # ReadWritePaths.  Standalone runs (no systemd) fall through
+            # to the OSError branch below and use in-memory mode.
+            callsign_path = Path(
+                os.environ.get("STATE_DIRECTORY", "/var/lib/wspr-recorder")
+            ) / "callhash" / "wspr-callhash.json"
             try:
                 callsign_path.parent.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
