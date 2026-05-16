@@ -32,6 +32,7 @@ from .decoder import DecoderRunner
 from .callsign_db import CallsignDB
 from .spot_sink import SpotSink, CycleBatcher, resolve_reporter_identity
 from .noise import compute_noise
+from .hs_uploader_shim import WsprUploaderHs
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,12 @@ class WsprRecorder:
         self.timing_service: Optional[TimingService] = None
         self.ipc_server: Optional[IPCServer] = None
         self.band_recorders: Dict[int, BandRecorder] = {}  # ssrc -> BandRecorder
+        # hs-uploader pumps wspr.spots + wspr.noise → wsprdaemon.org +
+        # wsprnet.org from in-process.  v3 Phase A absorbed this from
+        # the standalone wd-upload-hs@.service; gated on
+        # WSPR_USE_HS_UPLOADER=1 so operators opt in alongside
+        # stopping the legacy unit.  None until run() builds it.
+        self.uploader: Optional[WsprUploaderHs] = None
 
         # Pipeline v2 — DB-direct decode + SpotSink.  Off by default;
         # enabled by `WD_DECODE_VIA_DB=1` in the unit's env.  When off,
@@ -893,6 +900,13 @@ class WsprRecorder:
 
             # Start IPC server
             await self._setup_ipc_server()
+
+            # In-process hs-uploader (v3 Phase A — replaces
+            # wd-upload-hs@.service).  start() exits cleanly when
+            # WSPR_USE_HS_UPLOADER is unset, when WD_RECEIVER_CALL/GRID
+            # are missing, or when hs-uploader isn't installed — none
+            # of those should block the recorder itself from running.
+            self._start_uploader()
             
             # Start background tasks
             cleanup_task = asyncio.create_task(self._cleanup_loop())
@@ -925,11 +939,47 @@ class WsprRecorder:
         finally:
             await self._shutdown()
     
+    def _start_uploader(self) -> None:
+        """Construct and start the hs-uploader pump thread.
+
+        Uses ``WsprUploaderHs.from_env()`` so the identity inputs
+        (``WD_RECEIVER_CALL``/``WD_RECEIVER_GRID``/``WD_SFTP_SERVERS``)
+        come from the same env file ``resolve_reporter_identity``
+        already reads.  Construction errors are non-fatal: an
+        operator with no callsign configured (or no
+        ``WSPR_USE_HS_UPLOADER`` flag) still gets a working recorder
+        — they simply ship nothing.
+        """
+        try:
+            self.uploader = WsprUploaderHs.from_env()
+        except ValueError as exc:
+            logger.info(
+                "hs-uploader: env-validation skipped uploader (%s)", exc,
+            )
+            return
+        try:
+            self.uploader.start()
+        except Exception:
+            logger.exception("hs-uploader: failed to start; recorder continues")
+            return
+        if self.uploader.is_active:
+            logger.info("hs-uploader: in-process pump thread active")
+
     async def _shutdown(self) -> None:
         """Shutdown the recorder gracefully."""
         logger.info("Shutting down WSPR recorder...")
         self._running = False
-        
+
+        # Stop the hs-uploader pump thread first so it has a chance
+        # to flush any in-flight batches before the rest of the
+        # service unwinds.  Bounded by hs-uploader's own join timeout
+        # (5 s default); failure here is non-fatal.
+        if self.uploader is not None:
+            try:
+                self.uploader.stop()
+            except Exception as e:
+                logger.error(f"Error stopping hs-uploader: {e}")
+
         # Flush all band recorders
         for recorder in self.band_recorders.values():
             try:

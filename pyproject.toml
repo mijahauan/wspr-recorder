@@ -30,10 +30,12 @@ dependencies = [
     "numpy>=1.20.0",
     "tomli>=2.0.0;python_version<'3.11'",
     "callhash>=1.0.0",
+    "hs-uploader>=0.1.0",
 ]
 
 [tool.uv.sources]
 callhash = { path = "../callhash" }
+hs-uploader = { path = "../hs-uploader" }
 
 [project.optional-dependencies]
 dev = [
