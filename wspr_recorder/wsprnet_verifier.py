@@ -157,12 +157,21 @@ def fetch_wsprnet_spots(
 # ---------------------------------------------------------------------- sqlite
 
 def _matching_rowids(
-    conn: sqlite3.Connection, wsprnet: Set[SpotKey],
+    conn: sqlite3.Connection, wsprnet: Set[SpotKey], reporter: str,
 ) -> list[int]:
     """Find pending_uploads rowids whose spot key is in `wsprnet`.
 
-    Walks every wspr.spots row in pending_uploads and json_extracts the
-    relevant fields.  Cheap enough at ~10k rows (a few ms).
+    Walks every wspr.spots row in pending_uploads (scoped to this
+    verifier's reporter) and json_extracts the relevant fields.  Cheap
+    enough at ~10k rows (a few ms).
+
+    The ``rx_call`` filter is load-bearing on multi-receiver hosts:
+    two wspr-recorder@<id> instances share /var/lib/sigmond/sink.db,
+    and the same beacon decoded by both receivers produces two rows
+    with identical (time, callsign, frequency_hz) but distinct
+    rx_call.  Without the scope, instance A's verifier would match —
+    and delete — instance B's pending rows the moment A confirms its
+    own spots at wsprnet.
     """
     rowids: list[int] = []
     cur = conn.execute("""
@@ -172,7 +181,8 @@ def _matching_rowids(
                json_extract(payload_json, '$.frequency_hz')
         FROM pending_uploads
         WHERE target_db='wspr' AND target_table='spots'
-    """)
+          AND json_extract(payload_json, '$.rx_call') = ?
+    """, (reporter,))
     for rid, t, call, freq in cur:
         if not t or not call or freq is None:
             continue
@@ -204,9 +214,13 @@ def _delete_by_rowids(conn: sqlite3.Connection, rowids: Iterable[int]) -> int:
 
 
 def _drop_old_unverified(
-    conn: sqlite3.Connection, drop_after_sec: int,
+    conn: sqlite3.Connection, drop_after_sec: int, reporter: str,
 ) -> int:
     """Delete pending wspr.spots rows older than `drop_after_sec` seconds.
+
+    Scoped to ``reporter`` for the same multi-receiver safety reason as
+    :func:`_matching_rowids`: instance A must never drop instance B's
+    unverified rows.
 
     `queued_at` is an ISO 8601 timestamp; we compare against `now - drop_after`.
     """
@@ -218,8 +232,9 @@ def _drop_old_unverified(
     cur = conn.execute("""
         DELETE FROM pending_uploads
         WHERE target_db='wspr' AND target_table='spots'
+          AND json_extract(payload_json, '$.rx_call') = ?
           AND queued_at < ?
-    """, (cutoff_iso,))
+    """, (reporter, cutoff_iso))
     conn.commit()
     return cur.rowcount
 
@@ -269,7 +284,7 @@ class WsprnetVerifier:
         )
         self._thread.start()
         logger.info(
-            "wsprnet-verifier started: reporter=%s interval=%ds window=%dmin "
+            "wsprnet-verifier[%s] started: interval=%ds window=%dmin "
             "drop_after=%ds",
             self._reporter, self._interval, self._window_min,
             self._drop_after,
@@ -298,7 +313,10 @@ class WsprnetVerifier:
             try:
                 self._verify_and_flush()
             except Exception:
-                logger.exception("wsprnet-verifier: pass raised; will retry")
+                logger.exception(
+                    "wsprnet-verifier[%s]: pass raised; will retry",
+                    self._reporter,
+                )
 
     def _verify_and_flush(self) -> tuple[int, int]:
         try:
@@ -306,10 +324,15 @@ class WsprnetVerifier:
                 self._reporter, minutes=self._window_min,
             )
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.warning("wsprnet-verifier: fetch failed: %s", exc)
+            logger.warning(
+                "wsprnet-verifier[%s]: fetch failed: %s",
+                self._reporter, exc,
+            )
             return (0, 0)
         except Exception:
-            logger.exception("wsprnet-verifier: fetch raised")
+            logger.exception(
+                "wsprnet-verifier[%s]: fetch raised", self._reporter,
+            )
             return (0, 0)
 
         # Open sink.db for write; rely on default journal mode + retries.
@@ -318,12 +341,17 @@ class WsprnetVerifier:
         try:
             conn = sqlite3.connect(self._db_path, timeout=10.0)
         except sqlite3.Error as exc:
-            logger.error("wsprnet-verifier: open sink.db failed: %s", exc)
+            logger.error(
+                "wsprnet-verifier[%s]: open sink.db failed: %s",
+                self._reporter, exc,
+            )
             return (0, 0)
         try:
-            rowids = _matching_rowids(conn, wsprnet)
+            rowids = _matching_rowids(conn, wsprnet, self._reporter)
             verified = _delete_by_rowids(conn, rowids) if rowids else 0
-            dropped = _drop_old_unverified(conn, self._drop_after)
+            dropped = _drop_old_unverified(
+                conn, self._drop_after, self._reporter,
+            )
         finally:
             conn.close()
 
@@ -331,17 +359,17 @@ class WsprnetVerifier:
             self._total_verified += verified
             self._total_dropped_old += dropped
             logger.info(
-                "wsprnet-verifier: pass complete "
+                "wsprnet-verifier[%s]: pass complete "
                 "verified=%d dropped_old=%d wsprnet_set_size=%d "
                 "(totals verified=%d dropped_old=%d)",
-                verified, dropped, len(wsprnet),
+                self._reporter, verified, dropped, len(wsprnet),
                 self._total_verified, self._total_dropped_old,
             )
         else:
             logger.debug(
-                "wsprnet-verifier: pass complete "
+                "wsprnet-verifier[%s]: pass complete "
                 "(no matches; wsprnet_set_size=%d)",
-                len(wsprnet),
+                self._reporter, len(wsprnet),
             )
         return (verified, dropped)
 
@@ -365,7 +393,7 @@ def _main_once() -> int:
         wsprnet = fetch_wsprnet_spots(args.reporter, minutes=args.window_min)
         conn = sqlite3.connect(args.db, timeout=10.0)
         try:
-            rowids = _matching_rowids(conn, wsprnet)
+            rowids = _matching_rowids(conn, wsprnet, args.reporter)
         finally:
             conn.close()
         print(f"wsprnet_set_size={len(wsprnet)} would-delete={len(rowids)}")

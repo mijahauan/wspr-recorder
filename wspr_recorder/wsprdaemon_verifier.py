@@ -27,19 +27,32 @@ Unlike :mod:`wsprnet_verifier`, this is **observe-only** — there is no
 via the gateway's SFTP ack, not via a deferred verification.  We just
 read the central DB and tell the operator what we found.
 
+Each per-server query is a single UNION ALL over ``wspr.rx`` (the
+deduped wsprnet mirror on the wd* hosts) and ``wsprdaemon.spots`` (the
+raw wsprdaemon firehose).  One HTTP round-trip per server returns both
+counts; three servers fanned out in parallel finish in
+``max(per-host rtt)`` capped at ``WSPRDAEMON_VERIFY_TIMEOUT_SEC``.
+
 Output (one line per server + one canonical pass-complete line):
 
-    wsprdaemon-verifier: wd10 ok rtt=127ms count=66 max=2026-05-17T12:12:00
-    wsprdaemon-verifier: wd20 stale rtt=132ms count=0 max=2026-05-14T13:16:00
-    wsprdaemon-verifier: wd30 unreachable rtt=5005ms
-    wsprdaemon-verifier: pass complete verified=66 dropped_old=0
-                         wsprdaemon_set_size=66 (totals verified=66
-                         dropped_old=0)
+    wsprdaemon-verifier[AC0G/B4]: wd10 ok rtt=567ms wsprnet=175 wsprdaemon=179 max=2026-05-17T12:28:00
+    wsprdaemon-verifier[AC0G/B4]: wd20 empty rtt=132ms wsprnet=0 wsprdaemon=0 max=2026-05-14T13:16:00
+    wsprdaemon-verifier[AC0G/B4]: wd30 timeout rtt=5005ms
+    wsprdaemon-verifier[AC0G/B4]: pass complete verified=179 dropped_old=0
+                                   wsprdaemon_set_size=179 wsprnet_set_size=175
+                                   servers_ok=1/3 (totals verified=179
+                                   dropped_old=0)
+
+The ``[<rx_sign>]`` tag matters on multi-receiver hosts where two
+``wspr-recorder@<id>.service`` instances run concurrently — without it,
+``smd watch verifier`` couldn't tell whose pass each line belongs to.
 
 The ``pass complete`` line shares its shape with
 :mod:`wsprnet_verifier` so ``smd watch verifier`` picks it up via the
 same regex.  ``dropped_old`` is always 0 (no rows deleted by this
-verifier).
+verifier — observe-only).  Headline ``verified`` reports the wsprdaemon
+count because wsprdaemon.spots has 1:1 correspondence to our uploads;
+wsprnet's dedup means its count can be legitimately lower.
 
 Env knobs
 ---------
@@ -87,11 +100,17 @@ WARMUP_SEC           = 60    # let the uploader ship its first cycle
 
 @dataclass
 class ServerResult:
-    """One server's reply for a single verifier pass."""
-    url: str            # original URL (for logging — short name extracted below)
-    status: str         # ok | empty | http_error | tcp_error | timeout | parse_error
-    count: int          # rows returned for our rx_sign in the window
-    max_time: str       # ISO time of the most recent row ("" if none / error)
+    """One server's reply for a single verifier pass.
+
+    Both counts come from the same UNION ALL query against the same
+    ClickHouse instance, so they share an rtt and represent the same
+    moment in the server's view.
+    """
+    url: str
+    status: str            # ok | empty | http_error | tcp_error | timeout | parse_error
+    wsprnet_count: int     # rows in wspr.rx for our rx_sign in the window
+    wsprdaemon_count: int  # rows in wsprdaemon.spots for our rx_sign in the window
+    max_time: str          # ISO time of the most recent row across both tables
     rtt_ms: int
 
     @property
@@ -107,15 +126,25 @@ def query_server(
 ) -> ServerResult:
     """Issue one ClickHouse HTTP query against ``url``.
 
-    Pure, side-effect-free (no logging) so the caller can fan-out and
-    log results in a stable order.
+    UNION ALL across ``wspr.rx`` (deduped wsprnet mirror) and
+    ``wsprdaemon.spots`` (raw wsprdaemon firehose) so one round-trip
+    answers both halves of "did our spots land".  Pure, side-effect-free
+    (no logging) so the caller can fan-out and log results in a stable
+    order.
+
+    Reporter callsigns can contain ``/`` (e.g. ``AC0G/B4``) which must
+    be URL-encoded inside the SQL string literal.  ClickHouse accepts
+    single-quoted string literals; we don't risk injection because the
+    reporter is taken from local config, not user input.
     """
-    # Reporter callsigns can contain ``/`` (e.g. ``AC0G/B4``) which must
-    # be URL-encoded inside the SQL string literal.  ClickHouse accepts
-    # single-quoted string literals; we don't risk injection because
-    # the reporter is taken from local config, not user input.
     sql = (
-        "SELECT count(),max(time) FROM wsprdaemon.spots "
+        "SELECT 'wsprnet' AS src, count() AS n, max(time) AS t "
+        "FROM wspr.rx "
+        f"WHERE rx_sign='{reporter}' "
+        f"AND time>=now()-INTERVAL {int(window_min)} MINUTE "
+        "UNION ALL "
+        "SELECT 'wsprdaemon' AS src, count() AS n, max(time) AS t "
+        "FROM wsprdaemon.spots "
         f"WHERE rx_sign='{reporter}' "
         f"AND time>=now()-INTERVAL {int(window_min)} MINUTE "
         "FORMAT TabSeparated"
@@ -128,25 +157,41 @@ def query_server(
         with urllib.request.urlopen(full_url, timeout=timeout_sec) as r:
             body = r.read().decode("utf-8", errors="replace").strip()
         rtt_ms = int((time.monotonic() - t0) * 1000)
-        parts = body.split("\t")
-        if len(parts) < 2:
-            return ServerResult(url, "parse_error", 0, "", rtt_ms)
-        try:
-            count = int(parts[0])
-        except ValueError:
-            return ServerResult(url, "parse_error", 0, "", rtt_ms)
-        max_time = parts[1].strip()
-        if count == 0:
-            # ClickHouse fills max() with epoch zero when the set is
-            # empty; treat anything with no rows as "empty".  The
-            # caller can then look at max_time to tell "empty because
-            # the server has no data for us" from "empty because the
-            # server is stale by days".
-            return ServerResult(url, "empty", 0, max_time, rtt_ms)
-        return ServerResult(url, "ok", count, max_time, rtt_ms)
-    except urllib.error.HTTPError as exc:
+
+        # Expect two lines: "wsprnet\tN\tT" and "wsprdaemon\tN\tT"
+        # (UNION ALL preserves both, order not guaranteed).
+        rows: dict = {}
+        for line in body.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                rows[parts[0]] = (int(parts[1]), parts[2].strip())
+            except ValueError:
+                continue
+        if "wsprnet" not in rows or "wsprdaemon" not in rows:
+            return ServerResult(url, "parse_error", 0, 0, "", rtt_ms)
+
+        wsprnet_count, wsprnet_max = rows["wsprnet"]
+        wsprdaemon_count, wsprdaemon_max = rows["wsprdaemon"]
+        # Report the freshest max across the two tables — useful for
+        # operator triage when one table is stale and the other isn't.
+        max_time = max(wsprnet_max, wsprdaemon_max)
+
+        if wsprnet_count == 0 and wsprdaemon_count == 0:
+            # ClickHouse fills max() with epoch zero on empty sets.  The
+            # max_time string still tells the operator how stale the
+            # tables are (e.g. "1970-01-01" = no data ever, vs.
+            # "2026-05-14" = stale replica).
+            return ServerResult(
+                url, "empty", 0, 0, max_time, rtt_ms,
+            )
         return ServerResult(
-            url, "http_error", 0, "",
+            url, "ok", wsprnet_count, wsprdaemon_count, max_time, rtt_ms,
+        )
+    except urllib.error.HTTPError:
+        return ServerResult(
+            url, "http_error", 0, 0, "",
             int((time.monotonic() - t0) * 1000),
         )
     except (urllib.error.URLError, TimeoutError) as exc:
@@ -160,12 +205,12 @@ def query_server(
         if "timed out" in str(reason or exc).lower():
             status = "timeout"
         return ServerResult(
-            url, status, 0, "",
+            url, status, 0, 0, "",
             int((time.monotonic() - t0) * 1000),
         )
     except Exception:  # noqa: BLE001 — defensive; never crash the pass
         return ServerResult(
-            url, "tcp_error", 0, "",
+            url, "tcp_error", 0, 0, "",
             int((time.monotonic() - t0) * 1000),
         )
 
@@ -225,7 +270,7 @@ class WsprdaemonVerifier:
         )
         self._thread.start()
         logger.info(
-            "wsprdaemon-verifier started: reporter=%s servers=%d interval=%ds "
+            "wsprdaemon-verifier[%s] started: servers=%d interval=%ds "
             "window=%dmin timeout=%ds",
             self._reporter, len(self._urls), self._interval,
             self._window_min, self._timeout,
@@ -250,7 +295,10 @@ class WsprdaemonVerifier:
             try:
                 self._verify_once()
             except Exception:
-                logger.exception("wsprdaemon-verifier: pass raised; will retry")
+                logger.exception(
+                    "wsprdaemon-verifier[%s]: pass raised; will retry",
+                    self._reporter,
+                )
 
     def _verify_once(self) -> List[ServerResult]:
         # Fan out parallel HTTP queries.  ThreadPoolExecutor's
@@ -272,13 +320,15 @@ class WsprdaemonVerifier:
         results.sort(key=lambda r: r.url)
 
         # Per-server line.  Each carries the short name + status + rtt
-        # + count + max_time so an operator can spot which server is
-        # drifting at a glance.
+        # + both counts + max_time so an operator can spot which server
+        # is drifting (and on which table) at a glance.
         for r in results:
             if r.status == "ok":
                 logger.info(
-                    "wsprdaemon-verifier: %s ok rtt=%dms count=%d max=%s",
-                    r.short_name, r.rtt_ms, r.count, r.max_time,
+                    "wsprdaemon-verifier[%s]: %s ok rtt=%dms "
+                    "wsprnet=%d wsprdaemon=%d max=%s",
+                    self._reporter, r.short_name, r.rtt_ms,
+                    r.wsprnet_count, r.wsprdaemon_count, r.max_time,
                 )
             elif r.status == "empty":
                 # Distinguish "server is fine, no data for us yet" from
@@ -287,29 +337,35 @@ class WsprdaemonVerifier:
                 # never replied.
                 max_part = f" max={r.max_time}" if r.max_time else ""
                 logger.warning(
-                    "wsprdaemon-verifier: %s empty rtt=%dms count=0%s",
-                    r.short_name, r.rtt_ms, max_part,
+                    "wsprdaemon-verifier[%s]: %s empty rtt=%dms "
+                    "wsprnet=0 wsprdaemon=0%s",
+                    self._reporter, r.short_name, r.rtt_ms, max_part,
                 )
             else:
                 logger.warning(
-                    "wsprdaemon-verifier: %s %s rtt=%dms",
-                    r.short_name, r.status, r.rtt_ms,
+                    "wsprdaemon-verifier[%s]: %s %s rtt=%dms",
+                    self._reporter, r.short_name, r.status, r.rtt_ms,
                 )
 
         # Aggregate: best-of-three.  The intent of "verified" here is
         # "how many of our spots are visible somewhere in the central
-        # network" — so we take the maximum across servers.  A server
-        # that's silently behind shows up in its own line as "empty
-        # max=<old>" but doesn't drag the aggregate down.
-        best = max((r.count for r in results), default=0)
+        # network" — so we take the maximum across servers, per table.
+        # A server that's silently behind shows up in its own line as
+        # "empty max=<old>" but doesn't drag the aggregate down.  The
+        # canonical pass-complete line reports the wsprdaemon count as
+        # the headline ``verified`` (it's the raw firehose; wsprnet's
+        # dedup means its count can legitimately be lower).
+        best_wsprnet = max((r.wsprnet_count for r in results), default=0)
+        best_wsprdaemon = max((r.wsprdaemon_count for r in results), default=0)
         servers_ok = sum(1 for r in results if r.status == "ok")
-        self._total_verified += best
+        self._total_verified += best_wsprdaemon
         logger.info(
-            "wsprdaemon-verifier: pass complete "
+            "wsprdaemon-verifier[%s]: pass complete "
             "verified=%d dropped_old=0 wsprdaemon_set_size=%d "
-            "servers_ok=%d/%d "
+            "wsprnet_set_size=%d servers_ok=%d/%d "
             "(totals verified=%d dropped_old=0)",
-            best, best, servers_ok, len(results),
+            self._reporter, best_wsprdaemon, best_wsprdaemon,
+            best_wsprnet, servers_ok, len(results),
             self._total_verified,
         )
         return results
