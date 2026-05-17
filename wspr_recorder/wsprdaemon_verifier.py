@@ -65,8 +65,20 @@ Env knobs
 ``WSPRDAEMON_VERIFY_URLS``      comma-separated server URLs; default
                                 ``http://wd10.wsprdaemon.org,http://wd20.wsprdaemon.org,http://wd30.wsprdaemon.org``.
 ``WSPRDAEMON_VERIFY_INTERVAL_SEC``  pass cadence (default 300 = 5 min).
-``WSPRDAEMON_VERIFY_WINDOW_MIN`` how many minutes back to query (15).
+``WSPRDAEMON_VERIFY_WINDOW_MIN`` how many minutes back to query (30).
 ``WSPRDAEMON_VERIFY_TIMEOUT_SEC``   per-server HTTP timeout (5 s).
+Authentication
+--------------
+For servers whose ClickHouse ``default`` user has a password (wd30 as
+of 2026-05-17), embed credentials per-URL in
+``WSPRDAEMON_VERIFY_URLS`` using userinfo form::
+
+    http://wd10.wsprdaemon.org,http://wd20.wsprdaemon.org,http://user:pass@wd30.wsprdaemon.org
+
+Anonymous servers (wd10/wd20) must NOT receive a Basic Auth header —
+ClickHouse validates the header when sent and rejects unrecognized
+users, so a shared credential is unsafe.  Per-URL keeps each server
+on the auth posture it actually wants.
 """
 from __future__ import annotations
 
@@ -156,6 +168,31 @@ class ServerResult:
         return f"max_wn={self.wsprnet_max} max_wd={self.wsprdaemon_max}"
 
 
+def _split_userinfo(url: str) -> tuple[str, Optional[str], Optional[str]]:
+    """Extract ``user:pass`` from a URL's userinfo segment.
+
+    Returns ``(clean_url, user, password)`` where ``clean_url`` has
+    the userinfo stripped (so it's safe to log and use as a dict
+    key) and ``user``/``password`` are ``None`` when the URL has no
+    userinfo.  Round-trip works through ``urllib.parse.urlsplit``
+    rather than regex so e.g. ``%40``-encoded chars are handled.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if not parts.username:
+        return url, None, None
+    netloc = parts.hostname or ""
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    clean = urllib.parse.urlunsplit((
+        parts.scheme, netloc, parts.path, parts.query, parts.fragment,
+    ))
+    # urlsplit leaves userinfo URL-encoded; decode to get the raw
+    # password so the Base64 wraps the actual bytes the server expects.
+    user = urllib.parse.unquote(parts.username)
+    password = urllib.parse.unquote(parts.password) if parts.password else ""
+    return clean, user, password
+
+
 def query_server(
     url: str, reporter: str, window_min: int, timeout_sec: int,
 ) -> ServerResult:
@@ -171,7 +208,13 @@ def query_server(
     be URL-encoded inside the SQL string literal.  ClickHouse accepts
     single-quoted string literals; we don't risk injection because the
     reporter is taken from local config, not user input.
+
+    HTTP Basic Auth is enabled when ``url`` carries a userinfo
+    segment (``http://user:pass@host``).  Anonymous servers must NOT
+    receive an Auth header — ClickHouse validates it when present and
+    rejects unknown users, breaking anonymous access.
     """
+    clean_url, user, password = _split_userinfo(url)
     sql = (
         "SELECT 'wsprnet' AS src, count() AS n, max(time) AS t "
         "FROM wspr.rx "
@@ -185,11 +228,26 @@ def query_server(
         "FORMAT TabSeparated"
     )
     qs = urllib.parse.urlencode({"query": sql})
-    full_url = f"{url}/?{qs}"
+    full_url = f"{clean_url}/?{qs}"
+
+    # Build the Request with optional Basic-Auth header.  We don't use
+    # ``urllib.request.HTTPBasicAuthHandler`` — it requires a 401
+    # challenge-response round-trip, which doubles the visible RTT for
+    # every protected server.  Sending the header preemptively when
+    # we know the server needs auth keeps the RTT measurement honest.
+    req = urllib.request.Request(full_url)
+    if user is not None:
+        import base64
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        req.add_header("Authorization", f"Basic {token}")
+
+    # Carry the userinfo-stripped URL into the ServerResult so a typo'd
+    # password doesn't end up in logs.
+    url = clean_url
 
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(full_url, timeout=timeout_sec) as r:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as r:
             body = r.read().decode("utf-8", errors="replace").strip()
         rtt_ms = int((time.monotonic() - t0) * 1000)
 
@@ -223,9 +281,14 @@ def query_server(
             url, "ok", wsprnet_count, wsprdaemon_count,
             wsprnet_max, wsprdaemon_max, rtt_ms,
         )
-    except urllib.error.HTTPError:
+    except urllib.error.HTTPError as exc:
+        # Distinguish auth failures so the operator immediately knows
+        # the server needs credentials (or different ones).  ClickHouse
+        # returns 401 when the default user has a password and no
+        # Basic-Auth header was sent (or the password is wrong).
+        status = "auth_error" if exc.code == 401 else "http_error"
         return ServerResult(
-            url, "http_error", 0, 0, "", "",
+            url, status, 0, 0, "", "",
             int((time.monotonic() - t0) * 1000),
         )
     except (urllib.error.URLError, TimeoutError) as exc:
@@ -281,6 +344,8 @@ class WsprdaemonVerifier:
         self._reporter = reporter
         # Empty-string entries (from a stray comma in the env var) get
         # dropped; otherwise an HTTP open on "" would noisily fail.
+        # URLs may carry userinfo (``http://user:pass@host``) which
+        # query_server splits out for per-request Basic Auth.
         self._urls: List[str] = [
             u.strip() for u in (urls or DEFAULT_URLS) if u and u.strip()
         ]
@@ -303,11 +368,16 @@ class WsprdaemonVerifier:
             target=self._loop, daemon=True, name="wsprdaemon-verifier",
         )
         self._thread.start()
+        n_auth = sum(
+            1 for u in self._urls
+            if _split_userinfo(u)[1] is not None
+        )
+        auth_part = f" auth_urls={n_auth}" if n_auth else ""
         logger.info(
             "wsprdaemon-verifier[%s] started: servers=%d interval=%ds "
-            "window=%dmin timeout=%ds",
+            "window=%dmin timeout=%ds%s",
             self._reporter, len(self._urls), self._interval,
-            self._window_min, self._timeout,
+            self._window_min, self._timeout, auth_part,
         )
 
     def stop(self, timeout: float = 10.0) -> None:
