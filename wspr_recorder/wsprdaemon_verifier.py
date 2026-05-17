@@ -496,23 +496,32 @@ class WsprdaemonVerifier:
         # rather than whichever future completed first).
         results.sort(key=lambda r: r.url)
 
-        # Cross-server diff against the wsprdaemon.spots table (the
-        # raw firehose — 1:1 with our uploads, no dedup, so set
-        # differences are real data-loss signals).  We union all
-        # responding servers' wsprdaemon sets to get the "every spot
-        # any server has seen" reference, then each server's
-        # ``missing`` is union \ self.  Servers with status != "ok"
+        # Cross-server diffs against both tables.  We union the
+        # responding servers' sets per table, then each server's
+        # missing is union \ self.  Servers with status != "ok"
         # contribute nothing to the union (a tcp_error has no spots
-        # to add) and aren't reported as missing — they have their
-        # own status surface in the per-server line.
+        # to add).
+        #
+        # The two tables answer different questions:
+        #   - wsprdaemon.spots: raw firehose, 1:1 with our uploads.
+        #     A divergence here is a real "this spot didn't reach
+        #     this server" signal.
+        #   - wspr.rx: deduped wsprnet mirror, replicated to each
+        #     wd*.  A divergence here is "this server's wspr.rx
+        #     replication is behind the others" — also useful, but
+        #     it's a mirror-lag signal not a data-loss one.
+        ok_results = [r for r in results if r.status == "ok"]
         union_wd: Set[SpotKey] = set()
-        for r in results:
-            if r.status == "ok":
-                union_wd |= r.wsprdaemon_set
-        missing_by_server: dict = {}
-        for r in results:
-            if r.status == "ok":
-                missing_by_server[r.short_name] = union_wd - r.wsprdaemon_set
+        union_wn: Set[SpotKey] = set()
+        for r in ok_results:
+            union_wd |= r.wsprdaemon_set
+            union_wn |= r.wsprnet_set
+        missing_wd_by_server: dict = {
+            r.short_name: union_wd - r.wsprdaemon_set for r in ok_results
+        }
+        missing_wn_by_server: dict = {
+            r.short_name: union_wn - r.wsprnet_set for r in ok_results
+        }
 
         # Optional verbose mode: include the actual missing tuples in
         # the per-server line so the operator can drill in.  Default
@@ -524,11 +533,19 @@ class WsprdaemonVerifier:
         ).strip().lower() in ("1", "true", "yes", "on")
 
         # Per-server line.  Each carries the short name + status + rtt
-        # + both counts + max-time(s) + missing-from-this-server.
+        # + both counts + per-table missing-from-this-server + max-time(s).
+        # Missing-counts are only shown when non-zero so the typical
+        # all-agree pass keeps the line concise.
         for r in results:
             if r.status == "ok":
-                missing = missing_by_server.get(r.short_name, set())
-                miss_part = f" missing={len(missing)}" if missing else ""
+                miss_wd = missing_wd_by_server.get(r.short_name, set())
+                miss_wn = missing_wn_by_server.get(r.short_name, set())
+                miss_parts = []
+                if miss_wd:
+                    miss_parts.append(f"missing_wd={len(miss_wd)}")
+                if miss_wn:
+                    miss_parts.append(f"missing_wn={len(miss_wn)}")
+                miss_part = (" " + " ".join(miss_parts)) if miss_parts else ""
                 logger.info(
                     "wsprdaemon-verifier[%s]: %s ok rtt=%dms "
                     "wsprnet=%d wsprdaemon=%d%s %s",
@@ -536,19 +553,22 @@ class WsprdaemonVerifier:
                     r.wsprnet_count, r.wsprdaemon_count,
                     miss_part, r.max_display,
                 )
-                if log_missing and missing:
-                    # One spare line per missing tuple, sorted by
-                    # epoch so the operator sees them in time order.
+                if log_missing:
+                    # One spare line per missing tuple, prefixed with
+                    # the table identifier and sorted by epoch so the
+                    # operator sees them in time order.
                     import datetime as _dt
-                    for ep, tx, fhz in sorted(missing):
-                        when = _dt.datetime.fromtimestamp(
-                            ep, tz=_dt.timezone.utc,
-                        ).strftime("%H:%M")
-                        logger.info(
-                            "wsprdaemon-verifier[%s]:   %s missing %s "
-                            "%s %d Hz",
-                            self._reporter, r.short_name, when, tx, fhz,
-                        )
+                    for label, missing in (("wd", miss_wd), ("wn", miss_wn)):
+                        for ep, tx, fhz in sorted(missing):
+                            when = _dt.datetime.fromtimestamp(
+                                ep, tz=_dt.timezone.utc,
+                            ).strftime("%H:%M")
+                            logger.info(
+                                "wsprdaemon-verifier[%s]:   %s missing_%s "
+                                "%s %s %d Hz",
+                                self._reporter, r.short_name, label,
+                                when, tx, fhz,
+                            )
             elif r.status == "empty":
                 # Distinguish "server is fine, no data for us yet" from
                 # "server is stale by days": include max display when
@@ -566,34 +586,39 @@ class WsprdaemonVerifier:
                     self._reporter, r.short_name, r.status, r.rtt_ms,
                 )
 
-        # Aggregate.  ``verified`` is the size of the union (every
-        # distinct spot that reached the central network on at least
-        # one server).  ``missing_total`` is the size of (union minus
-        # intersection) — spots that aren't on every responding
-        # server, i.e. the row count that disagreed somewhere.  Zero
-        # means all responding servers agree; non-zero means
-        # replication drift or partial ingest.
-        if missing_by_server:
+        # Aggregates.  Both ``missing_wd_total`` and ``missing_wn_total``
+        # are |union − intersection| for their respective tables —
+        # zero when all responding servers agree, non-zero on
+        # replication drift or partial ingest.  ``missing_total``
+        # (legacy name) is kept as a synonym of ``missing_wd_total``
+        # for the per-spot diff we shipped first and for the smd
+        # watch verifier regex that already captures it.
+        if ok_results:
             intersection_wd = set.intersection(
-                *[r.wsprdaemon_set for r in results if r.status == "ok"]
+                *[r.wsprdaemon_set for r in ok_results]
             )
-            missing_total = len(union_wd - intersection_wd)
+            intersection_wn = set.intersection(
+                *[r.wsprnet_set for r in ok_results]
+            )
+            missing_wd_total = len(union_wd - intersection_wd)
+            missing_wn_total = len(union_wn - intersection_wn)
         else:
-            missing_total = 0
+            missing_wd_total = 0
+            missing_wn_total = 0
 
-        best_wsprnet = max(
-            (r.wsprnet_count for r in results), default=0,
-        )
         best_wsprdaemon = len(union_wd)
-        servers_ok = sum(1 for r in results if r.status == "ok")
+        best_wsprnet = len(union_wn)
+        servers_ok = len(ok_results)
         self._total_verified += best_wsprdaemon
         logger.info(
             "wsprdaemon-verifier[%s]: pass complete "
             "verified=%d dropped_old=0 wsprdaemon_set_size=%d "
-            "wsprnet_set_size=%d missing_total=%d servers_ok=%d/%d "
+            "wsprnet_set_size=%d missing_wd_total=%d missing_wn_total=%d "
+            "servers_ok=%d/%d "
             "(totals verified=%d dropped_old=0)",
             self._reporter, best_wsprdaemon, best_wsprdaemon,
-            best_wsprnet, missing_total, servers_ok, len(results),
+            best_wsprnet, missing_wd_total, missing_wn_total,
+            servers_ok, len(results),
             self._total_verified,
         )
         return results
