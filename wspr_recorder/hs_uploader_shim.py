@@ -107,6 +107,7 @@ class WsprUploaderHs:
         self._thread: Optional[threading.Thread] = None
         self._uploader = None
         self._verifier = None       # set in start() if WD_VERIFY_FLUSH=1
+        self._wd_verifier = None    # set in start() if WSPRDAEMON_VERIFY=1
         self._transports: list = []
         # Per-pump per-pipeline tallies; the on_batch_outcome callback
         # populates these so the journal log line reflects what
@@ -280,6 +281,23 @@ class WsprUploaderHs:
                     "continuing without it"
                 )
 
+        # Sibling verifier for the wsprdaemon.org SFTP path.  Observe-only
+        # (no DELETEs from pending_uploads — the wsprdaemon transport
+        # commits via the gateway SFTP ack, unlike wsprnet's stateless
+        # HTTP post).  Queries wd10/wd20/wd30 ClickHouse in parallel and
+        # logs per-server status + an aggregate pass-complete line.
+        # Off by default; opt in with WSPRDAEMON_VERIFY=1.
+        try:
+            from . import wsprdaemon_verifier
+            self._wd_verifier = wsprdaemon_verifier.from_env(reporter=self._call)
+            if self._wd_verifier is not None:
+                self._wd_verifier.start()
+        except Exception:
+            logger.exception(
+                "wspr-uploader-hs: failed to start wsprdaemon verifier; "
+                "continuing without it"
+            )
+
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="wspr-uploader-hs",
         )
@@ -317,6 +335,11 @@ class WsprUploaderHs:
                 self._verifier.stop(timeout=timeout)
             except Exception:
                 logger.exception("wspr-uploader-hs: verifier.stop failed")
+        if self._wd_verifier is not None:
+            try:
+                self._wd_verifier.stop(timeout=timeout)
+            except Exception:
+                logger.exception("wspr-uploader-hs: wd_verifier.stop failed")
         for t in self._transports:
             close = getattr(t, "close", None)
             if callable(close):
