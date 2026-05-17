@@ -158,7 +158,7 @@ def fetch_wsprnet_spots(
 
 def _matching_rowids(
     conn: sqlite3.Connection, wsprnet: Set[SpotKey], reporter: str,
-) -> list[int]:
+) -> tuple[list[int], list[SpotKey]]:
     """Find pending_uploads rowids whose spot key is in `wsprnet`.
 
     Walks every wspr.spots row in pending_uploads (scoped to this
@@ -174,6 +174,7 @@ def _matching_rowids(
     own spots at wsprnet.
     """
     rowids: list[int] = []
+    matched_keys: list[SpotKey] = []
     cur = conn.execute("""
         SELECT id,
                json_extract(payload_json, '$.time'),
@@ -192,7 +193,8 @@ def _matching_rowids(
             continue
         if key in wsprnet:
             rowids.append(int(rid))
-    return rowids
+            matched_keys.append(key)
+    return rowids, matched_keys
 
 
 def _delete_by_rowids(conn: sqlite3.Connection, rowids: Iterable[int]) -> int:
@@ -215,7 +217,7 @@ def _delete_by_rowids(conn: sqlite3.Connection, rowids: Iterable[int]) -> int:
 
 def _drop_old_unverified(
     conn: sqlite3.Connection, drop_after_sec: int, reporter: str,
-) -> int:
+) -> tuple[int, list[SpotKey]]:
     """Delete pending wspr.spots rows older than `drop_after_sec` seconds.
 
     Scoped to ``reporter`` for the same multi-receiver safety reason as
@@ -223,20 +225,51 @@ def _drop_old_unverified(
     unverified rows.
 
     `queued_at` is an ISO 8601 timestamp; we compare against `now - drop_after`.
+
+    Returns ``(deleted_count, dropped_keys)`` so the caller can stamp
+    ``dropped_at`` on the corresponding ``wsprnet_audit`` rows — those
+    spots are the "uploaded but never appeared in wspr.rx" cohort the
+    ``smd verifier report`` command surfaces.
     """
     cutoff_iso = (
         datetime.now(timezone.utc) -
         # use seconds via datetime arithmetic for clarity
         _seconds_to_timedelta(drop_after_sec)
     ).isoformat()
+    # SELECT-then-DELETE in one transaction so the keys we return
+    # exactly match what was just removed (no race with a concurrent
+    # writer that could remove a row between the SELECT and DELETE).
     cur = conn.execute("""
-        DELETE FROM pending_uploads
-        WHERE target_db='wspr' AND target_table='spots'
-          AND json_extract(payload_json, '$.rx_call') = ?
-          AND queued_at < ?
+        SELECT id,
+               json_extract(payload_json, '$.time'),
+               json_extract(payload_json, '$.callsign'),
+               json_extract(payload_json, '$.frequency_hz')
+          FROM pending_uploads
+         WHERE target_db='wspr' AND target_table='spots'
+           AND json_extract(payload_json, '$.rx_call') = ?
+           AND queued_at < ?
     """, (reporter, cutoff_iso))
-    conn.commit()
-    return cur.rowcount
+    rows = cur.fetchall()
+    dropped_keys: list[SpotKey] = []
+    rowids: list[int] = []
+    for rid, t, call, freq in rows:
+        rowids.append(int(rid))
+        if t and call and freq is not None:
+            try:
+                dropped_keys.append(
+                    (str(t), str(call).upper(), int(freq)),
+                )
+            except (TypeError, ValueError):
+                pass
+    if rowids:
+        placeholders = ",".join("?" for _ in rowids)
+        cur = conn.execute(
+            f"DELETE FROM pending_uploads WHERE id IN ({placeholders})",
+            rowids,
+        )
+        conn.commit()
+        return cur.rowcount, dropped_keys
+    return 0, []
 
 
 def _seconds_to_timedelta(sec: int):
@@ -309,6 +342,11 @@ class WsprnetVerifier:
         # batch before we start querying.
         if self._stop.wait(self._warmup):
             return
+        # Prune the audit table every N passes so old rows don't
+        # accumulate forever.  The 24 h retention default means the
+        # table stays under ~50k rows even on a busy multi-receiver
+        # host — small, but worth keeping bounded.
+        passes_since_prune = 0
         while not self._stop.wait(self._interval):
             try:
                 self._verify_and_flush()
@@ -317,6 +355,25 @@ class WsprnetVerifier:
                     "wsprnet-verifier[%s]: pass raised; will retry",
                     self._reporter,
                 )
+            passes_since_prune += 1
+            if passes_since_prune >= 12:  # every ~hour at 5-min cadence
+                try:
+                    from . import wsprnet_audit
+                    n_audit, n_batch = wsprnet_audit.prune(
+                        db_path=self._db_path,
+                    )
+                    if n_audit or n_batch:
+                        logger.info(
+                            "wsprnet-verifier[%s]: audit prune "
+                            "removed %d spot rows, %d batch rows",
+                            self._reporter, n_audit, n_batch,
+                        )
+                except Exception:
+                    logger.exception(
+                        "wsprnet-verifier[%s]: audit prune raised",
+                        self._reporter,
+                    )
+                passes_since_prune = 0
 
     def _verify_and_flush(self) -> tuple[int, int]:
         try:
@@ -347,13 +404,43 @@ class WsprnetVerifier:
             )
             return (0, 0)
         try:
-            rowids = _matching_rowids(conn, wsprnet, self._reporter)
+            rowids, matched_keys = _matching_rowids(
+                conn, wsprnet, self._reporter,
+            )
             verified = _delete_by_rowids(conn, rowids) if rowids else 0
-            dropped = _drop_old_unverified(
+            dropped, dropped_keys = _drop_old_unverified(
                 conn, self._drop_after, self._reporter,
             )
         finally:
             conn.close()
+
+        # Best-effort: stamp the wsprnet_audit table for spots that
+        # just transitioned (verified) or aged out (dropped/lost).
+        # When the audit isn't enabled the calls below no-op because
+        # the audit module's writes return silently if the tables
+        # don't exist (see :func:`wsprnet_audit.ensure_schema` —
+        # callers gate on WSPRNET_AUDIT=1).  Failures are logged but
+        # don't break the verifier's main path.
+        if matched_keys or dropped_keys:
+            try:
+                from . import wsprnet_audit
+                if matched_keys:
+                    wsprnet_audit.mark_verified(
+                        rx_call=self._reporter,
+                        spot_keys=matched_keys,
+                        db_path=self._db_path,
+                    )
+                if dropped_keys:
+                    wsprnet_audit.mark_dropped(
+                        rx_call=self._reporter,
+                        spot_keys=dropped_keys,
+                        db_path=self._db_path,
+                    )
+            except Exception:
+                logger.exception(
+                    "wsprnet-verifier[%s]: audit update failed (ignored)",
+                    self._reporter,
+                )
 
         if verified or dropped:
             self._total_verified += verified
@@ -393,7 +480,9 @@ def _main_once() -> int:
         wsprnet = fetch_wsprnet_spots(args.reporter, minutes=args.window_min)
         conn = sqlite3.connect(args.db, timeout=10.0)
         try:
-            rowids = _matching_rowids(conn, wsprnet, args.reporter)
+            rowids, _matched = _matching_rowids(
+                conn, wsprnet, args.reporter,
+            )
         finally:
             conn.close()
         print(f"wsprnet_set_size={len(wsprnet)} would-delete={len(rowids)}")

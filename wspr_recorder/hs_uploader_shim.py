@@ -108,6 +108,14 @@ class WsprUploaderHs:
         self._uploader = None
         self._verifier = None       # set in start() if WD_VERIFY_FLUSH=1
         self._wd_verifier = None    # set in start() if WSPRDAEMON_VERIFY=1
+        # Per-spot wsprnet upload audit: feeds the `smd verifier
+        # report` command's "uploaded but never appeared in wspr.rx"
+        # cohort.  Default off; opt in with WSPRNET_AUDIT=1.
+        # When enabled, ``ensure_schema`` is called from start() so
+        # the audit table exists by the time the first batch ships.
+        self._wsprnet_audit_enabled = os.environ.get(
+            "WSPRNET_AUDIT", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
         self._transports: list = []
         # Per-pump per-pipeline tallies; the on_batch_outcome callback
         # populates these so the journal log line reflects what
@@ -195,6 +203,22 @@ class WsprUploaderHs:
                 "wspr-uploader-hs: hs-uploader import failed: %s", exc,
             )
             return
+
+        # Ensure the wsprnet audit table exists before the first batch
+        # ships, so its INSERT in _on_batch_outcome doesn't race with
+        # schema creation in the verifier thread.  No-op if WSPRNET_AUDIT
+        # is off — the audit module's own writes are gated on the
+        # ``_wsprnet_audit_enabled`` flag.
+        if self._wsprnet_audit_enabled:
+            try:
+                from . import wsprnet_audit
+                wsprnet_audit.ensure_schema(str(self._sink_db))
+            except Exception:
+                logger.exception(
+                    "wsprnet-audit: ensure_schema raised (continuing "
+                    "with audit disabled)"
+                )
+                self._wsprnet_audit_enabled = False
 
         watermark = SqliteWatermarkStore(default_path())
         # Pick up HS_UPLOADER_SSH_KEY_FILE (and any other identity env
@@ -432,11 +456,39 @@ class WsprUploaderHs:
             import re
             m = re.match(r"(\d+)/(\d+) added", outcome.reason or "")
             if m:
-                self._pump_wsprnet_accepted += int(m.group(1))
+                n_added = int(m.group(1))
+                n_posted = int(m.group(2))
             else:
                 # No diagnostic — assume all posted records were accepted
                 # (older transport version without the parse).
-                self._pump_wsprnet_accepted += len(batch.records)
+                n_added = len(batch.records)
+                n_posted = len(batch.records)
+            self._pump_wsprnet_accepted += n_added
+
+            # Per-spot audit so the operator can later run
+            # ``smd verifier report`` and see exactly which spots fell
+            # into the "uploaded but never appeared in wspr.rx"
+            # bucket.  Best-effort: failures here never block uploads.
+            # Off by default; opt in with WSPRNET_AUDIT=1 (typically
+            # set alongside WD_VERIFY_FLUSH=1).
+            if self._wsprnet_audit_enabled:
+                try:
+                    from . import wsprnet_audit
+                    spot_keys = [
+                        _record_to_spot_key(r)
+                        for r in batch.records
+                    ]
+                    spot_keys = [k for k in spot_keys if k is not None]
+                    wsprnet_audit.record_batch(
+                        rx_call=self._call,
+                        spots=spot_keys,
+                        n_posted=n_posted,
+                        n_added=n_added,
+                    )
+                except Exception:
+                    logger.exception(
+                        "wsprnet-audit: record_batch raised (ignored)"
+                    )
 
     # ----- pipeline construction -----
 
@@ -639,6 +691,44 @@ def _server_host(server_spec: str) -> str:
     if "@" in server_spec:
         return server_spec.split("@", 1)[1]
     return server_spec
+
+
+def _record_to_spot_key(record):
+    """Render an hs-uploader ``Record`` into the audit table's SpotKey
+    tuple ``(time_iso, tx_sign_upper, freq_hz_int)``.
+
+    Returns ``None`` if the record is missing fields the audit can't
+    work without — caller filters those out so we don't pollute the
+    table with rows whose primary key can't be reconstructed.
+
+    Two row shapes appear in practice:
+      * v2 sink.db rows: ``columns['callsign']``, ``columns['frequency_hz']``
+      * legacy: ``columns['tx_sign']``, ``columns['frequency']``
+    Falls back gracefully across both so the audit works on hosts
+    mid-migration.
+    """
+    cols = getattr(record, "columns", None) or {}
+    tx = cols.get("callsign") or cols.get("tx_sign")
+    freq = cols.get("frequency_hz")
+    if freq is None:
+        freq = cols.get("frequency")
+    if not tx or freq is None:
+        return None
+    try:
+        freq_hz = int(freq)
+    except (TypeError, ValueError):
+        return None
+    rec_time = getattr(record, "time", None)
+    if rec_time is None:
+        return None
+    # WsprnetVerifier's canonical SpotKey time format is
+    # ``YYYY-MM-DDTHH:MM:00Z`` (minute precision, literal ``:00Z``
+    # suffix — see wsprnet_verifier.parse_wsprnet_spots).  Match
+    # exactly so the audit's spot_key strings collide cleanly with
+    # the verifier's mark_verified/mark_dropped calls.
+    rec_min = rec_time.replace(second=0, microsecond=0)
+    time_str = rec_min.strftime("%Y-%m-%dT%H:%M:00Z")
+    return (time_str, str(tx).upper(), freq_hz)
 
 
 # ----- short spots-file parser (wsprnet fallback) -----
