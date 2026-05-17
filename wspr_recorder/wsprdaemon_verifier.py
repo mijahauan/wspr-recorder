@@ -67,6 +67,10 @@ Env knobs
 ``WSPRDAEMON_VERIFY_INTERVAL_SEC``  pass cadence (default 300 = 5 min).
 ``WSPRDAEMON_VERIFY_WINDOW_MIN`` how many minutes back to query (30).
 ``WSPRDAEMON_VERIFY_TIMEOUT_SEC``   per-server HTTP timeout (5 s).
+``WSPRDAEMON_VERIFY_LOG_MISSING`` ``1`` to enumerate each missing
+                                ``(time, tx_sign, frequency)`` tuple
+                                under each server's ok line (default
+                                off; missing count is always logged).
 Authentication
 --------------
 For servers whose ClickHouse ``default`` user has a password (wd30 as
@@ -90,8 +94,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -120,13 +124,23 @@ WARMUP_SEC           = 60    # let the uploader ship its first cycle
 
 # ---------------------------------------------------------------------- per-server query
 
+# A single spot's identity for cross-server comparison: the
+# (utc_epoch_minute, tx_sign_upper, frequency_hz_int) tuple that
+# uniquely identifies a transmission as our receiver heard it.
+# Using the rounded-to-minute epoch (not the full DateTime string)
+# means a server that returned the same row as another server
+# compares equal even if their string formatters use different
+# timezone projections.
+SpotKey = Tuple[int, str, int]
+
+
 @dataclass
 class ServerResult:
     """One server's reply for a single verifier pass.
 
-    Both counts come from the same UNION ALL query against the same
-    ClickHouse instance, so they share an rtt and represent the same
-    moment in the server's view.
+    Both spot sets come from the same UNION ALL query against the
+    same ClickHouse instance, so they share an rtt and represent the
+    same moment in the server's view.
 
     ``wsprnet_max`` and ``wsprdaemon_max`` are tracked separately
     because the two tables can ingest at different rates on the same
@@ -136,12 +150,20 @@ class ServerResult:
     ``max`` would hide that asymmetry.
     """
     url: str
-    status: str             # ok | empty | http_error | tcp_error | timeout | parse_error
-    wsprnet_count: int      # rows in wspr.rx for our rx_sign in the window
-    wsprdaemon_count: int   # rows in wsprdaemon.spots for our rx_sign in the window
-    wsprnet_max: str        # ISO time of the most recent wspr.rx row
-    wsprdaemon_max: str     # ISO time of the most recent wsprdaemon.spots row
-    rtt_ms: int
+    status: str             # ok | empty | http_error | tcp_error | timeout | parse_error | auth_error
+    wsprnet_set: Set[SpotKey] = field(default_factory=set)
+    wsprdaemon_set: Set[SpotKey] = field(default_factory=set)
+    wsprnet_max: str = ""    # ISO time of the most recent wspr.rx row
+    wsprdaemon_max: str = ""  # ISO time of the most recent wsprdaemon.spots row
+    rtt_ms: int = 0
+
+    @property
+    def wsprnet_count(self) -> int:
+        return len(self.wsprnet_set)
+
+    @property
+    def wsprdaemon_count(self) -> int:
+        return len(self.wsprdaemon_set)
 
     @property
     def short_name(self) -> str:
@@ -223,13 +245,23 @@ def query_server(
     # UTC-stored ``time`` values pulled in ~5 hours of extra rows.
     # ``now('UTC')`` is TZ-aware and produces the correct epoch on
     # any server config.
+    #
+    # SELECT each row's (epoch, tx_sign, frequency) so the caller can
+    # build a SpotKey set and diff across servers — surfaces which
+    # individual spots are missing from a given server, not just how
+    # many.  toUnixTimestamp(time) instead of the DateTime string is
+    # what makes the per-server diff TZ-safe: comparing epochs
+    # avoids the server-tz-projection ambiguity that bit us on wd30
+    # before the wd30 admin set its server tz to UTC.
     sql = (
-        "SELECT 'wsprnet' AS src, count() AS n, max(time) AS t "
+        "SELECT 'wsprnet' AS src, toUnixTimestamp(time) AS t, "
+        "tx_sign, frequency "
         "FROM wspr.rx "
         f"WHERE rx_sign='{reporter}' "
         f"AND time>=now('UTC')-INTERVAL {int(window_min)} MINUTE "
         "UNION ALL "
-        "SELECT 'wsprdaemon' AS src, count() AS n, max(time) AS t "
+        "SELECT 'wsprdaemon' AS src, toUnixTimestamp(time), "
+        "tx_sign, frequency "
         "FROM wsprdaemon.spots "
         f"WHERE rx_sign='{reporter}' "
         f"AND time>=now('UTC')-INTERVAL {int(window_min)} MINUTE "
@@ -259,35 +291,68 @@ def query_server(
             body = r.read().decode("utf-8", errors="replace").strip()
         rtt_ms = int((time.monotonic() - t0) * 1000)
 
-        # Expect two lines: "wsprnet\tN\tT" and "wsprdaemon\tN\tT"
-        # (UNION ALL preserves both, order not guaranteed).
-        rows: dict = {}
+        # Parse: lines look like ``src\tepoch\ttx_sign\tfrequency``.
+        # Group into two SpotKey sets keyed by ``src``.  Track each
+        # set's max(epoch) on the fly so we don't have to re-iterate.
+        wsprnet_set: Set[SpotKey] = set()
+        wsprdaemon_set: Set[SpotKey] = set()
+        wsprnet_max_epoch = 0
+        wsprdaemon_max_epoch = 0
         for line in body.splitlines():
             parts = line.split("\t")
-            if len(parts) < 3:
+            if len(parts) < 4:
                 continue
+            src = parts[0]
             try:
-                rows[parts[0]] = (int(parts[1]), parts[2].strip())
+                epoch = int(parts[1])
+                tx_sign = parts[2].upper()
+                freq_hz = int(parts[3])
             except ValueError:
                 continue
-        if "wsprnet" not in rows or "wsprdaemon" not in rows:
-            return ServerResult(url, "parse_error", 0, 0, "", "", rtt_ms)
+            # Round epoch to the minute — WSPR cycles align to minute
+            # boundaries, so this is the natural identity for a spot.
+            # Without rounding, ingest-side microsecond drift would
+            # cause "same spot" to compare unequal across servers.
+            epoch_min = (epoch // 60) * 60
+            key: SpotKey = (epoch_min, tx_sign, freq_hz)
+            if src == "wsprnet":
+                wsprnet_set.add(key)
+                if epoch > wsprnet_max_epoch:
+                    wsprnet_max_epoch = epoch
+            elif src == "wsprdaemon":
+                wsprdaemon_set.add(key)
+                if epoch > wsprdaemon_max_epoch:
+                    wsprdaemon_max_epoch = epoch
 
-        wsprnet_count, wsprnet_max = rows["wsprnet"]
-        wsprdaemon_count, wsprdaemon_max = rows["wsprdaemon"]
+        # Render max-time strings in UTC for display consistency
+        # across servers (otherwise a Chicago-tz server would print
+        # local-tz strings that look "behind" wd10/wd20's UTC ones).
+        def _fmt_epoch(epoch: int) -> str:
+            if not epoch:
+                return ""
+            import datetime as _dt
+            return _dt.datetime.fromtimestamp(
+                epoch, tz=_dt.timezone.utc,
+            ).strftime("%Y-%m-%d %H:%M:%S")
 
-        if wsprnet_count == 0 and wsprdaemon_count == 0:
-            # ClickHouse fills max() with epoch zero on empty sets.  The
-            # max strings still tell the operator how stale each table
-            # is (e.g. "1970-01-01" = no data ever for our reporter,
-            # vs. "2026-05-14" = stale replica that used to have us).
+        wsprnet_max = _fmt_epoch(wsprnet_max_epoch)
+        wsprdaemon_max = _fmt_epoch(wsprdaemon_max_epoch)
+
+        if not wsprnet_set and not wsprdaemon_set:
+            # Empty pass — the server is reachable but returned no
+            # rows for our reporter in the window.  Could be a fresh
+            # install, a stale replica, or the reporter has nothing
+            # to upload yet.
             return ServerResult(
-                url, "empty", 0, 0,
-                wsprnet_max, wsprdaemon_max, rtt_ms,
+                url=url, status="empty",
+                wsprnet_max=wsprnet_max, wsprdaemon_max=wsprdaemon_max,
+                rtt_ms=rtt_ms,
             )
         return ServerResult(
-            url, "ok", wsprnet_count, wsprdaemon_count,
-            wsprnet_max, wsprdaemon_max, rtt_ms,
+            url=url, status="ok",
+            wsprnet_set=wsprnet_set, wsprdaemon_set=wsprdaemon_set,
+            wsprnet_max=wsprnet_max, wsprdaemon_max=wsprdaemon_max,
+            rtt_ms=rtt_ms,
         )
     except urllib.error.HTTPError as exc:
         # Distinguish auth failures so the operator immediately knows
@@ -296,8 +361,8 @@ def query_server(
         # Basic-Auth header was sent (or the password is wrong).
         status = "auth_error" if exc.code == 401 else "http_error"
         return ServerResult(
-            url, status, 0, 0, "", "",
-            int((time.monotonic() - t0) * 1000),
+            url=url, status=status,
+            rtt_ms=int((time.monotonic() - t0) * 1000),
         )
     except (urllib.error.URLError, TimeoutError) as exc:
         # urllib distinguishes name-resolution errors, connection-refused,
@@ -310,13 +375,13 @@ def query_server(
         if "timed out" in str(reason or exc).lower():
             status = "timeout"
         return ServerResult(
-            url, status, 0, 0, "", "",
-            int((time.monotonic() - t0) * 1000),
+            url=url, status=status,
+            rtt_ms=int((time.monotonic() - t0) * 1000),
         )
     except Exception:  # noqa: BLE001 — defensive; never crash the pass
         return ServerResult(
-            url, "tcp_error", 0, 0, "", "",
-            int((time.monotonic() - t0) * 1000),
+            url=url, status="tcp_error",
+            rtt_ms=int((time.monotonic() - t0) * 1000),
         )
 
 
@@ -431,21 +496,59 @@ class WsprdaemonVerifier:
         # rather than whichever future completed first).
         results.sort(key=lambda r: r.url)
 
-        # Per-server line.  Each carries the short name + status + rtt
-        # + both counts + max-time(s) so an operator can spot which
-        # server is drifting (and on which table) at a glance.  The
-        # max_display property collapses to ``max=...`` when both
-        # tables agree and expands to ``max_wn=... max_wd=...`` when
-        # they diverge (e.g. wd20 keeps wspr.rx current but lags
-        # wsprdaemon.spots).
+        # Cross-server diff against the wsprdaemon.spots table (the
+        # raw firehose — 1:1 with our uploads, no dedup, so set
+        # differences are real data-loss signals).  We union all
+        # responding servers' wsprdaemon sets to get the "every spot
+        # any server has seen" reference, then each server's
+        # ``missing`` is union \ self.  Servers with status != "ok"
+        # contribute nothing to the union (a tcp_error has no spots
+        # to add) and aren't reported as missing — they have their
+        # own status surface in the per-server line.
+        union_wd: Set[SpotKey] = set()
         for r in results:
             if r.status == "ok":
+                union_wd |= r.wsprdaemon_set
+        missing_by_server: dict = {}
+        for r in results:
+            if r.status == "ok":
+                missing_by_server[r.short_name] = union_wd - r.wsprdaemon_set
+
+        # Optional verbose mode: include the actual missing tuples in
+        # the per-server line so the operator can drill in.  Default
+        # off because a busy site with replication lag could emit
+        # dozens of tuples per pass — counts are the headline signal,
+        # the tuples are diagnostics.
+        log_missing = os.environ.get(
+            "WSPRDAEMON_VERIFY_LOG_MISSING", "",
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+        # Per-server line.  Each carries the short name + status + rtt
+        # + both counts + max-time(s) + missing-from-this-server.
+        for r in results:
+            if r.status == "ok":
+                missing = missing_by_server.get(r.short_name, set())
+                miss_part = f" missing={len(missing)}" if missing else ""
                 logger.info(
                     "wsprdaemon-verifier[%s]: %s ok rtt=%dms "
-                    "wsprnet=%d wsprdaemon=%d %s",
+                    "wsprnet=%d wsprdaemon=%d%s %s",
                     self._reporter, r.short_name, r.rtt_ms,
-                    r.wsprnet_count, r.wsprdaemon_count, r.max_display,
+                    r.wsprnet_count, r.wsprdaemon_count,
+                    miss_part, r.max_display,
                 )
+                if log_missing and missing:
+                    # One spare line per missing tuple, sorted by
+                    # epoch so the operator sees them in time order.
+                    import datetime as _dt
+                    for ep, tx, fhz in sorted(missing):
+                        when = _dt.datetime.fromtimestamp(
+                            ep, tz=_dt.timezone.utc,
+                        ).strftime("%H:%M")
+                        logger.info(
+                            "wsprdaemon-verifier[%s]:   %s missing %s "
+                            "%s %d Hz",
+                            self._reporter, r.short_name, when, tx, fhz,
+                        )
             elif r.status == "empty":
                 # Distinguish "server is fine, no data for us yet" from
                 # "server is stale by days": include max display when
@@ -463,25 +566,34 @@ class WsprdaemonVerifier:
                     self._reporter, r.short_name, r.status, r.rtt_ms,
                 )
 
-        # Aggregate: best-of-three.  The intent of "verified" here is
-        # "how many of our spots are visible somewhere in the central
-        # network" — so we take the maximum across servers, per table.
-        # A server that's silently behind shows up in its own line as
-        # "empty max=<old>" but doesn't drag the aggregate down.  The
-        # canonical pass-complete line reports the wsprdaemon count as
-        # the headline ``verified`` (it's the raw firehose; wsprnet's
-        # dedup means its count can legitimately be lower).
-        best_wsprnet = max((r.wsprnet_count for r in results), default=0)
-        best_wsprdaemon = max((r.wsprdaemon_count for r in results), default=0)
+        # Aggregate.  ``verified`` is the size of the union (every
+        # distinct spot that reached the central network on at least
+        # one server).  ``missing_total`` is the size of (union minus
+        # intersection) — spots that aren't on every responding
+        # server, i.e. the row count that disagreed somewhere.  Zero
+        # means all responding servers agree; non-zero means
+        # replication drift or partial ingest.
+        if missing_by_server:
+            intersection_wd = set.intersection(
+                *[r.wsprdaemon_set for r in results if r.status == "ok"]
+            )
+            missing_total = len(union_wd - intersection_wd)
+        else:
+            missing_total = 0
+
+        best_wsprnet = max(
+            (r.wsprnet_count for r in results), default=0,
+        )
+        best_wsprdaemon = len(union_wd)
         servers_ok = sum(1 for r in results if r.status == "ok")
         self._total_verified += best_wsprdaemon
         logger.info(
             "wsprdaemon-verifier[%s]: pass complete "
             "verified=%d dropped_old=0 wsprdaemon_set_size=%d "
-            "wsprnet_set_size=%d servers_ok=%d/%d "
+            "wsprnet_set_size=%d missing_total=%d servers_ok=%d/%d "
             "(totals verified=%d dropped_old=0)",
             self._reporter, best_wsprdaemon, best_wsprdaemon,
-            best_wsprnet, servers_ok, len(results),
+            best_wsprnet, missing_total, servers_ok, len(results),
             self._total_verified,
         )
         return results
