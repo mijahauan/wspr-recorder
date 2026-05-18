@@ -60,6 +60,57 @@ def _enabled() -> bool:
     return os.environ.get("WD_DECODE_VIA_DB", "0").strip() not in ("", "0")
 
 
+def _resolve_ft_settle_sec(env=None) -> float:
+    """Resolve the WSPRDAEMON_TAR_FT_SETTLE_SEC env var.
+
+    0 (default) disables the gate: CycleBatcher fires the wake
+    callback the instant a WSPR cycle commits.
+
+    > 0 enables the Phase 2 PR 6 settle gate: after a WSPR cycle
+    commits, wait until the next 15-second UTC boundary (so an FT8
+    cycle has just closed) + this many seconds (decoder finish-write
+    buffer), THEN fire the wake.  The resulting tar will carry both
+    wspr.spots and the most recent psk.spots, aligned on the same
+    upload cycle.
+
+    Unparseable / negative values fall back to 0 with a debug log
+    rather than masking a typo.
+    """
+    e = env if env is not None else os.environ
+    raw = (e.get("WSPRDAEMON_TAR_FT_SETTLE_SEC") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        v = float(raw)
+        if v < 0:
+            logger.debug(
+                "WSPRDAEMON_TAR_FT_SETTLE_SEC=%r is negative; treating as 0",
+                raw,
+            )
+            return 0.0
+        return v
+    except ValueError:
+        logger.debug(
+            "WSPRDAEMON_TAR_FT_SETTLE_SEC=%r is unparseable; treating as 0",
+            raw,
+        )
+        return 0.0
+
+
+def _seconds_to_next_15s_boundary(now_epoch: float) -> float:
+    """Seconds until the next UTC 15-second boundary after `now_epoch`.
+
+    FT8 cycle boundary is at every 15 s of UTC time-since-epoch — same
+    second alignment WSJT-X uses.  Result is in (0, 15].  Returns 15
+    exactly when the input is itself on a boundary, since we want the
+    NEXT one (the boundary the operator just passed has already
+    triggered any decoders that were going to fire on it; we want the
+    one that closes the cycle now in progress).
+    """
+    rem = now_epoch % 15.0
+    return 15.0 - rem if rem else 15.0
+
+
 def _whoami() -> str:
     """Best-effort uname for the silent-noop diagnostic.  Falls back
     to UID when getpwuid would block (NSS lookup on container hosts
@@ -618,9 +669,20 @@ class CycleBatcher:
         sink: "SpotSink",
         *,
         deadline_sec: float = 30.0,
+        ft_settle_sec: Optional[float] = None,
     ):
         self._sink = sink
         self._deadline_sec = float(deadline_sec)
+        # Phase 2 PR 6: optional delay between WSPR cycle commit and
+        # uploader wake, so the wsprdaemon-tar transport picks up
+        # both wspr.spots and the most recent psk.spots in the same
+        # tar.  Resolved at construction so __main__ can pass an
+        # explicit value or rely on the env var. 0 disables the gate
+        # (today's behavior — fire wake the instant the WSPR cycle
+        # commits, no FT bundling guarantee).
+        if ft_settle_sec is None:
+            ft_settle_sec = _resolve_ft_settle_sec()
+        self._ft_settle_sec = max(0.0, float(ft_settle_sec))
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._batches: dict = {}   # (date, hhmm) -> _CycleBatch
@@ -632,6 +694,11 @@ class CycleBatcher:
         # starts.  Replaces the legacy SIGUSR1+pidfile dance from
         # the pre-Phase-A standalone wd-upload-hs era.
         self._wake_callback: Optional[Callable[[], None]] = None
+        # Pending settle-gate timers (so stop() can cancel them and
+        # tests can poke at outstanding fires).  threading.Timer is
+        # one-shot; we'd otherwise leak threads if shutdown races a
+        # scheduled fire.
+        self._pending_timers: List[threading.Timer] = []
         self._thread = threading.Thread(
             target=self._run,
             name="cycle-batcher",
@@ -767,18 +834,62 @@ class CycleBatcher:
             hhmm[:2], hhmm[2:], n, n_noise,
             len(batch.bands) or len(batch.noise), elapsed_ms,
         )
-        # Wake the in-process uploader immediately so it doesn't
-        # have to wait for its next polling tick.  No-op if no
-        # callback is registered (e.g. uploader not configured, or
-        # WsprRecorder hasn't called set_wake_callback yet).  A
-        # callback exception is logged but doesn't propagate — the
-        # uploader's 60-second polling fallback still catches the
-        # commit on the next tick.
+        # Wake the in-process uploader.  No-op if no callback is
+        # registered.  A callback exception is logged but doesn't
+        # propagate — the uploader's 60-second polling fallback
+        # still catches the commit on the next tick.
+        #
+        # Two modes:
+        #   ft_settle_sec == 0 (default): fire immediately (today's
+        #     behavior; the uploader pumps the moment the cycle
+        #     commits and ships whatever it can read).
+        #   ft_settle_sec >  0:           schedule a delayed fire at
+        #     the next UTC 15 s boundary + settle, so the
+        #     wsprdaemon-tar transport's pump reads both wspr.spots
+        #     AND the most recent psk.spots in one tar.
         if n > 0 and self._wake_callback is not None:
-            try:
-                self._wake_callback()
-            except Exception:
-                logger.exception("cycle-batcher: wake callback raised")
+            self._schedule_wake()
+
+    def _schedule_wake(self) -> None:
+        """Fire the wake callback now or on the FT settle gate.
+
+        With ft_settle_sec=0 (default), invokes the callback inline;
+        with > 0, schedules a one-shot Timer to fire at the next UTC
+        15-second boundary + settle.  Multiple consecutive flushes
+        each schedule their own Timer — that's fine because the
+        uploader's pump is idempotent under repeated wakes (it just
+        reads whatever's currently committed).
+        """
+        if self._ft_settle_sec <= 0:
+            self._fire_wake()
+            return
+        delay = (_seconds_to_next_15s_boundary(time.time())
+                 + self._ft_settle_sec)
+        timer = threading.Timer(delay, self._fire_wake)
+        timer.daemon = True
+        timer.name = f"ft-settle-{int(time.time())}"
+        with self._lock:
+            # Prune already-finished timers so the list doesn't grow.
+            self._pending_timers = [
+                t for t in self._pending_timers if t.is_alive()
+            ]
+            self._pending_timers.append(timer)
+        timer.start()
+        logger.debug(
+            "cycle-batcher: wake scheduled in %.2fs "
+            "(next 15s boundary + %.1fs settle)",
+            delay, self._ft_settle_sec,
+        )
+
+    def _fire_wake(self) -> None:
+        """Invoke the registered wake callback (or no-op if cleared)."""
+        cb = self._wake_callback
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            logger.exception("cycle-batcher: wake callback raised")
 
     # --- lifecycle -------------------------------------------------------
 
@@ -789,12 +900,18 @@ class CycleBatcher:
         on orderly shutdown).  Anything still buffered when stop()
         is called gets one final flush attempt — better to ship a
         partial cycle than to lose the rows.
+
+        Cancels any outstanding FT-settle timers so they don't fire
+        post-shutdown into a torn-down uploader.
         """
         self._stop.set()
         with self._cond:
             self._cond.notify_all()
         self._thread.join(timeout=timeout)
         with self._lock:
+            for t in self._pending_timers:
+                t.cancel()
+            self._pending_timers.clear()
             leftover = list(self._batches.values())
             self._batches.clear()
         for batch in leftover:

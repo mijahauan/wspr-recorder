@@ -235,5 +235,106 @@ class TestCycleBatcherWakeCallback(unittest.TestCase):
             b.stop()
 
 
+# Phase 2 PR 6 — FT settle gate ---------------------------------------------
+
+
+class TestFtSettleGate(unittest.TestCase):
+    """The gate delays the wake callback until the next UTC 15s
+    boundary + WSPRDAEMON_TAR_FT_SETTLE_SEC so the wsprdaemon-tar
+    transport's pump bundles WSPR + most-recent FT spots into one tar.
+    Disabled (0) by default — must not alter existing behavior.
+    """
+
+    def test_zero_settle_fires_wake_inline(self):
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=0.1, ft_settle_sec=0)
+        fire_count = [0]
+        b.set_wake_callback(lambda: fire_count.__setitem__(0, fire_count[0] + 1))
+        try:
+            b.add(("260518", "1430"), "20", [_make_spot()], radiod_id="rx")
+            time.sleep(0.3)
+            self.assertEqual(fire_count[0], 1)
+            self.assertEqual([t for t in b._pending_timers if t.is_alive()], [])
+        finally:
+            b.stop()
+
+    def test_positive_settle_schedules_timer_and_delays_fire(self):
+        """With a small settle, the wake should NOT fire inline; a
+        timer should be in flight; the wake eventually fires after the
+        scheduled delay."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=0.1, ft_settle_sec=1.0)
+        fire_count = [0]
+        fire_event = threading.Event()
+        def cb():
+            fire_count[0] += 1
+            fire_event.set()
+        b.set_wake_callback(cb)
+        try:
+            b.add(("260518", "1430"), "20", [_make_spot()], radiod_id="rx")
+            time.sleep(0.3)
+            self.assertEqual(len(sink.calls), 1,
+                             "sink write should not be delayed by the gate")
+            self.assertEqual(fire_count[0], 0,
+                             "wake must not fire inline when settle > 0")
+            self.assertTrue(any(t.is_alive() for t in b._pending_timers))
+            self.assertTrue(fire_event.wait(timeout=20.0),
+                            "wake never fired after settle window")
+            self.assertEqual(fire_count[0], 1)
+        finally:
+            b.stop()
+
+    def test_stop_cancels_pending_timers(self):
+        """Pending timers must NOT fire after stop() — otherwise they
+        could ping the uploader after teardown."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=0.1, ft_settle_sec=30.0)
+        fired = threading.Event()
+        b.set_wake_callback(lambda: fired.set())
+        b.add(("260518", "1430"), "20", [_make_spot()], radiod_id="rx")
+        time.sleep(0.3)
+        self.assertTrue(any(t.is_alive() for t in b._pending_timers))
+        b.stop()
+        time.sleep(0.1)
+        self.assertFalse(any(t.is_alive() for t in b._pending_timers))
+        self.assertFalse(fired.is_set())
+
+
+class TestFtSettleHelpers(unittest.TestCase):
+    """Pure-function tests for the gate's two arithmetic helpers."""
+
+    def test_resolve_env_default_zero(self):
+        from wspr_recorder.spot_sink import _resolve_ft_settle_sec
+        self.assertEqual(_resolve_ft_settle_sec(env={}), 0.0)
+
+    def test_resolve_env_parses_positive(self):
+        from wspr_recorder.spot_sink import _resolve_ft_settle_sec
+        self.assertEqual(
+            _resolve_ft_settle_sec(env={"WSPRDAEMON_TAR_FT_SETTLE_SEC": "5"}),
+            5.0,
+        )
+
+    def test_resolve_env_negative_falls_back_to_zero(self):
+        from wspr_recorder.spot_sink import _resolve_ft_settle_sec
+        self.assertEqual(
+            _resolve_ft_settle_sec(env={"WSPRDAEMON_TAR_FT_SETTLE_SEC": "-3"}),
+            0.0,
+        )
+
+    def test_resolve_env_garbage_falls_back_to_zero(self):
+        from wspr_recorder.spot_sink import _resolve_ft_settle_sec
+        self.assertEqual(
+            _resolve_ft_settle_sec(env={"WSPRDAEMON_TAR_FT_SETTLE_SEC": "soon"}),
+            0.0,
+        )
+
+    def test_seconds_to_next_15s_boundary(self):
+        from wspr_recorder.spot_sink import _seconds_to_next_15s_boundary
+        self.assertEqual(_seconds_to_next_15s_boundary(0.0), 15.0)
+        self.assertAlmostEqual(_seconds_to_next_15s_boundary(1.0), 14.0, places=3)
+        self.assertAlmostEqual(_seconds_to_next_15s_boundary(14.9), 0.1, places=3)
+        self.assertEqual(_seconds_to_next_15s_boundary(15.0), 15.0)
+
+
 if __name__ == "__main__":
     unittest.main()
