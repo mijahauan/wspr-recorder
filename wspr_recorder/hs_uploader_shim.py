@@ -584,6 +584,21 @@ class WsprUploaderHs:
                 tar_compression,
             )
             tar_compression = "bz2"
+        # Tar-root knob — pairs with WSPRDAEMON_TAR_COMPRESSION. The new
+        # ``wspr`` root is what every Phase 2 wd will accept, but old wd
+        # processes only look under ``wsprdaemon`` and would silently
+        # drop spots from a ``wspr/`` tar.  Default to ``wsprdaemon``
+        # during rollout — flip to ``wspr`` once every wd has been
+        # restarted with the new wsprdaemon-server code.
+        tar_root = (
+            os.environ.get("WSPRDAEMON_TAR_ROOT", "wsprdaemon").strip().lower()
+        )
+        if tar_root not in ("wspr", "wsprdaemon"):
+            logger.warning(
+                "WSPRDAEMON_TAR_ROOT=%r is not wspr/wsprdaemon; using wsprdaemon",
+                tar_root,
+            )
+            tar_root = "wsprdaemon"
         transport = WsprdaemonTarSftp(
             servers=[_server_host(s) for s in self._sftp_servers],
             spool_root=None,
@@ -598,6 +613,7 @@ class WsprUploaderHs:
             # "wspr.spots").
             primary_table_name="wspr.cycle",
             compression=tar_compression,
+            tar_root=tar_root,
         )
         pipeline = Pipeline(
             name=f"wsprdaemon-tar-{self._instance_name}",
