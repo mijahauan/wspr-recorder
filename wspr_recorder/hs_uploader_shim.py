@@ -693,6 +693,9 @@ def _server_host(server_spec: str) -> str:
     return server_spec
 
 
+_HASH_UNRESOLVED = "<...>"
+
+
 def _record_to_spot_key(record):
     """Render an hs-uploader ``Record`` into the audit table's SpotKey
     tuple ``(time_iso, tx_sign_upper, freq_hz_int)``.
@@ -700,6 +703,15 @@ def _record_to_spot_key(record):
     Returns ``None`` if the record is missing fields the audit can't
     work without — caller filters those out so we don't pollute the
     table with rows whose primary key can't be reconstructed.
+
+    Also returns ``None`` for records the wsprnet transport itself
+    filters out (the hash-unresolved ``<...>`` placeholder).  Without
+    this the audit would record them as "uploaded" — they'd sit
+    ``in_flight`` forever and eventually flip to ``lost`` — even
+    though wsprnet never actually received them.  The transport's
+    ``_record_to_mept`` returns ``None`` for the same callsigns
+    (hs-uploader/transports/wsprnet.py around the
+    ``_HASH_UNRESOLVED`` check), so we mirror that filter here.
 
     Two row shapes appear in practice:
       * v2 sink.db rows: ``columns['callsign']``, ``columns['frequency_hz']``
@@ -713,6 +725,10 @@ def _record_to_spot_key(record):
     if freq is None:
         freq = cols.get("frequency")
     if not tx or freq is None:
+        return None
+    if str(tx).strip() == _HASH_UNRESOLVED:
+        # Mirror the transport's filter — the spot never crosses the
+        # wire to wsprnet, so it'd be a lie to call it "uploaded".
         return None
     try:
         freq_hz = int(freq)
