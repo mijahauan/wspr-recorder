@@ -643,6 +643,17 @@ class WsprUploaderHs:
                 "wspr-uploader-hs: wsprnet batch size capped at %d",
                 batch_size,
             )
+        # When batches are tiny (per-spot diagnostic mode), unblock
+        # the orchestrator's default "one batch per pump-pass" cap —
+        # otherwise we'd ship one spot per ~60 s pump while decoding
+        # ~25 spots/min, and the local queue would grow without
+        # bound.  Budget = 200 records lets the pump drain a typical
+        # 2-min cycle's worth (~50 spots/instance) plus the next
+        # cycle's lookahead while staying bounded.
+        if batch_size < 50:
+            max_per_pump = 200
+        else:
+            max_per_pump = None  # historical one-batch-per-pump
         pipeline = Pipeline(
             name=f"wsprnet-{self._instance_name}",
             source=source,
@@ -654,6 +665,7 @@ class WsprUploaderHs:
             # transport's POST cap (the per-batch chunker handles
             # smaller, but a higher orchestrator cap is pointless).
             batch_limit=max(1, min(900, batch_size)),
+            max_records_per_pump=max_per_pump,
         )
         return (pipeline, transport)
 
