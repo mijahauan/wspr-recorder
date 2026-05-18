@@ -569,6 +569,21 @@ class WsprUploaderHs:
         fallback_ftp = self._build_wsprdaemon_ftp_fallback(
             spool_root=None, receiver=receiver,
         )
+        # Compression knob — defaults to bz2 during the Phase 2 rollout
+        # so a producer can ship the new tar layout while the
+        # wsprdaemon-server processes on wd{10,20,30} are still on a
+        # pre-zstd-sniff build (it'd ReadError zstd payloads).
+        # Flip to ``zstd`` once every wd has been redeployed and we've
+        # confirmed it sniffs both formats.
+        tar_compression = (
+            os.environ.get("WSPRDAEMON_TAR_COMPRESSION", "bz2").strip().lower()
+        )
+        if tar_compression not in ("bz2", "zstd"):
+            logger.warning(
+                "WSPRDAEMON_TAR_COMPRESSION=%r is not bz2/zstd; using bz2",
+                tar_compression,
+            )
+            tar_compression = "bz2"
         transport = WsprdaemonTarSftp(
             servers=[_server_host(s) for s in self._sftp_servers],
             spool_root=None,
@@ -582,6 +597,7 @@ class WsprUploaderHs:
             # still uses SqliteSource on wspr.spots, watermark key
             # "wspr.spots").
             primary_table_name="wspr.cycle",
+            compression=tar_compression,
         )
         pipeline = Pipeline(
             name=f"wsprdaemon-tar-{self._instance_name}",
