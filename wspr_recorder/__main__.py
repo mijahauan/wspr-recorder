@@ -99,7 +99,11 @@ class WsprRecorder:
         # band_name -> DecoderRunner; lazily built on first decode for
         # a given band so we don't pay the work_dir/hashtable setup
         # cost on bands with no slots completed yet.
-        self._decoders: Dict[str, DecoderRunner] = {}
+        # Keyed by (rx_source, band_name).  Each source gets its own
+        # DecoderRunner (and therefore its own ``.phase2`` work_dir +
+        # hashtable.txt) — wsprd subprocesses across sources must not
+        # share working state (multi-RX888 plan, phase 3c).
+        self._decoders: Dict[Tuple[str, str], DecoderRunner] = {}
 
         # Thread pool for WAV writes + per-period decoder dispatch
         # (wsprd / jt9 subprocesses are spawned from inside this pool
@@ -320,24 +324,50 @@ class WsprRecorder:
             wsprd_spread = shutil.which("wsprd.spreading")
         return wsprd_path, wsprd_spread, jt9_path
 
-    def _resolve_decoder(self, band_name: str, frequency_hz: int) -> Optional[DecoderRunner]:
-        """Get-or-build a DecoderRunner for one band.
+    def _resolve_decoder(
+        self,
+        band_name: str,
+        frequency_hz: int,
+        rx_source: str = "",
+    ) -> Optional[DecoderRunner]:
+        """Get-or-build a DecoderRunner for one (source, band) pair.
 
-        Per-band working directory is `<output_dir>/<band>/.phase2/`
-        — a hidden subdir under the band's WAV recording dir, kept
-        separate from the legacy `wd-decode@*` chain's ALL_WSPR.TXT /
-        hashtable.txt artefacts so the two pipelines can run side-by-
-        side during the dual-write observation window without one
-        clobbering the other's state.  When Phase 4 retires the bash
-        chain, the `.phase2` segment can be dropped.
+        Per-(source, band) working directory is
+        ``<output_dir>/<source-slug>/<band>/.phase2/`` — a hidden
+        subdir under the band's WAV recording dir.  With multiple
+        sources tuned to the same band, each source needs its own
+        ``.phase2`` so concurrent wsprd subprocess invocations don't
+        share state files (hashtable.txt, ALL_WSPR.TXT, decdata, etc.)
+        and step on each other.
+
+        The directory is created if missing, but its CONTENTS are
+        never wiped by this module — wsprd populates and updates
+        hashtable.txt across runs and the operator's expectation
+        (recorded 2026-05-19) is that those accumulated files persist
+        across cycles.  Cleanup of stale ``*.wav`` files in
+        ``.phase2`` symlink form is the only mutation we perform; the
+        real persistent state files in there are untouchable.
+
+        When ``rx_source`` is empty (legacy single-source contexts,
+        tests), the work_dir falls back to ``<output_dir>/<band>/.phase2/``
+        — same path the recorder used pre-phase-3c.
         """
         if self.callsign_db is None or self.wav_writer is None:
             return None
-        runner = self._decoders.get(band_name)
+        cache_key = (rx_source, band_name)
+        runner = self._decoders.get(cache_key)
         if runner is not None:
             return runner
         wsprd_path, wsprd_spread, jt9_path = self._resolve_decoder_binaries()
-        work_dir = self.wav_writer.output_dir / band_name / ".phase2"
+        # Mirrors wav_writer.get_band_dir layout decision: with an
+        # rx_source the band lives under a per-source slug; without,
+        # the legacy flat layout.
+        from .wav_writer import source_slug as _slug
+        slug = _slug(rx_source)
+        if slug:
+            work_dir = self.wav_writer.output_dir / slug / band_name / ".phase2"
+        else:
+            work_dir = self.wav_writer.output_dir / band_name / ".phase2"
         work_dir.mkdir(parents=True, exist_ok=True)
         runner = DecoderRunner(
             band_name=band_name,
@@ -348,7 +378,7 @@ class WsprRecorder:
             wsprd_spread_path=wsprd_spread,
             jt9_path=jt9_path,
         )
-        self._decoders[band_name] = runner
+        self._decoders[cache_key] = runner
         return runner
 
     @staticmethod
@@ -400,7 +430,10 @@ class WsprRecorder:
         publish results to the SpotSink.  Per-mode failures are
         logged but don't propagate — one bad decode doesn't kill
         the rest of the cycle."""
-        runner = self._resolve_decoder(request.band_name, request.frequency_hz)
+        runner = self._resolve_decoder(
+            request.band_name, request.frequency_hz,
+            rx_source=request.rx_source,
+        )
         if runner is None:
             return
         # wsprd / jt9 both extract date+time from the WAV filename's

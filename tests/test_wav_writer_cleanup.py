@@ -248,3 +248,90 @@ def test_make_room_for_file_no_enoent_under_concurrent_cleanup(writer, tmp_path)
     finally:
         stop.set()
         t.join(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3c: per-source isolation
+# ---------------------------------------------------------------------------
+
+class TestSourceSlug:
+    """source_slug derives a filesystem-safe segment from a SourceConfig.key."""
+
+    def test_strips_radiod_prefix(self):
+        from wspr_recorder.wav_writer import source_slug
+        assert source_slug("radiod:bee1-status.local") == "bee1-status.local"
+
+    def test_strips_kiwisdr_prefix_and_replaces_colon(self):
+        from wspr_recorder.wav_writer import source_slug
+        assert source_slug("kiwisdr:192.168.1.20:8073") == "192.168.1.20-8073"
+
+    def test_strips_usb_prefix_and_collapses_colons(self):
+        from wspr_recorder.wav_writer import source_slug
+        assert source_slug("usb:0bda:2832:abc123") == "0bda-2832-abc123"
+
+    def test_empty_input_returns_empty(self):
+        from wspr_recorder.wav_writer import source_slug
+        assert source_slug("") == ""
+        assert source_slug(None or "") == ""
+
+    def test_unknown_chars_replaced_with_hyphen(self):
+        from wspr_recorder.wav_writer import source_slug
+        # Space + slash + parens → all hyphens
+        assert source_slug("radiod:host (a)/x") == "host--a--x"
+
+
+class TestPerSourceBandDir:
+    """get_band_dir routes through a per-source slug when rx_source is set."""
+
+    def test_no_rx_source_legacy_layout(self, writer, tmp_path):
+        d = writer.get_band_dir(14095600)  # rx_source default ""
+        assert d == tmp_path / "20"
+
+    def test_with_rx_source_nests_under_slug(self, writer, tmp_path):
+        d = writer.get_band_dir(14095600, rx_source="radiod:bee1-status.local")
+        assert d == tmp_path / "bee1-status.local" / "20"
+
+    def test_two_sources_get_disjoint_dirs(self, writer, tmp_path):
+        a = writer.get_band_dir(14095600, rx_source="radiod:host-a.local")
+        b = writer.get_band_dir(14095600, rx_source="radiod:host-b.local")
+        assert a != b
+        assert a.parent != b.parent
+
+
+class TestEnforceMaxFilesPerBandAcrossLayouts:
+    """enforce_max_files_per_band finds band dirs at depth 1 (legacy) and
+    depth 2 (per-source) and applies the cap to each independently."""
+
+    def test_finds_band_dirs_at_either_depth(self, writer, tmp_path):
+        legacy = tmp_path / "20"
+        legacy.mkdir()
+        for i in range(6):
+            (legacy / f"260519T{i:02d}00Z_14000000_usb_120.wav").touch()
+
+        source_a = tmp_path / "host-a.local" / "20"
+        source_a.mkdir(parents=True)
+        for i in range(7):
+            (source_a / f"260519T{i:02d}00Z_14000000_usb_120.wav").touch()
+
+        removed = writer.enforce_max_files_per_band(max_files=5)
+        # legacy: 6→5 = 1 removed; source_a: 7→5 = 2 removed
+        assert removed == 3
+        assert len(list(legacy.glob("*.wav"))) == 5
+        assert len(list(source_a.glob("*.wav"))) == 5
+
+    def test_phase2_subdirs_not_treated_as_band_dirs(self, writer, tmp_path):
+        """Hidden ``.phase2`` subdirs hold wsprd's persistent state +
+        symlinks; never treat them as band dirs to enforce against."""
+        band = tmp_path / "host-a.local" / "20"
+        phase2 = band / ".phase2"
+        phase2.mkdir(parents=True)
+        # 10 symlinks in .phase2 — must not get capped
+        for i in range(10):
+            (phase2 / f"260519_{i:04d}.wav").touch()
+        # 3 real WAVs in the band dir — below cap, also untouched
+        for i in range(3):
+            (band / f"260519T{i:02d}00Z_14000000_usb_120.wav").touch()
+
+        removed = writer.enforce_max_files_per_band(max_files=5)
+        assert removed == 0
+        assert len(list(phase2.glob("*.wav"))) == 10

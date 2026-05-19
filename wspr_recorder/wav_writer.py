@@ -21,6 +21,38 @@ from .config import freq_to_band_name
 logger = logging.getLogger(__name__)
 
 
+def source_slug(rx_source: str) -> str:
+    """Filesystem-safe path segment derived from a SourceConfig.key.
+
+    Used to isolate WAV output and wsprd ``.phase2`` working dirs per
+    source, so two radiods serving the same band don't clobber each
+    other's files / hashtables (multi-RX888 plan, phase 3c).
+
+    Strips the well-known type prefix (``radiod:``, ``kiwisdr:``,
+    ``usb:``) for readability and replaces any non-portable character
+    with ``-``.  An empty / falsy input returns the empty string —
+    callers treat that as "legacy single-source layout, no source
+    level in the path".
+
+    Examples:
+      ``radiod:bee1-status.local``      → ``bee1-status.local``
+      ``kiwisdr:192.168.1.20:8073``     → ``192.168.1.20-8073``
+      ``usb:0bda:2832:abc123``          → ``0bda-2832-abc123``
+    """
+    import re as _re
+    if not rx_source:
+        return ""
+    s = rx_source
+    for prefix in ("radiod:", "kiwisdr:", "usb:"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    # Keep alphanumeric, dot, hyphen, underscore.  Everything else
+    # (colons in IP:port, slashes, whitespace) collapses to a hyphen
+    # so the result is safe on every supported filesystem.
+    return _re.sub(r"[^A-Za-z0-9._-]", "-", s)
+
+
 def _safe_sorted_by_mtime(paths) -> List[Path]:
     """Sort ``paths`` by mtime ascending, tolerating concurrent unlinks.
 
@@ -181,10 +213,27 @@ class WavWriter:
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
     
-    def get_band_dir(self, frequency_hz: int) -> Path:
-        """Get output directory for a band."""
+    def get_band_dir(self, frequency_hz: int, rx_source: str = "") -> Path:
+        """Get output directory for a band, optionally namespaced per
+        source.
+
+        With multiple sources tuned to the same band, both would write
+        identical filenames (timestamp + freq + period) into the same
+        band_dir and stomp on each other's WAVs and ``.phase2``
+        hashtables.  When ``rx_source`` is supplied, the path becomes
+        ``output_dir/<source-slug>/<band>/`` so each source has its
+        own ``.phase2`` namespace alongside its own WAVs.
+
+        Empty ``rx_source`` keeps the legacy ``output_dir/<band>/``
+        layout — used by tests that don't care about source isolation
+        and by the wsprdaemon-client compat shim.
+        """
         band_name = freq_to_band_name(frequency_hz)
-        band_dir = self.output_dir / band_name
+        slug = source_slug(rx_source)
+        if slug:
+            band_dir = self.output_dir / slug / band_name
+        else:
+            band_dir = self.output_dir / band_name
         band_dir.mkdir(parents=True, exist_ok=True)
         return band_dir
     
@@ -328,9 +377,14 @@ class WavWriter:
             Path to written WAV file, or None on error
         """
         try:
-            self.make_room_for_file(request.frequency_hz, max_files_per_band)
+            self.make_room_for_file(
+                request.frequency_hz, max_files_per_band,
+                rx_source=request.rx_source,
+            )
 
-            band_dir = self.get_band_dir(request.frequency_hz)
+            band_dir = self.get_band_dir(
+                request.frequency_hz, rx_source=request.rx_source,
+            )
             filename = generate_period_wav_filename(
                 request.frequency_hz, request.start_wallclock, request.period_seconds,
             )
@@ -557,6 +611,14 @@ class WavWriter:
         Deletes oldest files first to make room for new ones.
         This prevents filling up /dev/shm if wsprdaemon stops processing.
 
+        Works with both layouts simultaneously: the legacy
+        ``output_dir/<band>/`` and the per-source
+        ``output_dir/<source-slug>/<band>/`` introduced in phase 3c.
+        A "band directory" is identified as *any* directory that
+        contains ``.wav`` files directly (no recursion into
+        ``.phase2``-style subdirs), so the same cap applies regardless
+        of how many sources are configured.
+
         Args:
             max_files: Maximum WAV files per band directory (default: 35)
 
@@ -565,11 +627,24 @@ class WavWriter:
         """
         removed_count = 0
 
-        # Find all band subdirectories
-        for band_dir in self.output_dir.iterdir():
-            if not band_dir.is_dir():
+        # Walk every directory under output_dir.  A band directory is
+        # any directory whose direct children include a ``.wav`` file.
+        # Hidden subdirs like ``.phase2`` aren't band dirs because
+        # their ``*.wav`` entries are symlinks living under a band
+        # dir's ``.phase2`` — not directly under the band dir itself.
+        # We exclude dotted names to keep that contract.
+        band_dirs: List[Path] = []
+        for d in self.output_dir.rglob("*"):
+            if not d.is_dir():
                 continue
+            if d.name.startswith("."):
+                continue
+            # Cheap test: any direct *.wav child?  Stop iteration as
+            # soon as one is found.
+            if any(True for _ in d.glob("*.wav")):
+                band_dirs.append(d)
 
+        for band_dir in band_dirs:
             # Snapshot (path, mtime) up front instead of letting the
             # ``key=`` callback stat lazily during sort.  A concurrent
             # ``make_room_for_file`` / ``cleanup_old_files`` running in
@@ -583,8 +658,12 @@ class WavWriter:
             # Remove oldest files if over limit
             files_to_remove = len(wav_files) - max_files
             if files_to_remove > 0:
+                try:
+                    label = str(band_dir.relative_to(self.output_dir))
+                except ValueError:
+                    label = band_dir.name
                 logger.warning(
-                    f"{band_dir.name}: {len(wav_files)} files exceeds limit of {max_files}, "
+                    f"{label}: {len(wav_files)} files exceeds limit of {max_files}, "
                     f"removing {files_to_remove} oldest"
                 )
                 
@@ -608,17 +687,26 @@ class WavWriter:
         
         return removed_count
     
-    def make_room_for_file(self, frequency_hz: int, max_files: int = 35) -> None:
+    def make_room_for_file(
+        self,
+        frequency_hz: int,
+        max_files: int = 35,
+        *,
+        rx_source: str = "",
+    ) -> None:
         """
         Ensure there's room for a new file in the band directory.
 
-        Call this BEFORE writing a new file to guarantee we never exceed max_files.
+        Call this BEFORE writing a new file to guarantee we never exceed
+        max_files.  When ``rx_source`` is set, scope to that source's
+        ``<output_dir>/<slug>/<band>/`` so deletions don't span sources.
 
         Args:
             frequency_hz: Frequency of the band to check
             max_files: Maximum files allowed (default: 35)
+            rx_source: Source identifier for per-source band-dir
         """
-        band_dir = self.get_band_dir(frequency_hz)
+        band_dir = self.get_band_dir(frequency_hz, rx_source=rx_source)
 
         # Race-tolerant snapshot: see enforce_max_files_per_band for
         # the rationale (Task #31).
