@@ -894,6 +894,15 @@ class WsprUploaderHs:
                 # pipeline.  `smd storage trim` (24h wspr retention)
                 # is the cleanup mechanism.
                 delete_on_commit=False,
+                # Multi-RX888 dedup: when two receivers see the same
+                # spot, ship only the max-SNR version to wsprnet (its
+                # central database doesn't want duplicates and silently
+                # rejects them).  The same rows stay in the queue for
+                # the wsprdaemon-tar pipeline below, whose SqliteSource
+                # does NOT set these dedup params and therefore sees
+                # every receiver's row (diversity tier).
+                dedup_partition_by=('time', 'callsign', 'frequency_hz'),
+                dedup_order_by_desc='snr_db',
             )
             if sqlite_source.health() != HEALTH_NOOP:
                 logger.info(
