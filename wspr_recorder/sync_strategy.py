@@ -65,6 +65,17 @@ class SyncStrategy(ABC):
     def on_minute_started(self, rtp_timestamp: int, wall_clock: datetime) -> None:
         """Called after the recorder begins filling a new minute buffer."""
 
+    def reset(self) -> None:
+        """Reset to fresh-startup state — forget any cached RTP↔UTC
+        correlation.  Override in subclasses that track state.
+
+        Called by ``BandRecorder.reset()`` on a radiod-stream-restored
+        event.  After reset, the strategy must re-correlate against the
+        first incoming RTP timestamp, which may live in a completely
+        different 32-bit value space than before (radiod restarts its
+        RTP counter on every launch).
+        """
+
 
 # =============================================================================
 # RTP-based sync (L5/L6 — GPSDO/PPS-locked radiod)
@@ -254,6 +265,27 @@ class RtpSyncStrategy(SyncStrategy):
                 f"RtpSync: next boundary at unwrapped={self._next_boundary} "
                 f"({self._next_minute.strftime('%H:%M')}Z +60s)"
             )
+
+    def reset(self) -> None:
+        """Forget the RTP↔UTC correlation so it re-runs on the next packet.
+
+        The 32-bit unwrap state (``_last_raw``, ``_unwrapped``) is also
+        cleared.  Critical: radiod reinitializes its RTP counter on
+        restart, so the new RTP space lives in a different absolute
+        range from before — letting the old _unwrapped value persist
+        would treat the new timestamps as a multi-million-sample
+        backward jump, poisoning ``_next_boundary`` math forever.
+        Discovered B4-100 2026-05-14 (commit message that introduced
+        the os._exit(75) workaround); re-rooted 2026-05-19 by inspecting
+        ``_correlated`` left True across BandRecorder.reset().
+        """
+        self._correlated = False
+        self._correlation_source = None
+        self._correlation_offset_ns = None
+        self._next_boundary = None
+        self._next_minute = None
+        self._last_raw = None
+        self._unwrapped = 0
 
 
 # =============================================================================

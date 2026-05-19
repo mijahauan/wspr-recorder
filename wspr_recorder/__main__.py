@@ -162,30 +162,45 @@ class WsprRecorder:
             # 15s) of silence + successful ensure_channel() — a real
             # radiod restart, not a transient packet hiccup.
             #
-            # Empirically (B4-100 2026-05-14) an in-place reset of the
-            # BandRecorder + sync_strategy isn't sufficient: bands
-            # produce full-size WAVs after re-sync but wsprd decodes
-            # zero spots, because the partial samples accumulated
-            # mid-outage leave the ring buffer's minute alignment off
-            # by an unknowable offset.  A fresh process restart syncs
-            # cleanly on the next minute boundary and decoding resumes
-            # in the following cycle, so trade the heavier-hammer
-            # restart for guaranteed correct timing.  Systemd's
-            # ``Restart=always`` (already set on wd-ka9q-record@) brings
-            # us back within RestartSec=5.
+            # 2026-05-14: in-place recovery was attempted and produced
+            # full-size WAVs that wsprd rejected as cycle-unaligned, so
+            # the bail-out below switched to os._exit(75) (costs 2-4 WSPR
+            # cycles per radiod cascade plus a process restart).
+            #
+            # 2026-05-19: root-caused — the prior reset cleared the
+            # BandRecorder and recreated the ring buffer, but
+            # ``RtpSyncStrategy`` retained its correlation cache
+            # (``_correlated``, ``_last_raw``, ``_unwrapped``,
+            # ``_next_boundary``).  radiod reinitializes its RTP counter
+            # on restart, so the stale correlation mapped the new RTP
+            # space against the old anchor and the next-minute math
+            # landed at a non-UTC-aligned phase offset.
+            # ``BandRecorder.reset()`` now also calls
+            # ``self.sync_strategy.reset()`` (added 2026-05-19), so
+            # in-place recovery produces clean UTC-aligned WAVs and we
+            # match v3 bash wsprdaemon-client's zero-cycle-loss
+            # behavior.  Lost time: ~30-60 s waiting for the next clean
+            # UTC minute boundary, vs 4+ min on the os._exit path.
             logger.warning(
                 f"{channel_state.band_name}: Stream restored after "
-                f"radiod outage — exiting so systemd can restart us for "
-                f"a clean re-sync (in-place recovery produces "
-                f"timing-misaligned WAVs that wsprd rejects)"
+                f"radiod outage — resetting recorder + sync_strategy "
+                f"in place (waiting for next UTC minute boundary to "
+                f"resume decoding)"
             )
             channel_state.restore_count += 1
-            # Exit code 75 = EX_TEMPFAIL (transient failure, please retry).
-            # os._exit bypasses Python finalizers — necessary because we
-            # may be inside a MultiStream callback thread holding locks
-            # that sys.exit's normal teardown would deadlock on.
-            import os as _os
-            _os._exit(75)
+            try:
+                recorder.reset()
+            except Exception:
+                # Fallback to the legacy process-exit path if anything
+                # goes wrong in the in-place reset — os._exit(75) leaves
+                # systemd to respawn us, which is the prior known-safe
+                # state.
+                logger.exception(
+                    f"{channel_state.band_name}: recorder.reset() raised; "
+                    f"falling back to process exit so systemd respawns"
+                )
+                import os as _os
+                _os._exit(75)
 
         return ChannelSink(
             on_samples=on_samples,

@@ -126,6 +126,35 @@ class RingBuffer:
         """Attach a gap event to the current (incomplete) minute."""
         self._current_minute_gaps.append(gap)
 
+    def clear(self) -> None:
+        """Reset the ring to a fresh state — no samples, no minute marks.
+
+        Used by ``BandRecorder.reset()`` when a radiod-stream-restored
+        event tells us to throw away the partial-cycle state and
+        re-sync against the next clean UTC minute boundary.
+
+        Does NOT reallocate the underlying numpy array (just zeroes it
+        for cleanliness), so the cgroup memory footprint stays stable.
+
+        Why this matters: before the 2026-05-19 fix, ``BandRecorder.reset()``
+        existed but didn't touch the ring's per-minute counters.  Partial
+        samples accumulated mid-outage stayed in
+        ``_current_minute_sample_count``; the next stream restoration
+        appended fresh samples on top and the eventual "minute boundary"
+        landed at an arbitrary phase offset from UTC minute — wsprd
+        rejects those WAVs as cycle-unaligned.  Hence the previous
+        os._exit(75) workaround.  Properly clearing the ring on restore
+        lets in-place recovery match v3 bash wsprdaemon-client's
+        zero-cycle-loss behavior.
+        """
+        self._samples.fill(0.0)
+        self._write_pos = 0
+        self._absolute_sample_count = 0
+        self._current_minute_start_pos = 0
+        self._current_minute_sample_count = 0
+        self._current_minute_gaps = []
+        self._minute_marks.clear()
+
     def close_minute(self, wallclock: datetime, rtp_timestamp: int) -> None:
         """
         Called at each minute boundary after samples_per_minute samples

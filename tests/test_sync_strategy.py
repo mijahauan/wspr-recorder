@@ -270,3 +270,81 @@ class TestRtpSyncStrategyWithAuthority:
         for i in range(5):
             strategy.should_start_minute(100_000 + i * 240, 240, utc(second=58))
         assert calls["n"] == 1  # only the first packet triggers correlation
+
+
+class TestRtpSyncStrategyReset:
+    """Phase 2 fix 2026-05-19: RtpSyncStrategy.reset() forgets stale correlation.
+
+    On a radiod-stream-restored event, the new stream starts in a different
+    RTP-timestamp space than the pre-outage stream.  If we don't reset the
+    correlation cache, the strategy thinks it already knows the RTP↔UTC
+    mapping and projects nonsense — producing minute boundaries at random
+    phase offsets from UTC.  wsprd then rejects the WAVs as cycle-misaligned.
+
+    Before the fix, BandRecorder.reset() recreated the ring buffer but
+    left sync_strategy._correlated=True, which is why in-place recovery
+    didn't work and the previous workaround was os._exit(75) to let
+    systemd re-spawn with fresh state.
+    """
+
+    def test_reset_clears_correlation(self):
+        strategy = RtpSyncStrategy(
+            SAMPLE_RATE,
+            authority_reader=_FakeReader(_FakeSnap(offset_usable=True, offset_ns=999)),
+        )
+        # Establish correlation
+        strategy.should_start_minute(100_000, 240, utc(second=58))
+        assert strategy.correlation_source == "authority"
+        assert strategy.correlation_offset_ns == 999
+
+        strategy.reset()
+        # All correlation state forgotten
+        assert strategy.correlation_source is None
+        assert strategy.correlation_offset_ns is None
+
+    def test_reset_allows_fresh_correlation_in_new_rtp_space(self):
+        """After reset, a brand-new RTP timestamp is treated as the first
+        packet — re-correlated against the (new) wall clock."""
+        strategy = RtpSyncStrategy(SAMPLE_RATE)
+        # Pre-outage: correlate near old RTP timestamps
+        strategy.should_start_minute(100_000, 240, utc(second=58))
+        old_boundary = strategy._next_boundary
+        assert strategy.correlation_source == "wall_clock"
+        assert old_boundary is not None
+
+        strategy.reset()
+        assert strategy.correlation_source is None
+        assert strategy._next_boundary is None
+
+        # Post-outage: huge RTP-timestamp jump (typical when radiod restarts).
+        # Without reset, the strategy's unwrap counter would have stale state
+        # and projection would be off by hours.  After reset, the new RTP
+        # timestamp is the new t=0.
+        new_rtp_base = 8_000_000_000
+        strategy.should_start_minute(new_rtp_base, 240, utc(hour=1, second=58))
+        assert strategy.correlation_source == "wall_clock"
+        # The projected next boundary must be in the *new* RTP space —
+        # near new_rtp_base, not anywhere near the pre-reset projection
+        # which was anchored at rtp_ts=100_000.
+        assert strategy._next_boundary is not None
+        assert abs(strategy._next_boundary - new_rtp_base) < SAMPLE_RATE * 60
+
+    def test_reset_resets_unwrap_state(self):
+        """RTP timestamps unwrap; reset must clear that counter so a new
+        stream's small timestamps aren't treated as 'wrapped' continuations
+        of the old stream's large ones."""
+        strategy = RtpSyncStrategy(SAMPLE_RATE)
+        strategy.should_start_minute(4_000_000_000, 240, utc(second=58))
+        # Force an unwrap by sending a smaller timestamp (simulates wrap)
+        strategy.should_start_minute(100, 240, utc(second=59))
+        unwrapped_before = strategy._unwrapped
+
+        strategy.reset()
+        assert strategy._unwrapped == 0
+        assert strategy._last_raw is None
+
+    def test_base_class_reset_is_noop_safe(self):
+        """ClockSyncStrategy and FallbackSyncStrategy inherit a base reset()
+        that should not raise even though they have no correlation cache."""
+        ClockSyncStrategy(SAMPLE_RATE).reset()
+        FallbackSyncStrategy(SAMPLE_RATE).reset()

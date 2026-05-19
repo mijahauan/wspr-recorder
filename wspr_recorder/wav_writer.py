@@ -458,38 +458,61 @@ class WavWriter:
     def cleanup_old_files(self, max_age_minutes: int = 35) -> int:
         """
         Remove WAV files older than max_age_minutes.
-        
+
         Args:
             max_age_minutes: Maximum file age in minutes
-            
+
         Returns:
             Number of files removed
+
+        Handles broken symlinks specifically: ``.phase2/<YYMMDD_HHMM>.wav``
+        is a symlink to the parent band-dir WAV.  When the parent WAV
+        gets unlinked by ``enforce_max_files_per_band``, this symlink
+        becomes broken — ``stat()`` then raises FileNotFoundError and
+        the old code's blanket ``except`` left the symlink behind
+        forever (observed B4-100 2026-05-18: 27K orphan symlinks
+        consuming a directory of inodes).  Use ``lstat()`` so symlink
+        metadata is inspected, not the (possibly missing) target.
         """
         import time
-        
+
         removed_count = 0
         cutoff_time = time.time() - (max_age_minutes * 60)
-        
+
         for wav_path in self.output_dir.rglob("*.wav"):
             try:
-                if wav_path.stat().st_mtime < cutoff_time:
-                    # Remove WAV file
-                    wav_path.unlink()
+                # lstat() does NOT follow symlinks, so broken symlinks
+                # don't error out — they get unlinked just like regular
+                # files.  For a live symlink, lstat reports the link's
+                # own mtime (which is when wsprd created it pointing
+                # at the parent WAV), so age-based cleanup still works.
+                #
+                # Also unconditionally remove broken symlinks regardless
+                # of age — there's no scenario where keeping a broken
+                # symlink helps (no consumer can read it).
+                is_broken = wav_path.is_symlink() and not wav_path.exists()
+                if is_broken or wav_path.lstat().st_mtime < cutoff_time:
+                    # Use unlink(missing_ok=False) defensively; if the
+                    # entry vanished between rglob() and now (another
+                    # cleanup pass, manual rm), missing_ok=True swallows
+                    # the race.
+                    wav_path.unlink(missing_ok=True)
                     removed_count += 1
-                    
-                    # Remove JSON sidecar if exists
+
+                    # Remove JSON sidecar if exists (only meaningful for
+                    # real WAVs, not symlinks — but cheap to check)
                     json_path = wav_path.with_suffix('.json')
                     if json_path.exists():
                         json_path.unlink()
-                    
+
                     logger.debug(f"Removed old file: {wav_path.name}")
-                    
+
             except Exception as e:
                 logger.warning(f"Failed to remove {wav_path}: {e}")
-        
+
         if removed_count > 0:
             logger.info(f"Cleaned up {removed_count} old WAV files")
-        
+
         return removed_count
     
     def enforce_max_files_per_band(self, max_files: int = 35) -> int:

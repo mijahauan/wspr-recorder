@@ -306,3 +306,51 @@ class TestToDict:
         assert d["minutes_available"] == 0
         assert d["current_minute_samples"] == 0
         assert d["memory_bytes"] == 2 * RATE * 60 * 4  # 2 min * float32
+
+
+class TestClear:
+    """Phase 2 fix 2026-05-19: RingBuffer.clear() resets state in place.
+
+    Used by BandRecorder.reset() on radiod-stream-restored so partial
+    mid-cycle samples don't poison the post-restore minute alignment.
+    """
+
+    def test_clear_resets_partial_minute(self):
+        ring = RingBuffer(capacity_seconds=120, sample_rate=RATE)
+        # Write 1/4 of a minute — simulating partial cycle interrupted
+        # by a radiod outage
+        partial = np.ones(RATE * 15, dtype=np.float32)
+        ring.write_samples(partial)
+        assert ring.current_minute_sample_count == RATE * 15
+
+        ring.clear()
+        assert ring.current_minute_sample_count == 0
+        assert ring.minutes_available == 0
+        assert ring._write_pos == 0
+        assert ring._absolute_sample_count == 0
+
+    def test_clear_discards_completed_minute_marks(self):
+        ring = RingBuffer(capacity_seconds=240, sample_rate=RATE)
+        # Fill one full minute
+        ring.write_samples(np.ones(RATE * 60, dtype=np.float32))
+        ring.close_minute(make_wallclock(1), 0)
+        assert ring.minutes_available == 1
+
+        ring.clear()
+        assert ring.minutes_available == 0
+
+    def test_clear_allows_fresh_minute_after(self):
+        ring = RingBuffer(capacity_seconds=120, sample_rate=RATE)
+        ring.write_samples(np.ones(RATE * 30, dtype=np.float32))
+        ring.clear()
+
+        # After clear, a full minute write should close cleanly
+        ring.write_samples(np.full(RATE * 60, 7, dtype=np.float32))
+        assert ring.current_minute_sample_count == RATE * 60
+        ring.close_minute(make_wallclock(1), 0)
+        assert ring.minutes_available == 1
+
+        out, _, _, _ = ring.extract_slice(1)
+        assert np.all(out == 7)
+        # The "1 minute" extracted is purely post-clear samples (all 7s),
+        # not contaminated by the pre-clear 30s of 1s.

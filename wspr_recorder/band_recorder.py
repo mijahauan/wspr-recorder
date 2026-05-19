@@ -358,12 +358,36 @@ class BandRecorder:
         return stats
 
     def reset(self) -> None:
-        """Reset recorder state."""
+        """Reset recorder state — used on radiod-stream-restored.
+
+        Three pieces of state must clear to recover cleanly:
+
+          1. The recorder's own minute counter + sync flags (lines below).
+          2. The ring buffer (recreated fresh below; or, equivalently,
+             ``self._ring.clear()`` if we wanted to avoid the realloc).
+          3. The sync strategy's RTP↔UTC correlation cache — radiod
+             reinitializes its RTP timestamp counter on restart, so the
+             pre-restart correlation no longer maps the new RTP space.
+
+        Before 2026-05-19 only (1) and (2) were reset; (3) was leaking
+        ``_correlated = True`` across the restart, so the new RTP samples
+        landed at an arbitrary phase offset from UTC minute and wsprd
+        rejected the resulting WAVs as cycle-unaligned.  The 2026-05-14
+        ``os._exit(75)`` workaround in __main__.py was tolerating this
+        bug; with sync_strategy.reset() added, in-place recovery now
+        produces clean WAVs and we can match v3 bash wsprdaemon-client's
+        zero-cycle-loss behavior.
+        """
         self._initialized = False
         self._synced = False
         self._minute_count = 0
         self._first_wallclock = None
         self._first_rtp_timestamp = None
+
+        # Clear the sync strategy's RTP↔UTC correlation cache so the
+        # next packet's RTP timestamp re-correlates against the new
+        # radiod's counter space.  No-op for stateless strategies.
+        self.sync_strategy.reset()
 
         from .ring_buffer import RingBuffer
         capacity = max_period_seconds(self._decode_modes) + 120

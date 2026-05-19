@@ -86,6 +86,9 @@ class FakeSync:
     def on_minute_started(self, rtp_ts, wall_clock):
         pass
 
+    def reset(self):
+        self._triggered = False
+
 
 class TestBasicMinuteBoundary:
     def test_w2_fires_at_even_minute(self):
@@ -338,3 +341,77 @@ class TestGetStats:
         assert "decode_modes" in stats
         assert stats["decode_modes"] == ["W2", "F5"]
         assert stats["synced"] is False
+
+
+class TestBandRecorderReset:
+    """Phase 2 fix 2026-05-19: BandRecorder.reset() does in-place recovery
+    after a radiod-stream-restored event, replacing the os._exit(75)
+    workaround that lost 2 WSPR cycles per cascade restart.
+
+    The reset must clear *every* layer of state that holds the old RTP
+    space — including the sync_strategy's correlation cache — otherwise
+    new RTP timestamps get mapped against stale offsets and the resulting
+    WAVs are cycle-misaligned.
+    """
+
+    def test_reset_clears_initialized_and_synced_flags(self):
+        sync = FakeSync(sample_rate=1200)
+        rec = BandRecorder(
+            ssrc=1, frequency_hz=14095600, band_name="20",
+            sample_rate=1200, decode_modes=[DecodeMode.W2],
+            on_period_complete=lambda r: None,
+            sync_strategy=sync,
+        )
+        # Feed enough samples to initialize and sync
+        feed_minutes(rec, 1, 1200)
+        # _initialized should be True after first packet
+        assert rec._initialized is True
+
+        rec.reset()
+        assert rec._initialized is False
+        assert rec._synced is False
+
+    def test_reset_recreates_ring_buffer(self):
+        sync = FakeSync(sample_rate=1200)
+        rec = BandRecorder(
+            ssrc=1, frequency_hz=14095600, band_name="20",
+            sample_rate=1200, decode_modes=[DecodeMode.W2],
+            on_period_complete=lambda r: None,
+            sync_strategy=sync,
+        )
+        feed_minutes(rec, 1, 1200)
+        old_ring = rec._ring
+        assert rec._ring.current_minute_sample_count > 0 or \
+               rec._ring.minutes_available > 0
+
+        rec.reset()
+        # Fresh ring — never the same object, never with samples
+        assert rec._ring is not old_ring
+        assert rec._ring.current_minute_sample_count == 0
+        assert rec._ring.minutes_available == 0
+
+    def test_reset_calls_sync_strategy_reset(self):
+        """The critical bug fix: sync_strategy state must be cleared."""
+        sync_resets = {"n": 0}
+
+        class CountingSync(FakeSync):
+            def reset(self_inner):
+                sync_resets["n"] += 1
+                self_inner._triggered = False
+
+        sync = CountingSync(sample_rate=1200)
+        rec = BandRecorder(
+            ssrc=1, frequency_hz=14095600, band_name="20",
+            sample_rate=1200, decode_modes=[DecodeMode.W2],
+            on_period_complete=lambda r: None,
+            sync_strategy=sync,
+        )
+        feed_minutes(rec, 1, 1200)
+        assert sync_resets["n"] == 0
+
+        rec.reset()
+        assert sync_resets["n"] == 1, (
+            "BandRecorder.reset() must call sync_strategy.reset() to clear "
+            "the RTP↔UTC correlation cache; otherwise in-place recovery from "
+            "a radiod-restart-cascade misaligns WSPR cycles."
+        )
