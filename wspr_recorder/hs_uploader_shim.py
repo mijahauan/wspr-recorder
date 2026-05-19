@@ -254,6 +254,22 @@ class WsprUploaderHs:
             pipelines.append(wsprd_pipe[0])
             self._transports.append(wsprd_pipe[1])
 
+        # --- pipeline 2b: PSK rows (FT8/FT4) → wsprdaemon-tar ---
+        # Gated by PSK_VIA_WSPRDAEMON_TAR=1.  When enabled, reads
+        # psk.spots from the local sink and ships via the same tar
+        # transport — server-side ingestion picks the rows up under
+        # ft8/ft4 peer subdirs and the gw1-elected pskreporter_forwarder
+        # re-posts to PSKReporter on behalf of any row tagged
+        # forward_to_pskreporter=True.  See psk-recorder's
+        # PSK_DELIVERY_MODE for how that flag is set per-row.
+        if os.environ.get("PSK_VIA_WSPRDAEMON_TAR", "0").strip() == "1":
+            psk_pipe = self._build_psk_tar_pipeline(
+                identity=identity, watermark=watermark,
+            )
+            if psk_pipe is not None:
+                pipelines.append(psk_pipe[0])
+                self._transports.append(psk_pipe[1])
+
         # --- pipeline 3: wsprnet.org via HTTP MEPT ---
         wsprnet_pipe = self._build_wsprnet_pipeline(
             identity=identity, watermark=watermark,
@@ -627,6 +643,116 @@ class WsprUploaderHs:
         logger.info(
             "wspr-uploader-hs: using WsprCycleSource for wsprdaemon "
             "(sink at %s)", self._sink_db,
+        )
+        return (pipeline, transport)
+
+    def _build_psk_tar_pipeline(self, *, identity, watermark):
+        """PSK rows → wsprdaemon-tar (Phase 2 PSK forwarding path).
+
+        Reads from sink.db's ``psk.spots`` queue (populated by
+        psk-recorder's ChTailer) and ships via WsprdaemonTarSftp.
+        The transport already accepts ``psk.spots: [2]`` and renders
+        rows as JSONL under ``ft8/`` / ``ft4/`` peer subdirs at tar
+        root.  Server-side ingestion (``WSPRDAEMON_INGEST_PSK=1`` on
+        wd) writes into ``psk.spots`` ClickHouse table; the
+        gw1-elected ``pskreporter_forwarder`` re-posts to PSKReporter
+        for rows tagged ``forward_to_pskreporter=True``.
+
+        Gated by ``PSK_VIA_WSPRDAEMON_TAR=1``.  Operator must also
+        confirm wd servers are running wsprdaemon-server >= 2.27.0
+        with ingest enabled; otherwise the rows pile up unused.
+        """
+        if not self._sftp_servers:
+            logger.info(
+                "wspr-uploader-hs: PSK_VIA_WSPRDAEMON_TAR set but "
+                "WD_SFTP_SERVERS unset — skipping psk pipeline"
+            )
+            return None
+        if not self._sink_db.exists():
+            logger.info(
+                "wspr-uploader-hs: PSK_VIA_WSPRDAEMON_TAR set but "
+                "sink.db not present at %s — skipping psk pipeline",
+                self._sink_db,
+            )
+            return None
+        try:
+            from hs_uploader.sources.sqlite import SqliteSource, HEALTH_NOOP
+        except ImportError as exc:
+            logger.warning(
+                "wspr-uploader-hs: SqliteSource import failed: %s "
+                "— skipping psk pipeline", exc,
+            )
+            return None
+        from hs_uploader import Pipeline, RetryPolicy
+        from hs_uploader.transports.wsprdaemon import WsprdaemonTarSftp
+
+        # Reuse the env-var rollout knobs (compression, root) from the
+        # wsprdaemon-cycle pipeline so PSK and WSPR tars use the same
+        # wire format.  Separate transport instance so its watermark
+        # bookkeeping stays distinct.
+        tar_compression = (
+            os.environ.get("WSPRDAEMON_TAR_COMPRESSION", "bz2").strip().lower()
+        )
+        if tar_compression not in ("bz2", "zstd"):
+            tar_compression = "bz2"
+        tar_root = (
+            os.environ.get("WSPRDAEMON_TAR_ROOT", "wsprdaemon").strip().lower()
+        )
+        if tar_root not in ("wspr", "wsprdaemon"):
+            tar_root = "wsprdaemon"
+
+        receiver = os.environ.get("WD_RECEIVER_NAME", "") or self._instance_name
+        # Project just the columns the tar builder + JSONL output
+        # need.  Includes forward_to_pskreporter so the server's
+        # routing.json synthesizer can collapse per-receiver flags.
+        sqlite_source = SqliteSource.from_env(
+            database="psk", table="spots",
+            accepted_schema_versions=[2],
+            start_at="now",   # cold-start: skip backlog (it'll be served by direct uploader)
+            delete_on_commit=False,   # shared queue; smd storage trim handles cleanup
+            select_columns=[
+                "time", "mode", "frequency", "snr_db", "score", "dt",
+                "tx_call", "grid", "message", "host_call", "host_grid",
+                "radiod_id", "instance", "processing_version",
+                "forward_to_pskreporter",
+            ],
+        )
+        if sqlite_source.health() == HEALTH_NOOP:
+            logger.info(
+                "wspr-uploader-hs: psk SqliteSource resolved to no-op "
+                "(sink unreadable) — skipping psk pipeline"
+            )
+            return None
+
+        transport = WsprdaemonTarSftp(
+            servers=[_server_host(s) for s in self._sftp_servers],
+            spool_root=None,
+            sftp_user=self._sftp_user,
+            version=self._version,
+            upload_id=self._upload_id,
+            receiver=receiver,
+            # Reuse the FTP fallback the wsprdaemon-cycle pipeline
+            # built — fine to share, just one less object.  None is
+            # also OK; psk rows are recoverable from the local sink
+            # via direct upload, so no FTP fallback is acceptable.
+            fallback_ftp=None,
+            primary_table_name="psk.spots",   # distinct watermark key
+            compression=tar_compression,
+            tar_root=tar_root,
+        )
+        pipeline = Pipeline(
+            name=f"psk-tar-{self._instance_name}",
+            source=sqlite_source,
+            transport=transport,
+            watermark=watermark,
+            identity=identity,
+            retry=RetryPolicy.exponential(base=2.0, cap_sec=900.0),
+            batch_limit=10_000,
+        )
+        logger.info(
+            "wspr-uploader-hs: psk-via-tar pipeline ready (sink=%s, "
+            "compression=%s, tar_root=%s)",
+            self._sink_db, tar_compression, tar_root,
         )
         return (pipeline, transport)
 
