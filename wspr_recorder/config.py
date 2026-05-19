@@ -130,9 +130,40 @@ class ChannelDefaults:
 
 @dataclass
 class RadiodConfig:
-    """Radiod connection settings."""
+    """Radiod connection settings (legacy single-source shape).
+
+    Retained as a *fallback* — when ``Config.sources`` is empty, the
+    bootstrap code in ``__main__`` synthesises one :class:`SourceConfig`
+    from this section so existing single-radiod deployments continue
+    to work unchanged.
+    """
     status_address: str = "hf.local"
     port: int = 5004
+
+
+@dataclass
+class SourceConfig:
+    """One SDR source feeding this recorder.
+
+    Today a "source" is always a radiod control plane; ``key`` is the
+    operator-facing stable identifier (matches sigmond.sources.SourceKey
+    string form, e.g. ``radiod:bee1-status.local``) and is what spots
+    will carry as their ``rx_source`` tag once the spot-payload change
+    lands (phase 3b).  ``status_address`` is the mDNS hostname the
+    ReceiverManager dials; ``label`` is the operator-friendly display
+    name (free-form, may be edited without invalidating selections).
+
+    When the recorder is configured with multiple sources, one
+    ReceiverManager is instantiated per entry — each with its own
+    radiod control connection, its own multicast group(s), and its
+    own ssrc registry.  Per-source band_recorders all share a single
+    output_dir / wav_writer / spot_sink so the downstream pipeline
+    (CycleBatcher → hs-uploader) sees one aggregate stream.
+    """
+    key: str                  # "radiod:<host>" — matches sigmond.sources
+    status_address: str       # radiod mDNS status name
+    label: str = ""           # operator-friendly display name (optional)
+    port: int = 5004          # ka9q-radio RTP port; rarely overridden
 
 
 def _derive_radiod_id(status_address: str) -> str:
@@ -232,7 +263,17 @@ class RecorderConfig:
 
 @dataclass
 class Config:
-    """Complete wspr-recorder configuration."""
+    """Complete wspr-recorder configuration.
+
+    ``sources`` is the new multi-source list (phase 3 of the multi-RX888
+    plan; see ``sigmond/tasks/plan-multi-rx888-sources.md``).  When
+    empty, ``ensure_sources()`` synthesises a single SourceConfig from
+    the legacy ``radiod`` section so existing single-radiod configs
+    keep working without edits.  The bootstrap path in
+    ``wspr_recorder.__main__`` always iterates ``sources`` — never
+    ``radiod`` directly — so the rest of the code is multi-source
+    aware uniformly.
+    """
     recorder: RecorderConfig = field(default_factory=RecorderConfig)
     timing: TimingConfig = field(default_factory=TimingConfig)
     radiod: RadiodConfig = field(default_factory=RadiodConfig)
@@ -240,6 +281,30 @@ class Config:
     channel_defaults: ChannelDefaults = field(default_factory=ChannelDefaults)
     frequencies: List[int] = field(default_factory=list)
     bands: List[BandConfig] = field(default_factory=list)
+    sources: List[SourceConfig] = field(default_factory=list)
+
+    def ensure_sources(self) -> None:
+        """Backfill ``sources`` from the legacy ``radiod`` section.
+
+        Called once after parsing.  No-op if ``sources`` is already
+        populated.  The synthesised key is
+        ``radiod:<status_address>`` so it matches what
+        :mod:`sigmond.sources` would discover via mDNS for the same
+        host — letting an operator transition from the legacy
+        single-section config to the multi-source ``[[source]]`` form
+        without a key-format mismatch.
+        """
+        if self.sources:
+            return
+        addr = (self.radiod.status_address or "").strip()
+        if not addr:
+            return
+        self.sources.append(SourceConfig(
+            key=f"radiod:{addr}",
+            status_address=addr,
+            label="",
+            port=self.radiod.port,
+        ))
 
     def validate(self) -> List[str]:
         """
@@ -292,6 +357,32 @@ class Config:
         # Validate band configs
         for bc in self.bands:
             errors.extend(bc.validate())
+
+        # Validate sources.  Either ``sources`` must be populated
+        # (post-ensure_sources()) or the legacy ``radiod.status_address``
+        # must be non-empty — ensure_sources() will backfill at load
+        # time when only the legacy field is set.  Construction via
+        # ``Config()`` directly (tests, REPL) is also accepted because
+        # RadiodConfig defaults status_address to a non-empty fallback.
+        if not self.sources and not (self.radiod.status_address or "").strip():
+            errors.append(
+                "no sources configured: add at least one [[source]] entry "
+                "or a [radiod] status_address"
+            )
+        for src in self.sources:
+            if not src.status_address:
+                errors.append(f"source {src.key!r}: status_address is empty")
+            if not (1024 <= src.port <= 65535):
+                errors.append(
+                    f"source {src.key!r}: port out of range ({src.port})"
+                )
+        # Duplicate keys are an operator typo — flag rather than
+        # silently second-instance.
+        seen = set()
+        for src in self.sources:
+            if src.key in seen:
+                errors.append(f"duplicate source key: {src.key!r}")
+            seen.add(src.key)
 
         return errors
     
@@ -351,13 +442,40 @@ def load_config(config_path: str) -> Config:
             ipc_socket=rec.get("ipc_socket", config.recorder.ipc_socket),
         )
     
-    # Parse radiod section
+    # Parse radiod section (legacy single-source shape).  Kept for
+    # backward compat; the synthesised SourceConfig below mirrors this
+    # when no [[source]] entries are present.
     if "radiod" in data:
         rad = data["radiod"]
         config.radiod = RadiodConfig(
             status_address=rad.get("status_address", config.radiod.status_address),
             port=rad.get("port", config.radiod.port),
         )
+
+    # Parse [[source]] array-of-tables (multi-RX888 plan, phase 3a).
+    # Each entry yields one SourceConfig; downstream code iterates
+    # ``config.sources`` rather than ``config.radiod``.  Operators
+    # transitioning from the legacy single-radiod config can leave
+    # [radiod] in place and add [[source]] entries — but if any
+    # [[source]] is present, the legacy [radiod] is ignored
+    # (explicit beats implicit).
+    if "source" in data:
+        for src_entry in data["source"]:
+            try:
+                addr = src_entry["status_address"]
+            except KeyError:
+                logger.warning(
+                    "Skipping [[source]] entry without status_address: %s",
+                    src_entry,
+                )
+                continue
+            key = src_entry.get("key") or f"radiod:{addr}"
+            config.sources.append(SourceConfig(
+                key=key,
+                status_address=addr,
+                label=src_entry.get("label", ""),
+                port=src_entry.get("port", 5004),
+            ))
 
     # Parse timing section
     if "timing" in data:
@@ -417,10 +535,19 @@ def load_config(config_path: str) -> Config:
     # resolved status_address is what validate() and callers observe.
     resolve_radiod_status(config)
 
+    # Backfill ``sources`` from the legacy ``[radiod]`` section if no
+    # ``[[source]]`` entries were declared.  After this call,
+    # ``config.sources`` is guaranteed non-empty for any valid config
+    # (validation catches both "no radiod" and "no sources" cases).
+    config.ensure_sources()
+
     # Validate
     errors = config.validate()
     if errors:
         raise ValueError(f"Configuration errors: {'; '.join(errors)}")
 
-    logger.info(f"Loaded config with {len(config.frequencies)} frequencies, {len(config.bands)} bands")
+    logger.info(
+        "Loaded config with %d frequencies, %d bands, %d source(s)",
+        len(config.frequencies), len(config.bands), len(config.sources),
+    )
     return config

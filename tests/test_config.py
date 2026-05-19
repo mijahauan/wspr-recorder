@@ -229,3 +229,181 @@ modes = ["W2", "BOGUS"]
                 load_config(path)
         finally:
             os.unlink(path)
+
+
+class TestSourceConfig:
+    """Tests for the [[source]] multi-source schema (multi-RX888 plan, phase 3a)."""
+
+    def _write_toml(self, content: str) -> str:
+        fd, path = tempfile.mkstemp(suffix=".toml")
+        os.write(fd, content.encode())
+        os.close(fd)
+        return path
+
+    def test_legacy_radiod_section_backfills_one_source(self):
+        """No [[source]] entries → ensure_sources() synthesises one
+        from the [radiod] section.  Existing configs must keep working."""
+        path = self._write_toml("""
+[recorder]
+output_dir = "/tmp/test"
+
+[radiod]
+status_address = "B4-100-rx888mk2-status.local"
+
+[[band]]
+frequency = "14095600"
+modes = ["W2"]
+""")
+        try:
+            config = load_config(path)
+            assert len(config.sources) == 1
+            src = config.sources[0]
+            assert src.key == "radiod:B4-100-rx888mk2-status.local"
+            assert src.status_address == "B4-100-rx888mk2-status.local"
+            assert src.port == 5004
+            assert src.label == ""
+        finally:
+            os.unlink(path)
+
+    def test_explicit_sources_parsed(self):
+        """Multiple [[source]] entries → one SourceConfig each."""
+        path = self._write_toml("""
+[recorder]
+output_dir = "/tmp/test"
+
+[[source]]
+key = "radiod:B4-100-rx888mk2-status.local"
+status_address = "B4-100-rx888mk2-status.local"
+label = "AC0G/B4 Dipole"
+
+[[source]]
+key = "radiod:bee1-status.local"
+status_address = "bee1-status.local"
+label = "AC0G @EM38ww B1 T3FD"
+
+[[band]]
+frequency = "14095600"
+modes = ["W2"]
+""")
+        try:
+            config = load_config(path)
+            assert len(config.sources) == 2
+            assert config.sources[0].key == "radiod:B4-100-rx888mk2-status.local"
+            assert config.sources[0].label == "AC0G/B4 Dipole"
+            assert config.sources[1].key == "radiod:bee1-status.local"
+            assert config.sources[1].label == "AC0G @EM38ww B1 T3FD"
+        finally:
+            os.unlink(path)
+
+    def test_source_key_defaulted_from_status_address(self):
+        """Operator can omit ``key`` — defaults to ``radiod:<addr>``."""
+        path = self._write_toml("""
+[recorder]
+output_dir = "/tmp/test"
+
+[[source]]
+status_address = "bee1-status.local"
+
+[[band]]
+frequency = "14095600"
+""")
+        try:
+            config = load_config(path)
+            assert config.sources[0].key == "radiod:bee1-status.local"
+        finally:
+            os.unlink(path)
+
+    def test_explicit_sources_override_legacy_radiod(self):
+        """With both [radiod] and [[source]] present, [[source]] wins;
+        the legacy section is ignored.  Explicit beats implicit."""
+        path = self._write_toml("""
+[recorder]
+output_dir = "/tmp/test"
+
+[radiod]
+status_address = "legacy.local"
+
+[[source]]
+key = "radiod:bee1-status.local"
+status_address = "bee1-status.local"
+
+[[band]]
+frequency = "14095600"
+""")
+        try:
+            config = load_config(path)
+            assert len(config.sources) == 1
+            assert config.sources[0].status_address == "bee1-status.local"
+            # legacy section still parsed but not consumed downstream
+            assert config.radiod.status_address == "legacy.local"
+        finally:
+            os.unlink(path)
+
+    def test_source_without_status_address_skipped(self):
+        """An entry missing status_address → logged + skipped.  Loader
+        falls back to whatever sources remain (and the back-compat
+        synthesiser if all entries are bad)."""
+        path = self._write_toml("""
+[recorder]
+output_dir = "/tmp/test"
+
+[radiod]
+status_address = "fallback.local"
+
+[[source]]
+key = "radiod:no-addr"
+# status_address missing — entry will be dropped
+
+[[band]]
+frequency = "14095600"
+""")
+        try:
+            config = load_config(path)
+            # With the bad entry dropped, ensure_sources() backfills
+            # one from [radiod].
+            assert len(config.sources) == 1
+            assert config.sources[0].status_address == "fallback.local"
+        finally:
+            os.unlink(path)
+
+    def test_duplicate_source_keys_rejected(self):
+        path = self._write_toml("""
+[recorder]
+output_dir = "/tmp/test"
+
+[[source]]
+key = "radiod:bee1-status.local"
+status_address = "bee1-status.local"
+
+[[source]]
+key = "radiod:bee1-status.local"
+status_address = "bee1-status.local"
+
+[[band]]
+frequency = "14095600"
+""")
+        try:
+            with pytest.raises(ValueError, match="duplicate source key"):
+                load_config(path)
+        finally:
+            os.unlink(path)
+
+    def test_no_sources_at_all_rejected(self):
+        """No [radiod] AND no [[source]] should fail validation."""
+        # Need to defeat the RadiodConfig default of "hf.local" — pass
+        # an explicit empty status_address.
+        path = self._write_toml("""
+[recorder]
+output_dir = "/tmp/test"
+
+[radiod]
+status_address = ""
+
+[[band]]
+frequency = "14095600"
+""")
+        try:
+            with pytest.raises(ValueError, match="no sources configured"):
+                load_config(path)
+        finally:
+            os.unlink(path)
