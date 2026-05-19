@@ -97,8 +97,22 @@ class DecoderRunner:
 
         Returns merged spots with pkt_mode=2 (WSPR-2).
         """
+        # Per operator decision 2026-05-19: don't feed CallsignDB into
+        # wsprd's hashtable.  wsprd maintains its own per-band
+        # hashtable.txt across invocations (the working-dir state file
+        # persists between cycles within a tmpfs lifetime).  The
+        # CallsignDB-driven write may have been miss-triggering
+        # Type-3 hash mappings — observed empirically as ~20%
+        # wsprnet rejection rate even with a freshly-zeroed CallsignDB.
+        # Leaving wsprd to manage its own table, and only feeding
+        # back from wsprd's output via ``ingest_wsprd_hashtable`` so
+        # CallsignDB remains useful for jt9 -Y hash resolution.
+        # Set ``WSPR_FEED_HASHTABLE=1`` to re-enable the legacy
+        # behaviour for A/B testing.
         ht_path = self.work_dir / "hashtable.txt"
-        self.callsign_db.write_wsprd_hashtable(ht_path)
+        import os as _os
+        if _os.environ.get("WSPR_FEED_HASHTABLE", "0") == "1":
+            self.callsign_db.write_wsprd_hashtable(ht_path)
 
         # Run standard pass
         standard_spots = self._run_wsprd(
@@ -152,8 +166,13 @@ class DecoderRunner:
 
         Returns spots with appropriate pkt_mode.
         """
+        # Same gate as for wsprd's hashtable.txt — let jt9 manage its
+        # own ``fst4w_calls.txt`` across invocations unless the
+        # operator opts back into CallsignDB-driven seeding.
         calls_path = self.work_dir / "fst4w_calls.txt"
-        self.callsign_db.write_jt9_calls(calls_path)
+        import os as _os
+        if _os.environ.get("WSPR_FEED_HASHTABLE", "0") == "1":
+            self.callsign_db.write_jt9_calls(calls_path)
 
         # Record current line count for diffing
         decodes_path = self.work_dir / "fst4_decodes.dat"
