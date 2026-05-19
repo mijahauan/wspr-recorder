@@ -506,6 +506,41 @@ class WsprUploaderHs:
                         "wsprnet-audit: record_batch raised (ignored)"
                     )
 
+                # Negative-cache update — feeds CallsignDB's filter
+                # so wsprd stops emitting stale Type-2 compound calls
+                # that wsprnet has consistently rejected.  See
+                # /tmp/wsprnet-negative-cache-design.md.
+                #
+                # We extract callsigns from the records that ACTUALLY
+                # went on the wire by re-applying the transport's own
+                # dedup helper — multi-source spots collapse to one
+                # entry per (cycle, call, freq) and only the winner
+                # gets counted.  This keeps the audit's view of "what
+                # wsprnet saw" consistent with what was rendered into
+                # MEPT lines.
+                try:
+                    from hs_uploader.transports.wsprnet import (
+                        dedup_records_for_wsprnet,
+                    )
+                    deduped = dedup_records_for_wsprnet(batch.records)
+                    calls_on_wire: list = []
+                    for r in deduped:
+                        cols = r.columns or {}
+                        c = (cols.get("tx_sign") or cols.get("tx_call")
+                             or cols.get("callsign") or "").strip()
+                        if c:
+                            calls_on_wire.append(c)
+                    wsprnet_audit.update_reject_cache(
+                        rx_call=self._call,
+                        calls_in_batch=calls_on_wire,
+                        n_posted=n_posted,
+                        n_added=n_added,
+                    )
+                except Exception:
+                    logger.exception(
+                        "wsprnet-reject-cache: update raised (ignored)"
+                    )
+
     # ----- pipeline construction -----
 
     def _build_wsprdaemon_ftp_fallback(self, *, spool_root, receiver):

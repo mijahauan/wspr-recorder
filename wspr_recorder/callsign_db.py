@@ -50,18 +50,68 @@ class CallsignDB:
     Resolves jt9 -Y numeric hashes after decoding.
     """
 
-    def __init__(self, db_path: Optional[Path] = None):
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        rx_call: str = "",
+        sink_db_path: Optional[str] = None,
+    ):
         """
         Args:
             db_path: Path to persistent JSON file. None = in-memory only.
+            rx_call: Reporter callsign — used to query
+                ``wsprnet_audit.get_suppressed_calls`` so consistently-
+                rejected stale compound calls (e.g. ``W4UK/P`` once
+                wsprnet has decided that hash slot belongs to bare
+                ``W4UK``) are filtered out of ``hashtable.txt`` and
+                ``fst4w_calls.txt`` before wsprd / jt9 reads them.
+                See /tmp/wsprnet-negative-cache-design.md.  Empty
+                string disables the filter (kept for tests + standalone
+                runs without a sigmond sink.db).
+            sink_db_path: Optional override for the sigmond sink.db
+                location.  Default ``None`` reads from
+                ``wsprnet_audit.DEFAULT_SINK_DB_PATH`` at consult time
+                (so the module attribute can be monkey-patched in tests).
         """
         self._db_path = db_path
+        self._rx_call = rx_call or ""
+        self._sink_db_path = sink_db_path
         self._callsigns: Dict[str, CallsignEntry] = {}
         # Reverse lookup: 22-bit hash → callsign
         self._hash22_to_call: Dict[int, str] = {}
 
         if db_path and db_path.exists():
             self.load()
+
+    # ---------------------------------------------------------------
+    # Negative-cache consult
+    # ---------------------------------------------------------------
+
+    def _suppressed_for_rx(self) -> set:
+        """Return the set of calls wsprnet has consistently rejected
+        for our ``rx_call``.  Cached briefly to avoid hammering the
+        sink.db on every wsprd cycle (the cache is invalidated by
+        re-reading after the cache TTL elapses — wsprnet decisions
+        change slowly so a 60-second TTL is plenty)."""
+        if not self._rx_call:
+            return set()
+        from time import monotonic
+        now = monotonic()
+        cached = getattr(self, "_suppressed_cache", None)
+        cached_at = getattr(self, "_suppressed_cache_at", 0.0)
+        if cached is not None and (now - cached_at) < 60.0:
+            return cached
+        try:
+            from . import wsprnet_audit
+            db_path = self._sink_db_path or wsprnet_audit.DEFAULT_SINK_DB_PATH
+            calls = wsprnet_audit.get_suppressed_calls(
+                rx_call=self._rx_call, db_path=db_path,
+            )
+        except Exception:
+            calls = set()
+        self._suppressed_cache = calls
+        self._suppressed_cache_at = now
+        return calls
 
     def add_callsign(self, call: str, grid: str = "", band: str = "") -> bool:
         """
@@ -101,28 +151,60 @@ class CallsignDB:
         Write hashtable.txt for wsprd (15-bit index → callsign).
 
         Format: one line per entry, "%5d %s\\n" (index callsign).
-        Returns number of entries written.
+        Returns number of entries written.  Calls flagged as
+        consistently-rejected by wsprnet (see
+        ``_suppressed_for_rx``) are silently filtered — wsprd then
+        no longer emits Type-2 hashes for them, so they stop being
+        re-uploaded into the silent-reject loop.  The underlying
+        cache entry is NOT deleted; the operator can rehabilitate
+        via ``smd verifier rehabilitate <CALL>`` if wsprnet later
+        accepts the call.
         """
+        suppressed = self._suppressed_for_rx()
         count = 0
+        skipped = 0
         with open(path, 'w') as f:
             for call in self._callsigns:
+                if call in suppressed:
+                    skipped += 1
+                    continue
                 h15 = self.nhash15(call)
                 f.write(f"{h15:5d} {call}\n")
                 count += 1
+        if skipped:
+            logger.info(
+                "callsign_db: filtered %d suppressed call(s) from "
+                "hashtable.txt for rx_call=%s: %s",
+                skipped, self._rx_call,
+                sorted(c for c in self._callsigns if c in suppressed),
+            )
         return count
 
     def write_jt9_calls(self, path: Path) -> int:
         """
         Write fst4w_calls.txt for jt9 (callsign grid pairs).
 
-        Returns number of entries written.
+        Returns number of entries written.  Same negative-cache filter
+        as ``write_wsprd_hashtable`` — keeps jt9 from re-emitting
+        the same stale compounds that wsprnet rejects.
         """
+        suppressed = self._suppressed_for_rx()
         count = 0
+        skipped = 0
         with open(path, 'w') as f:
             for call, entry in self._callsigns.items():
+                if call in suppressed:
+                    skipped += 1
+                    continue
                 grid = entry.grid if entry.grid else "    "
                 f.write(f"{call} {grid}\n")
                 count += 1
+        if skipped:
+            logger.info(
+                "callsign_db: filtered %d suppressed call(s) from "
+                "fst4w_calls.txt for rx_call=%s",
+                skipped, self._rx_call,
+            )
         return count
 
     def ingest_wsprd_hashtable(self, path: Path) -> int:

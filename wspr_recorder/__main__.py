@@ -1043,7 +1043,10 @@ class WsprRecorder:
                     callsign_path.parent, exc,
                 )
                 callsign_path = None
-            self.callsign_db = CallsignDB(db_path=callsign_path)
+            self.callsign_db = CallsignDB(
+                db_path=callsign_path,
+                rx_call=rx_call,
+            )
             # CycleBatcher collects per-band spots into a single
             # per-cycle wspr.spots write on a dedicated writer
             # thread.  Sidesteps SQLite's thread-affinity check
