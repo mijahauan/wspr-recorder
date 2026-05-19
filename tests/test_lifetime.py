@@ -89,30 +89,36 @@ class LifetimeRefreshPassTests(unittest.TestCase):
     """
 
     def _make_recorder(self, lifetime_frames: int):
+        """Set up a bare WsprRecorder with one mock ReceiverManager keyed by
+        a synthetic source_key — matches the multi-source dict shape
+        introduced in the phase-3a wiring change."""
         from wspr_recorder.__main__ import WsprRecorder
         rec = WsprRecorder.__new__(WsprRecorder)
         rec.config = Config()
         rec.config.processing = ProcessingConfig(
             radiod_lifetime_frames=lifetime_frames,
         )
-        rec.receiver_manager = mock.MagicMock()
+        rm = mock.MagicMock()
+        rec.receiver_managers = {"radiod:test.local": rm}
+        # Convenience handle so tests can poke entries on the one RM.
+        rec._test_rm = rm
         return rec
 
-    def test_no_op_when_receiver_manager_missing(self):
+    def test_no_op_when_no_managers(self):
         rec = self._make_recorder(6000)
-        rec.receiver_manager = None
+        rec.receiver_managers = {}
         # Should not raise.
         rec._lifetime_refresh_pass()
 
     def test_no_op_when_no_entries(self):
         rec = self._make_recorder(6000)
-        rec.receiver_manager._lifetime_entries = []
+        rec._test_rm._lifetime_entries = []
         rec._lifetime_refresh_pass()
 
     def test_refreshes_every_entry(self):
         rec = self._make_recorder(200)
         m1, m2 = mock.MagicMock(), mock.MagicMock()
-        rec.receiver_manager._lifetime_entries = [
+        rec._test_rm._lifetime_entries = [
             (m1, 100), (m1, 101), (m2, 200),
         ]
 
@@ -130,7 +136,7 @@ class LifetimeRefreshPassTests(unittest.TestCase):
         m_bad = mock.MagicMock()
         m_bad.set_channel_lifetime.side_effect = RuntimeError("radiod down")
         m_good = mock.MagicMock()
-        rec.receiver_manager._lifetime_entries = [
+        rec._test_rm._lifetime_entries = [
             (m_bad, 100), (m_good, 200),
         ]
 
@@ -139,6 +145,25 @@ class LifetimeRefreshPassTests(unittest.TestCase):
 
         # Good entry refreshed despite the bad one raising.
         m_good.set_channel_lifetime.assert_any_call(200, 6000)
+
+    def test_walks_every_source(self):
+        """Multi-source: entries on multiple ReceiverManagers all get
+        refreshed in a single pass."""
+        from wspr_recorder.__main__ import WsprRecorder
+        rec = WsprRecorder.__new__(WsprRecorder)
+        rec.config = Config()
+        rec.config.processing = ProcessingConfig(radiod_lifetime_frames=200)
+        rm_a, rm_b = mock.MagicMock(), mock.MagicMock()
+        m_a, m_b = mock.MagicMock(), mock.MagicMock()
+        rm_a._lifetime_entries = [(m_a, 100)]
+        rm_b._lifetime_entries = [(m_b, 200)]
+        rec.receiver_managers = {
+            "radiod:host-a.local": rm_a,
+            "radiod:host-b.local": rm_b,
+        }
+        rec._lifetime_refresh_pass()
+        m_a.set_channel_lifetime.assert_called_once_with(100, 200)
+        m_b.set_channel_lifetime.assert_called_once_with(200, 200)
 
 
 if __name__ == "__main__":

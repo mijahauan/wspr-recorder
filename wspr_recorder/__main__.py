@@ -17,7 +17,7 @@ import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -68,11 +68,19 @@ class WsprRecorder:
         self._memprofile_baseline: Optional[tracemalloc.Snapshot] = None
         
         # Components
-        self.receiver_manager: Optional[ReceiverManager] = None
+        # Dict keyed by SourceConfig.key — one ReceiverManager per
+        # configured source.  Single-source deployments still produce
+        # a one-entry dict; multi-source (multi-RX888 plan, phase 3a)
+        # spawns one per [[source]] in config.toml.
+        self.receiver_managers: Dict[str, ReceiverManager] = {}
         self.wav_writer: Optional[WavWriter] = None
         self.timing_service: Optional[TimingService] = None
         self.ipc_server: Optional[IPCServer] = None
-        self.band_recorders: Dict[int, BandRecorder] = {}  # ssrc -> BandRecorder
+        # Keyed by (source_key, ssrc) — SSRCs are only unique within a
+        # single radiod's output, so two radiods can produce colliding
+        # SSRCs.  Single-source deployments still get one entry per
+        # SSRC (just paired with the synthesised source_key).
+        self.band_recorders: Dict[Tuple[str, int], BandRecorder] = {}
         # hs-uploader pumps wspr.spots + wspr.noise → wsprdaemon.org +
         # wsprnet.org from in-process.  v3 Phase A absorbed this from
         # the standalone wd-upload-hs@.service; gated on
@@ -120,7 +128,13 @@ class WsprRecorder:
         self._shutdown_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
     
-    def _build_sink(self, ssrc: int, channel_state: ChannelState) -> ChannelSink:
+    def _build_sink(
+        self,
+        ssrc: int,
+        channel_state: ChannelState,
+        *,
+        source_key: str,
+    ) -> ChannelSink:
         """Sink factory: build BandRecorder and return its ChannelSink.
 
         Called by ReceiverManager during provisioning, once per channel,
@@ -128,7 +142,10 @@ class WsprRecorder:
         ensure_channel(). The returned callbacks are handed directly to
         MultiStream.add_channel() — no post-hoc wiring.
         """
-        logger.info(f"Channel ready: SSRC {ssrc} -> {channel_state.band_name}")
+        logger.info(
+            "Channel ready: %s SSRC %d -> %s",
+            source_key, ssrc, channel_state.band_name,
+        )
 
         band_config = self.config.get_band_config(channel_state.frequency_hz)
         decode_modes = [DecodeMode(m) for m in band_config.modes]
@@ -146,11 +163,17 @@ class WsprRecorder:
             executor=self.executor,
             sync_strategy=sync_strategy,
         )
-        self.band_recorders[ssrc] = recorder
+        self.band_recorders[(source_key, ssrc)] = recorder
+
+        # Capture the right ReceiverManager for record_samples — each
+        # source has its own RM with its own SSRC namespace.  Bound in
+        # the closure rather than re-looked-up per packet to keep the
+        # hot path tight.
+        rm = self.receiver_managers.get(source_key)
 
         def on_samples(samples, quality):
-            if self.receiver_manager:
-                self.receiver_manager.record_samples(ssrc, len(samples))
+            if rm is not None:
+                rm.record_samples(ssrc, len(samples))
             recorder.on_samples(samples, quality)
 
         def on_stream_dropped(reason):
@@ -518,21 +541,22 @@ class WsprRecorder:
 
     def _lifetime_refresh_pass(self) -> None:
         """One pass of LIFETIME keep-alive across every (multi, ssrc)
-        entry.  Per-call failures (radiod restart, network blip) are
-        logged but don't propagate — the next pass retries.  Pulled out
-        of the async loop so tests can drive it directly without
-        fighting the asyncio.sleep cadence.
+        entry on every configured source.  Per-call failures (radiod
+        restart, network blip) are logged but don't propagate — the
+        next pass retries.
         """
-        if self.receiver_manager is None:
+        if not self.receiver_managers:
             return
         rlf = self.config.processing.radiod_lifetime_frames
-        for multi, ssrc in self.receiver_manager._lifetime_entries:
-            try:
-                multi.set_channel_lifetime(ssrc, rlf)
-            except Exception as exc:
-                logger.warning(
-                    "lifetime keepalive failed (ssrc=%s): %s", ssrc, exc,
-                )
+        for src_key, rm in self.receiver_managers.items():
+            for multi, ssrc in rm._lifetime_entries:
+                try:
+                    multi.set_channel_lifetime(ssrc, rlf)
+                except Exception as exc:
+                    logger.warning(
+                        "lifetime keepalive failed (source=%s ssrc=%s): %s",
+                        src_key, ssrc, exc,
+                    )
 
     async def _lifetime_keepalive_loop(self) -> None:
         """Refresh radiod's LIFETIME on every active SSRC.
@@ -543,17 +567,20 @@ class WsprRecorder:
         as 0) or before provisioning completes.  MultiStream's
         drop/restore path re-applies the slot's lifetime on its own.
         """
-        if (
-            self.receiver_manager is None
-            or not self.receiver_manager._lifetime_entries
-        ):
+        if not self.receiver_managers:
+            return
+        total_entries = sum(
+            len(rm._lifetime_entries) for rm in self.receiver_managers.values()
+        )
+        if total_entries == 0:
             return
         rlf = self.config.processing.radiod_lifetime_frames
         # Floor at 1 s so absurd configs don't busy-loop.
         interval = max(rlf / 50.0 / 4.0, 1.0)
         logger.info(
-            "lifetime keepalive: %d channels, %d frames, refresh every %.1fs",
-            len(self.receiver_manager._lifetime_entries), rlf, interval,
+            "lifetime keepalive: %d channels across %d source(s), "
+            "%d frames, refresh every %.1fs",
+            total_entries, len(self.receiver_managers), rlf, interval,
         )
         while self._running:
             try:
@@ -661,16 +688,17 @@ class WsprRecorder:
             try:
                 await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
 
-                if self.receiver_manager:
+                for src_key, rm in self.receiver_managers.items():
                     active = sum(
-                        1 for ch in self.receiver_manager.state.channels.values()
+                        1 for ch in rm.state.channels.values()
                         if ch.is_active
                     )
-                    total = len(self.receiver_manager.state.channels)
+                    total = len(rm.state.channels)
                     if active < total:
                         logger.warning(
-                            f"Channel health: {active}/{total} active "
-                            f"(recovery handled by ReceiverManager)"
+                            "Channel health (%s): %d/%d active "
+                            "(recovery handled by ReceiverManager)",
+                            src_key, active, total,
                         )
 
             except asyncio.CancelledError:
@@ -700,15 +728,24 @@ class WsprRecorder:
                 "peak_mb": round(peak / 1e6, 2),
             }
 
-        if self.receiver_manager:
-            status["receiver_manager"] = self.receiver_manager.get_status()
-        
+        if self.receiver_managers:
+            # Per-source status sub-dicts.  Single-source deployments
+            # get a one-entry dict; multi-source surfaces each radiod's
+            # health independently.
+            status["sources"] = {
+                src_key: rm.get_status()
+                for src_key, rm in self.receiver_managers.items()
+            }
+
         if self.timing_service:
             status["timing"] = self.timing_service.get_status()
-        
+
+        # band_recorders dict key is (source_key, ssrc); flatten to
+        # "<source_key>/<ssrc>" so the JSON output stays
+        # string-keyed (no tuple keys in JSON).
         status["band_recorders"] = {
-            str(ssrc): recorder.get_stats()
-            for ssrc, recorder in self.band_recorders.items()
+            f"{source_key}/{ssrc}": recorder.get_stats()
+            for (source_key, ssrc), recorder in self.band_recorders.items()
         }
         
         return status
@@ -736,11 +773,20 @@ class WsprRecorder:
         return self.timing_service.get_status()
     
     def _ipc_bands(self, params: Optional[Dict]) -> Dict:
-        """IPC: Get configured bands and their status."""
+        """IPC: Get configured bands and their status.
+
+        With multiple sources, the same band may be served by more than
+        one radiod.  Each (source, band) gets its own entry keyed by
+        "<source_key>/<band>" so colliding band names across sources
+        don't clobber each other.
+        """
         bands = {}
-        for ssrc, recorder in self.band_recorders.items():
-            bands[recorder.band_name] = {
+        for (source_key, ssrc), recorder in self.band_recorders.items():
+            key = f"{source_key}/{recorder.band_name}"
+            bands[key] = {
                 "frequency_hz": recorder.frequency_hz,
+                "source_key": source_key,
+                "band_name": recorder.band_name,
                 "ssrc": ssrc,
                 "synced": recorder._synced,
                 "ring_minutes": recorder._ring.minutes_available,
@@ -750,17 +796,30 @@ class WsprRecorder:
                 "decode_modes": [m.value for m in recorder._decode_modes],
             }
         return {"bands": bands, "count": len(bands)}
-    
+
     def _ipc_band_status(self, params: Optional[Dict]) -> Dict:
-        """IPC: Get status for a specific band."""
+        """IPC: Get status for a specific band.
+
+        Accepts ``band`` plus optional ``source`` to disambiguate when
+        multiple sources serve the same band.  Without ``source`` the
+        first matching recorder wins (matches the legacy single-source
+        behaviour).
+        """
         if not params or "band" not in params:
             return {"error": "Missing 'band' parameter"}
-        
+
         band_name = params["band"]
-        for ssrc, recorder in self.band_recorders.items():
-            if recorder.band_name == band_name:
-                return recorder.get_stats()
-        
+        want_source = params.get("source")
+        for (source_key, ssrc), recorder in self.band_recorders.items():
+            if recorder.band_name != band_name:
+                continue
+            if want_source is not None and source_key != want_source:
+                continue
+            stats = recorder.get_stats()
+            stats["source_key"] = source_key
+            stats["ssrc"] = ssrc
+            return stats
+
         return {"error": f"Band not found: {band_name}"}
     
     def _ipc_health(self, params: Optional[Dict]) -> Dict:
@@ -772,9 +831,21 @@ class WsprRecorder:
             healthy = False
             issues.append("Not running")
         
-        if self.receiver_manager and not self.receiver_manager.check_health():
-            healthy = False
-            issues.append("No active channels")
+        if self.receiver_managers:
+            # A source is unhealthy if its check_health() reports so.
+            # We surface a per-source breakdown to make multi-source
+            # operator-side diagnosis tractable.
+            unhealthy = [
+                src_key for src_key, rm in self.receiver_managers.items()
+                if not rm.check_health()
+            ]
+            if unhealthy:
+                healthy = False
+                issues.append(
+                    f"No active channels on {len(unhealthy)}/"
+                    f"{len(self.receiver_managers)} source(s): "
+                    f"{', '.join(unhealthy)}"
+                )
         
         active_bands = sum(1 for r in self.band_recorders.values() if r._synced)
         
@@ -948,22 +1019,54 @@ class WsprRecorder:
                 rx_call, rx_grid,
             )
         
-        self.receiver_manager = ReceiverManager(
-            config=self.config,
-            sink_factory=self._build_sink,
+        # Spawn one ReceiverManager per configured source.  Each runs
+        # against its own radiod control plane; band recorders are
+        # disambiguated by (source_key, ssrc) so colliding SSRCs from
+        # different radiods don't clobber each other.  Single-source
+        # configs produce a one-entry dict (legacy behaviour intact).
+        for src in self.config.sources:
+            sink_factory = (
+                lambda ssrc, state, sk=src.key:
+                    self._build_sink(ssrc, state, source_key=sk)
+            )
+            self.receiver_managers[src.key] = ReceiverManager(
+                config=self.config,
+                sink_factory=sink_factory,
+                status_address=src.status_address,
+                port=src.port,
+                source_key=src.key,
+            )
+        logger.info(
+            "Configured %d source(s): %s",
+            len(self.receiver_managers),
+            ", ".join(self.receiver_managers.keys()),
         )
 
         try:
-            # Provision all channels (ensure_channel + MultiStream.add_channel).
-            # sink_factory builds BandRecorders and returns their callbacks.
+            # Provision all channels across every source.  Per-source
+            # failures are independently logged; the recorder keeps
+            # running as long as at least one source connected.
             logger.info("Connecting to radiod...")
-            if not self.receiver_manager.connect():
-                logger.error("Failed to connect to radiod")
+            n_connected = 0
+            for src_key, rm in self.receiver_managers.items():
+                if rm.connect():
+                    n_connected += 1
+                else:
+                    logger.error("Source %s: failed to connect to radiod",
+                                 src_key)
+            if n_connected == 0:
+                logger.error(
+                    "All %d source(s) failed to connect — aborting startup",
+                    len(self.receiver_managers),
+                )
                 return
 
             # Start shared-socket MultiStreams (begins sample delivery)
+            # for every connected source.
             logger.info("Starting MultiStreams...")
-            self.receiver_manager.start_streams()
+            for rm in self.receiver_managers.values():
+                if rm.state.connected:
+                    rm.start_streams()
 
             # Start IPC server
             await self._setup_ipc_server()
@@ -1076,9 +1179,14 @@ class WsprRecorder:
         if self.ipc_server:
             await self.ipc_server.stop()
 
-        # Disconnect from radiod (stops all MultiStreams)
-        if self.receiver_manager:
-            self.receiver_manager.shutdown()
+        # Disconnect from every configured radiod (stops all
+        # MultiStreams).  Per-source failures don't propagate — we
+        # always tear them all down on shutdown.
+        for src_key, rm in self.receiver_managers.items():
+            try:
+                rm.shutdown()
+            except Exception as exc:
+                logger.error("Source %s: shutdown raised: %s", src_key, exc)
         
         # Shutdown thread pool
         self.executor.shutdown(wait=True, cancel_futures=False)

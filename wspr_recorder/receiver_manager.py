@@ -234,14 +234,40 @@ SinkFactory = Callable[[int, ChannelState], ChannelSink]
 
 
 class ReceiverManager:
-    """Provisions radiod channels and wires them to MultiStream(s)."""
+    """Provisions radiod channels and wires them to MultiStream(s).
 
-    def __init__(self, config: Config, sink_factory: SinkFactory):
+    Single-source by design — one ReceiverManager talks to exactly
+    one radiod control plane.  For multi-source deployments (multi-
+    RX888 plan, phase 3) the recorder instantiates several
+    ReceiverManager instances, each with its own ``status_address``
+    override.  ``source_key`` is the operator-facing identifier
+    (e.g. ``"radiod:bee1-status.local"``) that downstream callers use
+    to disambiguate channels coming from different radiods —
+    important because SSRCs are only unique within a single radiod's
+    output, not across the LAN.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        sink_factory: SinkFactory,
+        *,
+        status_address: Optional[str] = None,
+        port: Optional[int] = None,
+        source_key: Optional[str] = None,
+    ):
         self.config = config
         self.sink_factory = sink_factory
+        # Per-source overrides; default to the legacy config.radiod
+        # so single-source callers (existing tests, single-radiod
+        # production) keep working unchanged.
+        self._status_address = (status_address
+                                or config.radiod.status_address)
+        self._port = port if port is not None else config.radiod.port
+        self.source_key = source_key or f"radiod:{self._status_address}"
         self.state = ReceiverManagerState(
-            radiod_address=config.radiod.status_address,
-            port=config.radiod.port,
+            radiod_address=self._status_address,
+            port=self._port,
         )
         self._control: Optional[RadiodControl] = None
         self._multi_by_group: Dict[Tuple[str, int], MultiStream] = {}
@@ -258,13 +284,13 @@ class ReceiverManager:
             # docstring at top of file.
             _wait_for_chrony_settled()
 
-            logger.info(f"Connecting to radiod at {self.config.radiod.status_address}")
+            logger.info(f"Connecting to radiod at {self._status_address}")
             # client_id makes ka9q-python derive a per-(client, radiod)
             # multicast destination so this recorder's WSPR channels
             # never share a multicast group with peer clients on the
             # same radiod.  CONTRACT v0.3 §7 / ka9q-python ≥ 3.14.0.
             self._control = RadiodControl(
-                self.config.radiod.status_address,
+                self._status_address,
                 client_id="wspr-recorder",
             )
             self.state.connected = True
