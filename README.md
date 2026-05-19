@@ -27,7 +27,7 @@ wspr-recorder daemon (one per radiod)
   │
   ├─ decode (WD_DECODE_VIA_DB=1): wsprd + jt9 --fst4w per cycle
   │             → wspr.spots + wspr.noise rows
-  │             → /var/lib/sigmond/sink.db  (sigmond.hamsci_ch)
+  │             → /var/lib/sigmond/sink.db  (sigmond.hamsci_sink)
   │
   └─ upload (WSPR_USE_HS_UPLOADER=1): in-process hs-uploader
                 → wsprnet.org   (HTTP MEPT)
@@ -55,7 +55,7 @@ variables in the unit's env file (see [docs/CONFIG.md](docs/CONFIG.md)):
 - **Full pipeline.** `WD_DECODE_VIA_DB=1` enables in-process decode to
   the SQLite sink; `WSPR_USE_HS_UPLOADER=1` additionally enables the
   in-process uploader. Each flag is independent and each is a no-op if
-  its prerequisites (sigmond's `hamsci_ch`, the `hs-uploader` package,
+  its prerequisites (sigmond's `hamsci_sink`, the `hs-uploader` package,
   reporter identity env vars) are missing — the recorder always runs.
 
 ## Quickstart
@@ -108,7 +108,7 @@ atomically.
 across decoders via a persistent `CallsignDB`, measures per-cycle RMS
 and FFT noise, and writes `wspr.spots` + `wspr.noise` rows into
 sigmond's local SQLite sink (`/var/lib/sigmond/sink.db`) via
-`sigmond.hamsci_ch`.
+`sigmond.hamsci_sink`.
 
 **Uploads** (when `WSPR_USE_HS_UPLOADER=1`): runs an in-process
 `hs-uploader` pump that reads the sink and ships spots to wsprnet.org

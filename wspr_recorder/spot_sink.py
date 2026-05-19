@@ -1,8 +1,8 @@
 """DB-direct spot sink — pipeline v2 (Phase 2).
 
 Adapter between the decoder's in-process `RawSpot` instances and
-sigmond's canonical hamsci_ch sink (default backend SQLite at
-/var/lib/sigmond/sink.db, opt-in ClickHouse).
+sigmond's canonical hamsci_sink sink (SQLite at
+/var/lib/sigmond/sink.db).
 
 This module is the producer side of the contract defined in
 wsprdaemon-client/lib/wdlib/spots/CONTRACT.md.  RawSpot fields map
@@ -12,7 +12,7 @@ multi-receiver duplicates distinct while the WSPRnet uploader
 collapses them via SQL.
 
 Off by default; enabled via env var `WD_DECODE_VIA_DB=1`.  When
-disabled (or when sigmond's hamsci_ch package isn't on PYTHONPATH),
+disabled (or when sigmond's hamsci_sink package isn't on PYTHONPATH),
 all operations are no-ops so wspr-recorder runs identically to its
 pre-pipeline-v2 behavior.
 """
@@ -148,20 +148,20 @@ def resolve_reporter_identity(env=None):
 
 
 def _resolve_writer():
-    """Return a sigmond.hamsci_ch.Writer, or None.
+    """Return a sigmond.hamsci_sink.Writer, or None.
 
     Lazy-imported so wspr-recorder runs cleanly on hosts that haven't
     installed sigmond (CI, kiwi-only deployments).  We always target
     the per-mode `wspr` database (resolved via the standard
-    `hamsci_ch.Writer.from_env(mode="wspr", table="spots")` factory),
-    so operators can override via `SIGMOND_SQLITE_DB_WSPR` /
-    `SIGMOND_CLICKHOUSE_DB_WSPR` without code changes.
+    `hamsci_sink.Writer.from_env(mode="wspr", table="spots")` factory),
+    so operators can override via `SIGMOND_SQLITE_DB_WSPR`
+    without code changes.
     """
     try:
-        from sigmond.hamsci_ch import Writer  # type: ignore[import-not-found]
+        from sigmond.hamsci_sink import Writer  # type: ignore[import-not-found]
     except ImportError:
         logger.warning(
-            "spot_sink: sigmond.hamsci_ch not importable — DB writes "
+            "spot_sink: sigmond.hamsci_sink not importable — DB writes "
             "disabled.  Add /opt/git/sigmond/sigmond/lib to PYTHONPATH "
             "or install sigmond alongside wsprdaemon-client to enable."
         )
@@ -333,15 +333,15 @@ def noise_to_row(
 
 
 class SpotSink:
-    """Writer-facade that converts RawSpot batches → hamsci_ch rows.
+    """Writer-facade that converts RawSpot batches → hamsci_sink rows.
 
-    One instance per recorder process; the underlying hamsci_ch.Writer
+    One instance per recorder process; the underlying hamsci_sink.Writer
     handles its own batching/flush cadence.  Thread-safe at the
-    `submit_batch()` boundary because hamsci_ch.Writer serializes its
+    `submit_batch()` boundary because hamsci_sink.Writer serializes its
     own internal state — multiple BandRecorder threads can call us
     concurrently with no extra locking on our side.
 
-    When DB writes are disabled (env var off, hamsci_ch missing, or
+    When DB writes are disabled (env var off, hamsci_sink missing, or
     explicit `enabled=False`), the sink is a no-op: callers don't
     need to know whether they're configured for legacy or v2.
     """
@@ -374,7 +374,7 @@ class SpotSink:
         if (self._writer is not None
                 and getattr(self._writer, "is_noop", False)):
             logger.warning(
-                "spot_sink: sigmond.hamsci_ch.Writer returned a no-op "
+                "spot_sink: sigmond.hamsci_sink.Writer returned a no-op "
                 "instance — likely the producer user (%s) lacks g+w on "
                 "/var/lib/sigmond/sink.db.  DB writes disabled.",
                 _whoami(),
@@ -444,7 +444,7 @@ class SpotSink:
                 self._writer.insert(rows)
             except Exception as exc:
                 logger.error(
-                    "spot_sink: hamsci_ch.insert failed on %s "
+                    "spot_sink: hamsci_sink.insert failed on %s "
                     "(%d rows): %s — they will not be retried, "
                     "the legacy bash chain remains the system of record "
                     "until Phase 3.", band, len(rows), exc,
@@ -496,7 +496,7 @@ class SpotSink:
                 self._writer.insert(rows)
             except Exception as exc:
                 logger.error(
-                    "spot_sink: hamsci_ch.insert failed for cycle batch "
+                    "spot_sink: hamsci_sink.insert failed for cycle batch "
                     "(%d rows): %s — they will not be retried, "
                     "the legacy bash chain remains the system of record "
                     "until Phase 4.", len(rows), exc,
@@ -525,12 +525,12 @@ class SpotSink:
         """
         if not self.enabled or self._writer is None:
             return 0
-        # Open a second writer for the wspr.noise table.  hamsci_ch's
+        # Open a second writer for the wspr.noise table.  hamsci_sink's
         # Writer holds (mode, table) state, so spots and noise need
         # their own Writer instance.  Built lazily on first noise flush
         # to keep startup cost zero on stations that don't ship noise.
         if self._noise_writer is None:
-            from sigmond.hamsci_ch import Writer  # type: ignore
+            from sigmond.hamsci_sink import Writer  # type: ignore
             try:
                 self._noise_writer = Writer.from_env(
                     mode="wspr", table="noise",

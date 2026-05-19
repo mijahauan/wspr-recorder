@@ -279,7 +279,7 @@ class TestSpotSinkGating(unittest.TestCase):
 
     def test_explicit_enable_with_injected_writer(self):
         """When `enabled=True` and a writer is passed in, the sink
-        uses that writer regardless of hamsci_ch installation."""
+        uses that writer regardless of hamsci_sink installation."""
         mock_writer = MagicMock()
         # MagicMock attributes default to truthy mocks; the sink's
         # silent-noop guard reads `writer.is_noop` and would treat a

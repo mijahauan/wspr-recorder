@@ -154,7 +154,7 @@ these come from the unit's `EnvironmentFile`s
 | `WD_RECEIVER_CALL` / `WD_RECEIVER_GRID` | Reporter identity (rx call/grid) for sink rows. Set by wsprdaemon-client's envgen. |
 | `WD_RX_CALL` / `WD_RX_GRID` | Override pair for reporter identity (test rigs). Takes precedence over `WD_RECEIVER_*`. |
 | `SIGMOND_SQLITE_PATH` | Sink DB path (default `/var/lib/sigmond/sink.db`). |
-| `SIGMOND_SQLITE_DB_WSPR` / `SIGMOND_CLICKHOUSE_DB_WSPR` | Per-mode `hamsci_ch` backend overrides. |
+| `SIGMOND_SQLITE_DB_WSPR` | Per-mode `hamsci_sink` backend override. |
 
 ### Full pipeline — upload (`WSPR_USE_HS_UPLOADER`)
 
@@ -173,7 +173,7 @@ these come from the unit's `EnvironmentFile`s
 | `HS_UPLOADER_SSH_KEY_FILE` | SFTP private key (else `hs-uploader`'s default). |
 
 Each feature flag is independent and each silently no-ops when its
-prerequisites are missing (`sigmond.hamsci_ch`, the `hs-uploader`
+prerequisites are missing (`sigmond.hamsci_sink`, the `hs-uploader`
 package, reporter-identity vars). The recorder always runs.
 
 CLI `--log-level` overrides env for subcommands. SIGHUP re-reads

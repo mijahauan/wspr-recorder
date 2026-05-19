@@ -1,4 +1,4 @@
-"""HamSCI Client Contract v0.4 compliance tests for wspr-recorder.
+"""HamSCI Client Contract v0.6 compliance tests for wspr-recorder.
 
 Covers:
   - stdout cleanliness (§3)
@@ -73,7 +73,7 @@ class InventoryV04Tests(unittest.TestCase):
         self.assertEqual(self.data["client"], "wspr-recorder")
 
     def test_contract_version(self):
-        self.assertEqual(self.data["contract_version"], "0.4")
+        self.assertEqual(self.data["contract_version"], "0.6")
 
     def test_has_config_path(self):
         self.assertIn("config_path", self.data)

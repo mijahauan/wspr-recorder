@@ -200,7 +200,7 @@ class WsprRecorder:
         Writes period-length WAV file (runs in thread pool via
         BandRecorder).  When pipeline-v2 DB-direct decode is enabled,
         also runs wsprd / jt9 on the WAV and pushes the resulting
-        spots into the canonical hamsci_ch sink (`wspr.spots`).
+        spots into the canonical hamsci_sink sink (`wspr.spots`).
         """
         if not self.wav_writer:
             return
@@ -1077,7 +1077,7 @@ class WsprRecorder:
         #   2. cycle_batcher.stop() joins the writer thread and
         #      flushes any cycle whose deadline hasn't yet hit.
         #   3. spot_sink.close() then commits + closes the
-        #      hamsci_ch.Writer.
+        #      hamsci_sink.Writer.
         if self.cycle_batcher is not None:
             try:
                 self.cycle_batcher.stop()

@@ -11,7 +11,7 @@ from typing import Any
 from .config import Config, _derive_radiod_id
 from .version import GIT_INFO
 
-CONTRACT_VERSION = "0.4"
+CONTRACT_VERSION = "0.6"
 KA9Q_PYTHON_MIN_VERSION = "3.8.0"
 
 

@@ -27,7 +27,7 @@ the decode-in-process change here in wspr-recorder.
 Add a `SpotSink` to wspr-recorder that, when `WD_DECODE_VIA_DB=1`,
 invokes `DecoderRunner` (the in-repo class you already wrote in
 `wspr_recorder/decoder.py`) inside `_on_period_complete` and writes
-the resulting `RawSpot` instances directly to sigmond's hamsci_ch
+the resulting `RawSpot` instances directly to sigmond's hamsci_sink
 sink as `wspr.spots` rows.  The legacy bash chain
 (`wd-decode@<host>-<band>` × 13 polling services) is left running
 during a dual-write observation window, then disabled once row
@@ -60,7 +60,7 @@ the columnar shape `wd-ch-write` already produces from
 `_wd_spots.txt` parsing.
 
 The Phase 2 in-process `SpotSink` emits rows via
-`hamsci_ch.Writer(mode="wspr", table="spots")` — same database/table
+`hamsci_sink.Writer(mode="wspr", table="spots")` — same database/table
 as `wd-ch-write`.  Same `SqliteSource` filter on
 `wd-upload-hs` reads both.
 
@@ -95,7 +95,7 @@ e985ade feat(spot_sink): reuse envgen WD_RECEIVER_* vars for reporter identity
 Files:
 
   * `wspr_recorder/spot_sink.py` — RawSpot → row dict adapter, gated
-    on `WD_DECODE_VIA_DB=1`.  Lazy-imports `sigmond.hamsci_ch` so
+    on `WD_DECODE_VIA_DB=1`.  Lazy-imports `sigmond.hamsci_sink` so
     kiwi-only installs (no sigmond) keep working.
   * `wspr_recorder/__main__.py` — wire SpotSink + CallsignDB at
     startup; in `_on_period_complete`, after the WAV is written,
@@ -119,7 +119,7 @@ asking you to review.  Four problems surfaced and were fixed on
 this branch (now `pipeline-v2/phase-2` HEAD):
 
 1. **wspr-recorder venv missing sigmond on PYTHONPATH.**
-   `from sigmond.hamsci_ch import Writer` fails — psk-recorder's
+   `from sigmond.hamsci_sink import Writer` fails — psk-recorder's
    venv has a `.pth` file that adds `/opt/git/sigmond/sigmond/lib`;
    wspr-recorder's doesn't.  Workaround for the test: dropped a
    `sigmond-local.pth` into the venv.  **Action for production:**
@@ -143,7 +143,7 @@ this branch (now `pipeline-v2/phase-2` HEAD):
    DecoderRunner at the right files (mirrors the legacy `wd-decode`
    bash arch-switch).
 
-4. **`hamsci_ch.Writer` silently noops when producer user can't
+4. **`hamsci_sink.Writer` silently noops when producer user can't
    write `/var/lib/sigmond/sink.db`.**  This is the "SQLite Writer
    silent-noop trap" Rob already noted in his memory file.  My
    SpotSink now checks `writer.is_noop` and refuses to enable +

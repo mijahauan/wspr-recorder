@@ -61,9 +61,9 @@ dependencies by operator convention, not installed by `install.sh`.
 
 Full-pipeline decode writes `wspr.spots` / `wspr.noise` rows into
 sigmond's local SQLite sink (`/var/lib/sigmond/sink.db`) via
-`sigmond.hamsci_ch`. That requires `sigmond` to be importable in the
+`sigmond.hamsci_sink`. That requires `sigmond` to be importable in the
 venv (a `.pth` file pointing at `/opt/git/sigmond/sigmond/lib`, or
-sigmond installed alongside). If `hamsci_ch` is not importable the
+sigmond installed alongside). If `hamsci_sink` is not importable the
 sink logs a warning and the decode path no-ops — the recorder still
 runs.
 
@@ -147,9 +147,9 @@ Then `sudo systemctl restart wspr-recorder@<radiod_id>`.
 Prerequisites for full-pipeline mode:
 
 - `wsprd` / `jt9` reachable (see *Decoders* above).
-- `sigmond.hamsci_ch` importable in the venv (see *sigmond* above).
+- `sigmond.hamsci_sink` importable in the venv (see *sigmond* above).
 - The service user can write `/var/lib/sigmond/sink.db`. The
-  `hamsci_ch` writer silently no-ops if it cannot — add the service
+  `hamsci_sink` writer silently no-ops if it cannot — add the service
   user to the `sigmond` group and `chmod g+w` the sink and its
   directory.
 - `/var/lib/hs-uploader` writable for the uploader's watermark store.

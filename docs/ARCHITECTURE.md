@@ -29,7 +29,7 @@ wspr-recorder daemon (one per radiod)
   │     ├─ CallsignDB: type-3 hash resolution, persistent JSON
   │     ├─ compute_noise(): per-cycle RMS + FFT noise
   │     └─ CycleBatcher → SpotSink → wspr.spots / wspr.noise rows
-  │          in /var/lib/sigmond/sink.db via sigmond.hamsci_ch
+  │          in /var/lib/sigmond/sink.db via sigmond.hamsci_sink
   │
   ├── upload  (only when WSPR_USE_HS_UPLOADER=1)
   │     └─ WsprUploaderHs: in-process hs-uploader pump →
@@ -63,7 +63,7 @@ The decode and upload stages are feature-flagged and additive:
   `WsprUploaderHs` pump, which ships sink rows upstream.
 
 Each flag is independent and each silently no-ops when its
-prerequisites are absent (`sigmond.hamsci_ch`, the `hs-uploader`
+prerequisites are absent (`sigmond.hamsci_sink`, the `hs-uploader`
 package, reporter-identity env). The recorder itself always runs.
 
 ## Source layout
@@ -95,7 +95,7 @@ wspr_recorder/
   decoder.py           # DecoderRunner: wsprd / jt9 runner, RawSpot
   callsign_db.py       # cross-decoder type-3 hash resolver, persistent JSON
   noise.py             # per-cycle RMS + FFT NoiseMeasurement
-  spot_sink.py         # SpotSink + CycleBatcher → hamsci_ch wspr.spots/noise
+  spot_sink.py         # SpotSink + CycleBatcher → hamsci_sink wspr.spots/noise
   spot_processor.py    # standalone 34-field spot enhancer (not on the v2 path)
 
   # upload path (active when WSPR_USE_HS_UPLOADER=1)
@@ -105,7 +105,7 @@ wspr_recorder/
 
 `spot_processor.py` (the standalone 34-field enhancer) is not on the
 pipeline-v2 path — `SpotSink` writes `RawSpot`s straight to the
-canonical `hamsci_ch` row shape and the uploader's wsprdaemon
+canonical `hamsci_sink` row shape and the uploader's wsprdaemon
 transport computes geodesy downstream. It remains in-tree because
 `tests/` still exercises it.
 
@@ -244,8 +244,8 @@ share the cycle so one reading covers them.
 
 The producer side of the pipeline-v2 DB-direct path; gated on
 `WD_DECODE_VIA_DB=1`. `SpotSink` adapts `RawSpot`s to the canonical
-`hamsci_ch` row shape (`SCHEMA_VERSION = 2`) and writes them via
-`sigmond.hamsci_ch.Writer(mode="wspr", table="spots")`; `hamsci_ch`
+`hamsci_sink` row shape (`SCHEMA_VERSION = 2`) and writes them via
+`sigmond.hamsci_sink.Writer(mode="wspr", table="spots")`; `hamsci_sink`
 is lazy-imported so installs without sigmond run with all sink
 operations no-op'd. `CycleBatcher` collects per-band spots+noise into
 one per-cycle write on a dedicated writer thread — this keeps the

@@ -23,7 +23,7 @@ per radiod, `Type=notify` with a watchdog.
 - **Full pipeline.** `WD_DECODE_VIA_DB=1` turns on in-process decode →
   SQLite sink; `WSPR_USE_HS_UPLOADER=1` additionally turns on the
   in-process uploader. Each flag is independent; each silently no-ops
-  if its prerequisites are absent (sigmond `hamsci_ch`, `hs-uploader`
+  if its prerequisites are absent (sigmond `hamsci_sink`, `hs-uploader`
   package, reporter-identity env). The recorder always runs regardless.
 
 With both flags set, wspr-recorder supersedes `wsprdaemon-client`'s
@@ -76,7 +76,7 @@ radiod RTP stream (12kHz, wire encoding configurable — default f32)
                     → compute_noise() — per-cycle RMS + FFT noise
                     → CycleBatcher → SpotSink (spot_sink.py)
                         → wspr.spots + wspr.noise rows
-                        → /var/lib/sigmond/sink.db via sigmond.hamsci_ch
+                        → /var/lib/sigmond/sink.db via sigmond.hamsci_sink
                                                        │
               ── WSPR_USE_HS_UPLOADER=1: in-process uploader ──
                     → WsprUploaderHs (hs_uploader_shim.py)
@@ -84,7 +84,7 @@ radiod RTP stream (12kHz, wire encoding configurable — default f32)
                         → wsprdaemon.org (cycle-aligned spots+noise tar / SFTP)
 ```
 
-The `spot_processor.py` module (a separate 34-field enhancer) is not on this path; the SpotSink writes `RawSpot` instances straight to the canonical `hamsci_ch` row shape, and downstream geodesy is computed by the uploader's wsprdaemon transport.
+The `spot_processor.py` module (a separate 34-field enhancer) is not on this path; the SpotSink writes `RawSpot` instances straight to the canonical `hamsci_sink` row shape, and downstream geodesy is computed by the uploader's wsprdaemon transport.
 
 ### Five Decode Modes
 
@@ -132,7 +132,7 @@ The +120 s headroom above the longest period exists so that the W2 cycle that st
 
 **Noise** (`noise.py`): Per-cycle noise measurement. Computes RMS noise from three time windows of the 120 s WAV plus FFT noise from wsprd's `-c` C2 output (Hanning-windowed FFT, bottom 30% of magnitudes in the passband). Produces one `NoiseMeasurement` per (band, cycle), flushed through the `SpotSink` as `wspr.noise` rows. Only W2 decodes produce the C2 file; F-modes share the cycle so one reading covers them.
 
-**Spot Sink** (`spot_sink.py`): The producer side of the pipeline-v2 DB-direct path. Gated on `WD_DECODE_VIA_DB=1`. `SpotSink` adapts in-process `RawSpot` instances to the canonical `hamsci_ch` row shape (`SCHEMA_VERSION = 2`) and writes them via `sigmond.hamsci_ch.Writer(mode="wspr", table="spots")`. `CycleBatcher` collects per-band spots into one per-cycle `wspr.spots` write on a dedicated writer thread — this sidesteps SQLite's thread-affinity check (decodes run on per-band worker threads, but only the batcher thread touches the DB) and yields one `Writer.insert()` per cycle instead of one per band. Lazy-imports `hamsci_ch`, so kiwi-only / CI installs with no sigmond run identically with all sink operations no-op'd. `resolve_reporter_identity()` resolves `(rx_call, rx_grid)` from `WD_RX_CALL`/`WD_RX_GRID` or `WD_RECEIVER_CALL`/`WD_RECEIVER_GRID`.
+**Spot Sink** (`spot_sink.py`): The producer side of the pipeline-v2 DB-direct path. Gated on `WD_DECODE_VIA_DB=1`. `SpotSink` adapts in-process `RawSpot` instances to the canonical `hamsci_sink` row shape (`SCHEMA_VERSION = 2`) and writes them via `sigmond.hamsci_sink.Writer(mode="wspr", table="spots")`. `CycleBatcher` collects per-band spots into one per-cycle `wspr.spots` write on a dedicated writer thread — this sidesteps SQLite's thread-affinity check (decodes run on per-band worker threads, but only the batcher thread touches the DB) and yields one `Writer.insert()` per cycle instead of one per band. Lazy-imports `hamsci_sink`, so kiwi-only / CI installs with no sigmond run identically with all sink operations no-op'd. `resolve_reporter_identity()` resolves `(rx_call, rx_grid)` from `WD_RX_CALL`/`WD_RX_GRID` or `WD_RECEIVER_CALL`/`WD_RECEIVER_GRID`.
 
 **HS Uploader Shim** (`hs_uploader_shim.py`): In-process uploader, gated on `WSPR_USE_HS_UPLOADER=1`. `WsprUploaderHs` owns two `hs-uploader` pipelines inside one pump thread: (1) **wsprdaemon-tar** — `WsprCycleSource` on `(wspr.spots, wspr.noise)` → `WsprdaemonTarSftp`, one cycle-aligned tar per WSPR 2-min cycle (parallel `wsprdaemon/spots/...` + `wsprdaemon/noise/...` subtrees) shipped to wsprdaemon.org by SFTP; (2) **wsprnet** — `SqliteSource` on `wspr.spots` → `WsprNet`, individual MEPT rows posted to wsprnet.org by HTTP. Each pipeline has its own watermark stored under `/var/lib/hs-uploader`. The pump waits on a wake `Event` or a 60 s `PUMP_INTERVAL_SEC` timeout. Built from env (`WD_RECEIVER_CALL/GRID`, `WD_SFTP_SERVERS`, `WD_UPLOAD_WSPRDAEMON_DIR`, …) via `from_env()`. This absorbs the role of the standalone `wd-upload-hs@.service` (v3 Phase A). Optional `WD_VERIFY_FLUSH=1` runs a verify-and-flush thread (`wsprnet_verifier.py`) that polls wsprnet for accepted spots and deletes confirmed rows from `pending_uploads`.
 
@@ -260,7 +260,7 @@ operational sigmond client covering record → decode → sink → upload.
   `/var/lib/hs-uploader` (uploader watermark store).
 - **DB-direct decode** (`spot_sink.py`, `WD_DECODE_VIA_DB=1`). Decodes
   in-process and writes `wspr.spots` + `wspr.noise` rows into
-  `/var/lib/sigmond/sink.db` via `sigmond.hamsci_ch`. Per-cycle batched
+  `/var/lib/sigmond/sink.db` via `sigmond.hamsci_sink`. Per-cycle batched
   through `CycleBatcher`.
 - **In-process hs-uploader** (`hs_uploader_shim.py`,
   `WSPR_USE_HS_UPLOADER=1`). Ships spots to wsprnet.org (HTTP MEPT) and
