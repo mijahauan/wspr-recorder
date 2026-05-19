@@ -158,10 +158,10 @@ def _resolve_writer():
     without code changes.
     """
     try:
-        from sigmond.hamsci_sink import Writer  # type: ignore[import-not-found]
+        from sigmond.hamsci_ch import Writer  # type: ignore[import-not-found]
     except ImportError:
         logger.warning(
-            "spot_sink: sigmond.hamsci_sink not importable — DB writes "
+            "spot_sink: sigmond.hamsci_ch not importable — DB writes "
             "disabled.  Add /opt/git/sigmond/sigmond/lib to PYTHONPATH "
             "or install sigmond alongside wsprdaemon-client to enable."
         )
@@ -530,7 +530,7 @@ class SpotSink:
         # their own Writer instance.  Built lazily on first noise flush
         # to keep startup cost zero on stations that don't ship noise.
         if self._noise_writer is None:
-            from sigmond.hamsci_sink import Writer  # type: ignore
+            from sigmond.hamsci_ch import Writer  # type: ignore
             try:
                 self._noise_writer = Writer.from_env(
                     mode="wspr", table="noise",
