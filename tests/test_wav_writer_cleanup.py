@@ -185,3 +185,66 @@ def test_cleanup_handles_concurrent_unlink_race(writer, tmp_path):
     with unittest.mock.patch.object(Path, "unlink", racy_unlink):
         # Should not raise — missing_ok=True absorbs the race
         writer.cleanup_old_files(max_age_minutes=35)
+
+
+def test_safe_sorted_by_mtime_tolerates_concurrent_unlink(tmp_path):
+    """Task #31 fix: the file-listing sort key must not raise when a
+    file disappears between glob() and stat().
+
+    Before the fix, ``sorted(glob, key=lambda p: p.stat().st_mtime)``
+    raised FileNotFoundError out of write_period's make_room call when
+    the cleanup_loop's ``enforce_max_files_per_band`` unlinked a wav
+    concurrently — once per cycle, surfaced as
+    "Failed to write period WAV file: [Errno 2] <stale wav path>"
+    even though the new write itself never executed.
+    """
+    from wspr_recorder.wav_writer import _safe_sorted_by_mtime
+
+    band = tmp_path / "20"
+    band.mkdir()
+    a = band / "1.wav"; a.touch()
+    b = band / "2.wav"; b.touch()
+    c = band / "3.wav"; c.touch()
+
+    # Simulate concurrent unlink by deleting `b` between glob and sort.
+    glob_iter = list(band.glob("*.wav"))
+    b.unlink()
+
+    out = _safe_sorted_by_mtime(glob_iter)
+    # `b` skipped; `a` and `c` survive
+    assert b not in out
+    assert set(out) == {a, c}
+
+
+def test_make_room_for_file_no_enoent_under_concurrent_cleanup(writer, tmp_path):
+    """End-to-end: a wav being unlinked mid-glob does not crash
+    make_room_for_file."""
+    import threading
+    band = tmp_path / "20"
+    band.mkdir()
+
+    # Pre-fill so make_room actually has work to do
+    for i in range(8):
+        f = band / f"file_{i:03d}.wav"
+        f.touch()
+
+    # Start a thread that aggressively unlinks during make_room
+    stop = threading.Event()
+
+    def unlinker():
+        while not stop.is_set():
+            for f in list(band.glob("*.wav")):
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    pass
+            return
+
+    t = threading.Thread(target=unlinker, daemon=True)
+    t.start()
+    try:
+        # Should not raise even though files vanish under our feet
+        writer.make_room_for_file(14095600, max_files=5)
+    finally:
+        stop.set()
+        t.join(timeout=1.0)

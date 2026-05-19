@@ -20,6 +20,41 @@ from .config import freq_to_band_name
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_sorted_by_mtime(paths) -> List[Path]:
+    """Sort ``paths`` by mtime ascending, tolerating concurrent unlinks.
+
+    The naive ``sorted(paths, key=lambda p: p.stat().st_mtime)`` invokes
+    ``stat()`` lazily during the sort.  A concurrent thread (cleanup
+    loop, another make_room_for_file) can unlink an entry between the
+    iterable yielding it and the key function consuming it; ``stat()``
+    then raises FileNotFoundError that surfaces *out of* ``sorted()``
+    with the dead path as the exception filename.
+
+    On the wspr-recorder hot path that exception used to surface from
+    write_period's catch-all as "Failed to write period WAV file:
+    [Errno 2] No such file or directory: <some old wav>" — once per
+    cycle, ~11×/day — even though the write itself never actually ran.
+    See Task #31 for the diagnostic trail.
+
+    Solution: snapshot ``(path, mtime)`` up front, skipping entries
+    whose lstat fails.  The returned list contains only paths that
+    existed at snapshot time; callers that later try to unlink a
+    snapshotted path must still handle FileNotFoundError defensively
+    (their try/except already does).
+    """
+    snapshot: List[tuple[Path, float]] = []
+    for p in paths:
+        try:
+            snapshot.append((p, p.lstat().st_mtime))
+        except FileNotFoundError:
+            # Raced with concurrent unlink — entry is already gone,
+            # nothing to sort.
+            continue
+    snapshot.sort(key=lambda t: t[1])
+    return [p for p, _ in snapshot]
+
+
 # Import timing service (optional - may not be available)
 try:
     from .timing_service import TimingService, TimingMetadata
@@ -518,28 +553,32 @@ class WavWriter:
     def enforce_max_files_per_band(self, max_files: int = 35) -> int:
         """
         Ensure no band directory has more than max_files WAV files.
-        
+
         Deletes oldest files first to make room for new ones.
         This prevents filling up /dev/shm if wsprdaemon stops processing.
-        
+
         Args:
             max_files: Maximum WAV files per band directory (default: 35)
-            
+
         Returns:
             Number of files removed
         """
         removed_count = 0
-        
+
         # Find all band subdirectories
         for band_dir in self.output_dir.iterdir():
             if not band_dir.is_dir():
                 continue
-            
-            # Get all WAV files in this band directory, sorted by mtime (oldest first)
-            wav_files = sorted(
-                band_dir.glob("*.wav"),
-                key=lambda p: p.stat().st_mtime
-            )
+
+            # Snapshot (path, mtime) up front instead of letting the
+            # ``key=`` callback stat lazily during sort.  A concurrent
+            # ``make_room_for_file`` / ``cleanup_old_files`` running in
+            # another thread can unlink between glob() and stat(); a
+            # lazy key raises FileNotFoundError out of ``sorted()`` and
+            # the caller's try/except catches it with the *deleted*
+            # path in the error message (Task #31).  Skipping entries
+            # whose lstat fails keeps the sort race-tolerant.
+            wav_files = _safe_sorted_by_mtime(band_dir.glob("*.wav"))
             
             # Remove oldest files if over limit
             files_to_remove = len(wav_files) - max_files
@@ -572,20 +611,18 @@ class WavWriter:
     def make_room_for_file(self, frequency_hz: int, max_files: int = 35) -> None:
         """
         Ensure there's room for a new file in the band directory.
-        
+
         Call this BEFORE writing a new file to guarantee we never exceed max_files.
-        
+
         Args:
             frequency_hz: Frequency of the band to check
             max_files: Maximum files allowed (default: 35)
         """
         band_dir = self.get_band_dir(frequency_hz)
-        
-        # Get all WAV files, sorted by mtime (oldest first)
-        wav_files = sorted(
-            band_dir.glob("*.wav"),
-            key=lambda p: p.stat().st_mtime
-        )
+
+        # Race-tolerant snapshot: see enforce_max_files_per_band for
+        # the rationale (Task #31).
+        wav_files = _safe_sorted_by_mtime(band_dir.glob("*.wav"))
         
         # Need to remove files to make room for the new one
         # We want max_files - 1 after removal so the new file brings it to max_files
