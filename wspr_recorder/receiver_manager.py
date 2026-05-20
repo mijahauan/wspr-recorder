@@ -300,6 +300,18 @@ class ReceiverManager:
                 if self._provision(freq_hz):
                     success += 1
 
+            # Post-batch verify-and-retry — Task #46 workaround.
+            # The per-call verify inside ensure_channel returns success
+            # on a channel that subsequently reverts to radiod-default
+            # state (freq=0, samprate=radiod-global, default multicast
+            # group), particularly in dual-source deployments where the
+            # second source's ensure_channel burst seems to disturb the
+            # first source's recently-created channels.  This sweep
+            # catches the revert and re-issues ensure_channel for any
+            # band that doesn't read back correctly.
+            if success > 0:
+                self._verify_and_retry_provisioned()
+
             logger.info(
                 f"Provisioned {success}/{len(self.config.frequencies)} channels "
                 f"across {len(self._multi_by_group)} multicast group(s)"
@@ -380,6 +392,114 @@ class ReceiverManager:
         except Exception as e:
             logger.error(f"Failed to provision {band_name} ({freq_hz} Hz): {e}")
             return False
+
+    def _verify_and_retry_provisioned(self, max_passes: int = 3) -> bool:
+        """Re-discover radiod's view of every channel we just created
+        and re-issue ensure_channel for any band whose readback doesn't
+        match the request.
+
+        Task #46 workaround.  ``ensure_channel`` has its own per-call
+        verify loop, but in dual-source deployments it can return
+        success on a channel that subsequently reverts to radiod-default
+        state (freq=0, samprate equals radiod's global default rather
+        than the requested 12 kHz, multicast group equals the radiod-
+        default advertised group rather than ka9q-python's client-id-
+        derived one).  Verified 2026-05-20 on B4-100 with bee1 +
+        B4-100 sources both configured: 11/17 B4-100 channels reverted
+        after their initial ensure_channel returned True.  Re-issuing
+        ensure_channel for those bands one at a time outside the
+        startup burst succeeded for every one of them, supporting the
+        burst-rate-race theory.
+
+        Returns True iff every channel reads back correctly before the
+        retry budget is exhausted.
+        """
+        from ka9q.discovery import discover_channels
+        assert self._control is not None
+        defaults = self.config.channel_defaults
+        target_rate = defaults.sample_rate
+        encoding_int = _resolve_encoding(defaults.encoding)
+        rlf = self.config.processing.radiod_lifetime_frames
+        lifetime_arg: Optional[int] = rlf if rlf > 0 else None
+
+        # Settle delay: the Task #46 revert manifests several seconds
+        # after the ensure_channel call returns success.  Running a
+        # discover immediately would see the channels in their fresh-
+        # and-correct state and exit the loop with bad=[] silently.
+        # 15 s is long enough to catch the revert in observed cases
+        # (broken-state channels persist indefinitely once reverted).
+        settle_sec = 15.0
+        logger.info(
+            f"verify-and-retry [{self.source_key}]: settling {settle_sec}s "
+            f"before first readback (catches post-success channel revert)"
+        )
+        time.sleep(settle_sec)
+
+        for pass_n in range(max_passes):
+            channels = discover_channels(
+                self._status_address, listen_duration=2.0,
+            )
+            bad = []
+            for state in list(self.state.channels.values()):
+                ch = channels.get(state.ssrc)
+                want = state.frequency_hz
+                if (ch is None
+                        or abs(ch.frequency - want) > 1
+                        or ch.sample_rate != target_rate):
+                    bad.append(state)
+            if not bad:
+                if pass_n > 0:
+                    logger.info(
+                        f"verify-and-retry [{self.source_key}]: "
+                        f"all {len(self.state.channels)} channels "
+                        f"confirmed correct after pass {pass_n + 1}"
+                    )
+                return True
+            bad_names = ", ".join(s.band_name for s in bad)
+            logger.warning(
+                f"verify-and-retry [{self.source_key}] pass "
+                f"{pass_n + 1}: {len(bad)}/{len(self.state.channels)} "
+                f"band(s) need re-provisioning: {bad_names}"
+            )
+            for state in bad:
+                try:
+                    self._control.ensure_channel(
+                        frequency_hz=float(state.frequency_hz),
+                        preset=defaults.mode,
+                        sample_rate=target_rate,
+                        agc_enable=1 if defaults.agc else 0,
+                        gain=defaults.gain,
+                        encoding=encoding_int,
+                        lifetime=lifetime_arg,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"verify-and-retry [{self.source_key}]: "
+                        f"re-issue SSRC {state.ssrc} ({state.band_name}) "
+                        f"raised {type(e).__name__}: {e}"
+                    )
+            # Brief settle so radiod's status broadcasts catch up
+            # before the next discover_channels listens.
+            time.sleep(0.5)
+
+        # One final readback so the failure log lists exactly which
+        # bands are still wrong.
+        channels = discover_channels(
+            self._status_address, listen_duration=0.5,
+        )
+        still_bad: List[str] = []
+        for state in self.state.channels.values():
+            ch = channels.get(state.ssrc)
+            if (ch is None
+                    or abs(ch.frequency - state.frequency_hz) > 1
+                    or ch.sample_rate != target_rate):
+                still_bad.append(state.band_name)
+        logger.error(
+            f"verify-and-retry [{self.source_key}]: gave up after "
+            f"{max_passes} passes; {len(still_bad)} band(s) still wrong: "
+            f"{', '.join(still_bad) or '<none>'}"
+        )
+        return False
 
     def start_streams(self) -> None:
         for key, multi in self._multi_by_group.items():
