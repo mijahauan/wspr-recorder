@@ -225,6 +225,48 @@ class TestPipelineWiring(unittest.TestCase):
         finally:
             u.stop(timeout=2.0)
 
+    def test_psk_tar_pipeline_selects_multi_rx_columns(self):
+        """``PSK_VIA_WSPRDAEMON_TAR=1`` wires the psk-tar pipeline,
+        and its SqliteSource MUST project ``rx_source`` +
+        ``frequency_bucket_hz`` so the per-rx receiver tag and the
+        cross-rx dedup bucket reach wsprdaemon-server in the JSONL
+        payload.  Phase D Cut 4 of the multi-source psk-recorder
+        rollout — psk-recorder stamps these fields on every spot
+        (Phase A / Cut 2) but the wsprdaemon-tar pipeline has to opt
+        in to ship them."""
+        # The gate is read from os.environ inside the shim, not from
+        # the WsprUploaderHs config dict — patch it for this test.
+        with patch.dict(
+            os.environ,
+            {"PSK_VIA_WSPRDAEMON_TAR": "1"},
+            clear=False,
+        ):
+            u = self._start()
+        try:
+            psk_pipe = next(
+                (p for p in u._uploader.pipelines
+                 if p.name.startswith("psk-tar")),
+                None,
+            )
+            self.assertIsNotNone(
+                psk_pipe,
+                "psk-tar pipeline should be constructed when "
+                "PSK_VIA_WSPRDAEMON_TAR=1",
+            )
+            cols = psk_pipe.source.select_columns
+            # The existing baseline columns must still be present so
+            # this test catches an accidental projection regression.
+            for required in (
+                "time", "mode", "frequency",
+                "tx_call", "grid", "forward_to_pskreporter",
+            ):
+                self.assertIn(required, cols)
+            # Cut 4 additions — what this test is really pinning.
+            self.assertIn("rx_source", cols)
+            self.assertIn("frequency_bucket_hz", cols)
+        finally:
+            u.stop(timeout=2.0)
+
 
 # ---- short-spots-file parser --------------------------------------------
 

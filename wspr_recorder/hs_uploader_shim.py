@@ -740,6 +740,15 @@ class WsprUploaderHs:
         # Project just the columns the tar builder + JSONL output
         # need.  Includes forward_to_pskreporter so the server's
         # routing.json synthesizer can collapse per-receiver flags.
+        #
+        # ``rx_source`` and ``frequency_bucket_hz`` are stamped by
+        # psk-recorder (Phase A / Phase D Cut 2 of the multi-source
+        # rollout) on every spot.  The wsprdaemon-tar JSONL surface
+        # uses ``json.dumps(c, ...)`` over the columns dict — so
+        # including them here is all that's required to ship the
+        # per-rx receiver tag + dedup bucket to wsprdaemon-server.
+        # Server-side consumers that don't know these fields will
+        # silently ignore them (JSON forward-compat).
         sqlite_source = SqliteSource.from_env(
             database="psk", table="spots",
             accepted_schema_versions=[2],
@@ -750,6 +759,13 @@ class WsprUploaderHs:
                 "tx_call", "grid", "message", "host_call", "host_grid",
                 "radiod_id", "instance", "processing_version",
                 "forward_to_pskreporter",
+                # Multi-source visibility — the per-rx receiver key
+                # (``radiod:<status_address>``) and the 100 Hz freq
+                # bucket used by cross-rx dedup.  Forward-compat so
+                # the server can build per-rx diversity views and run
+                # its own dedup if it wants.
+                "rx_source",
+                "frequency_bucket_hz",
             ],
         )
         if sqlite_source.health() == HEALTH_NOOP:
