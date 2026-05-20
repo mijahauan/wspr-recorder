@@ -1,13 +1,16 @@
 """Tests for radiod channel-lifetime keep-alive (ka9q-python ≥3.13.0).
 
-wspr-recorder opts into ka9q-python / radiod's LIFETIME tag so a
-crashed or killed recorder can't leave its per-band channels lingering
-on radiod beyond ~`radiod_lifetime_frames / 50` seconds (≈2 min at
-the default).
+wspr-recorder can opt into ka9q-python / radiod's LIFETIME tag via
+``[processing] radiod_lifetime_frames``.  The default is 0 (infinite,
+no LIFETIME tag) because a positive value triggers a keepalive-vs-
+expiry race in radiod that wedges channels at Template defaults —
+see the docstring on ``ProcessingConfig.radiod_lifetime_frames``
+for the full diagnosis.
 
 Surfaces under test:
-  * config: ``[processing] radiod_lifetime_frames`` defaults to 6000,
-    validates non-negative int, sentinel 0 = "no LIFETIME tag".
+  * config: ``[processing] radiod_lifetime_frames`` defaults to 0,
+    validates non-negative int, accepts positive overrides for hosts
+    where crash-cleanup matters more than the wedge risk.
   * `_lifetime_refresh_pass`: the per-tick refresh body, factored out
     of the async loop so we can drive it directly without fighting
     asyncio.sleep cadence.
@@ -40,9 +43,9 @@ modes = ["W2"]
 
 class ConfigDefaultsTests(unittest.TestCase):
 
-    def test_default_is_6000_frames(self):
+    def test_default_is_zero_frames(self):
         cfg = Config()
-        self.assertEqual(cfg.processing.radiod_lifetime_frames, 6000)
+        self.assertEqual(cfg.processing.radiod_lifetime_frames, 0)
 
     def _write_config(self, body: str) -> Path:
         tmp = tempfile.NamedTemporaryFile(
@@ -58,7 +61,7 @@ class ConfigDefaultsTests(unittest.TestCase):
     def test_missing_section_falls_back_to_default(self):
         path = self._write_config(_MIN_TOML)
         cfg = load_config(str(path))
-        self.assertEqual(cfg.processing.radiod_lifetime_frames, 6000)
+        self.assertEqual(cfg.processing.radiod_lifetime_frames, 0)
 
     def test_explicit_value_honored(self):
         path = self._write_config(

@@ -214,11 +214,33 @@ class ProcessingConfig:
     auto-destruct after this many radiod main-loop frames (~50 Hz at the
     default 20 ms blocktime, so 6000 ≈ 2 min).  The recorder refreshes
     lifetime on every active SSRC every (frames / 4) seconds while
-    running, so a crashed/killed recorder leaves no residual channels
-    on radiod within ~2 min.  0 = infinite (no LIFETIME tag, no
-    keep-alive — radiod owns the channel for its full template default).
+    running.
+
+    **Default is 0 (infinite — no LIFETIME tag, no keep-alive)** to avoid
+    a keepalive-vs-expiry race in radiod that wedges channels:
+
+      * Under load with multiple sources, the keepalive thread can slip
+        past the channel idle window.
+      * When a finite-lifetime channel expires before its keepalive
+        arrives, `set_channel_lifetime` sends an 18-byte packet with
+        only OUTPUT_SSRC + COMMAND_TAG + LIFETIME + EOL — no freq /
+        samprate / dest TLVs.
+      * Radiod's `radio_status.c` new-SSRC branch (lookup_chan returns
+        NULL for the destroyed channel) calls `create_chan` to clone
+        from Template defaults, then runs `decode_radio_commands` on
+        the bare packet — which has nothing but LIFETIME to apply.
+      * The channel sticks at Template defaults forever
+        (samprate=24000, freq=0, default advertised data group).
+
+    Use a positive value only on hosts where the trade-off is worth it:
+    if the recorder crashes hard, finite-lifetime channels self-clean
+    within ~2 min, while infinite-lifetime channels need manual
+    `tune` or radiod restart to clear.  Verified on a 3-source host
+    (B4-100 + bee1 + bee2, 51 channels): default 6000 wedged the
+    local 17 channels within ~6 min; switching to 0 cleared the wedge
+    and held all 51 channels synced.
     """
-    radiod_lifetime_frames: int = 6000
+    radiod_lifetime_frames: int = 0
 
 @dataclass
 class BandConfig:
