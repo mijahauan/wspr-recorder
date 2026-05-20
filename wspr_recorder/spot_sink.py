@@ -884,11 +884,24 @@ class CycleBatcher:
         # plumbing — keep an "?" placeholder so the log format stays
         # parseable.
         rx_label = batch.rx_source or batch.radiod_id or "?"
+        # Per-band breakdown — emit alongside the count so downstream
+        # observers (e.g. `smd watch wspr`) can render
+        # ``[40m:N 30m:M ...]`` without going back to sqlite, which
+        # races wsprnet's cross-rx dedup that deletes "loser" siblings
+        # within milliseconds of insertion.  Bare band names (no "m"
+        # suffix) match what's stored in the DB; presentation layer
+        # adds the suffix.  Emit unsorted; consumers handle ordering.
+        bands_breakdown = " ".join(
+            f"{band}:{len(spots)}"
+            for band, spots in batch.bands.items()
+        )
         logger.info(
             "cycle UTC %s:%s rx=%s → %d spots in wspr.spots, "
-            "%d noise rows in wspr.noise (%d bands, sqlite write %d ms)",
+            "%d noise rows in wspr.noise (%d bands, sqlite write %d ms)"
+            "%s",
             hhmm[:2], hhmm[2:], rx_label, n, n_noise,
             len(batch.bands) or len(batch.noise), elapsed_ms,
+            f" bands=[{bands_breakdown}]" if bands_breakdown else "",
         )
         # Wake the in-process uploader.  No-op if no callback is
         # registered.  A callback exception is logged but doesn't
