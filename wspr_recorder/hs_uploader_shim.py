@@ -901,7 +901,21 @@ class WsprUploaderHs:
                 # the wsprdaemon-tar pipeline below, whose SqliteSource
                 # does NOT set these dedup params and therefore sees
                 # every receiver's row (diversity tier).
-                dedup_partition_by=('time', 'callsign', 'frequency_hz'),
+                #
+                # Partition by ``band``, not ``frequency_hz``: two
+                # receivers with slightly different oscillator
+                # references report the same WSPR transmission at
+                # frequencies differing by 1-few Hz, and wsprnet's
+                # own dedup considers them the same spot.  Empirical
+                # 2026-05-20 finding: cycle 00:10 W9VW arrived at
+                # 14097098 (bee1, snr=-13) and 14097099 (B4-100,
+                # snr=-11) — the exact-freq partition kept both,
+                # wsprnet accepted one and rejected the other as
+                # duplicate.  Partitioning by band collapses them
+                # to one max-SNR winner while still keeping
+                # legitimately-distinct same-call multi-band spots
+                # (e.g. NI5F on 40m + 15m in the same cycle).
+                dedup_partition_by=('time', 'callsign', 'band'),
                 dedup_order_by_desc='snr_db',
             )
             if sqlite_source.health() != HEALTH_NOOP:
