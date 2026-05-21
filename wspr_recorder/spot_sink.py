@@ -787,6 +787,16 @@ class CycleBatcher:
         # double-wake if a late rx commits after backstop already
         # tripped, or after all-rx-done already fired the wake).
         self._cycle_wake_fired: set = set()
+        # Static per-source band → period_seconds list.  Populated by
+        # set_bands_by_source(); used at first expect_band() to compute
+        # the FULL expected_bands set for the cycle (rather than building
+        # it up incrementally as bands report).  Without this, the
+        # completion check can fire prematurely when only the fastest
+        # bands have reported in — they were the only ones the batch
+        # knew were expected.
+        #
+        # Shape: {rx_source: {band_name: [period_sec, ...]}}
+        self._bands_by_source: dict = {}
         self._stop = threading.Event()
         # Wake callback — invoked after every flush that committed
         # spots so an in-process uploader can pump immediately
@@ -816,6 +826,101 @@ class CycleBatcher:
         a None.
         """
         self._wake_callback = callback
+
+    def set_bands_by_source(
+        self,
+        bands_by_source: dict,
+    ) -> None:
+        """Register the static per-source band → period map.
+
+        ``bands_by_source`` shape::
+
+            {rx_source: {band_name: [period_sec, ...]}}
+
+        e.g.::
+
+            {"radiod:bee1-status.local": {
+                "40":   [120],
+                "60eu": [120],
+                "80":   [120, 300],
+                "2200": [120, 900],
+                "630":  [120, 1800],
+            }}
+
+        Used at FIRST ``expect_band`` call for a (cycle_key, rx_source)
+        to pre-populate the batch's expected_bands set with every band
+        that SHOULD report ``mark_done`` for this cycle UTC — based on
+        which of its periods evenly divide the cycle's epoch-second
+        boundary.  Without pre-registration the expected_bands set
+        grew incrementally as bands reported in, and completion check
+        ``completed >= expected`` could fire prematurely the instant
+        the first 1-2 fast bands' decodes finished (because those WERE
+        the only "expected" bands the batcher knew about yet).
+
+        Symptom we're fixing: a single (cycle, rx) producing TWO
+        separate cycle-commit log lines — the first with only a couple
+        of bands' decodes (early flush), the second 3-30 s later when
+        the slower bands finally reported, creating a phantom "second
+        cycle" in ``smd watch wspr``.
+
+        ``Iterable[str]`` configuration applied separately via
+        ``set_expected_rx_sources`` — the rx-side cross-rx sync.  This
+        method is the per-band-side completion sync.
+        """
+        with self._lock:
+            self._bands_by_source = {
+                src: {
+                    band: list(periods)
+                    for band, periods in bands.items()
+                }
+                for src, bands in bands_by_source.items()
+            }
+
+    def _expected_bands_for_cycle(
+        self,
+        cycle_key: Tuple[str, str],
+        rx_source: str,
+    ) -> set:
+        """Compute the band set that SHOULD report for this cycle.
+
+        For each band in ``_bands_by_source[rx_source]``, a band is
+        included if ANY of its configured periods evenly divides the
+        cycle's epoch-second boundary — that's the same rule
+        ``decode_mode.modes_completing_at_minute()`` uses to decide
+        whether a band's recording finishes on this minute.
+
+        Empty config (caller never called ``set_bands_by_source``)
+        returns an empty set, which is the fallback "grow expected
+        as bands report" behaviour of the pre-fix code.  Safe for
+        out-of-tree / test callers that don't supply the band map.
+        """
+        if not self._bands_by_source:
+            return set()
+        bands_for_source = self._bands_by_source.get(rx_source, {})
+        if not bands_for_source:
+            return set()
+        date_str, hhmm = cycle_key
+        try:
+            year = 2000 + int(date_str[:2])
+            month = int(date_str[2:4])
+            day = int(date_str[4:6])
+            hour = int(hhmm[:2])
+            minute = int(hhmm[2:])
+        except (ValueError, IndexError):
+            return set()
+        try:
+            dt = datetime(year, month, day, hour, minute,
+                          tzinfo=timezone.utc)
+        except ValueError:
+            return set()
+        epoch_sec = int(dt.timestamp())
+        expected: set = set()
+        for band, periods in bands_for_source.items():
+            for p in periods:
+                if p > 0 and epoch_sec % p == 0:
+                    expected.add(band)
+                    break
+        return expected
 
     def set_expected_rx_sources(self, sources: Iterable[str]) -> None:
         """Configure cross-rx sync.
@@ -875,6 +980,17 @@ class CycleBatcher:
                 batch.radiod_id = radiod_id
                 batch.rx_source = rx_source
                 batch.first_expect_at = now
+                # Pre-populate expected_bands from the static band-period
+                # config (if registered via set_bands_by_source).  This
+                # tells the batcher the FULL set of bands that should
+                # report mark_done for this cycle BEFORE any of them
+                # have reported in yet — closes the early-flush race
+                # where completion fired after only the fastest 1-2
+                # bands' decodes finished.  Falls back to incremental
+                # growth when no config is registered.
+                pre = self._expected_bands_for_cycle(cycle_key, rx_source)
+                if pre:
+                    batch.expected_bands |= pre
                 self._batches[key] = batch
             batch.expected_bands.add(band)
             self._cond.notify()

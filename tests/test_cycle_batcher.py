@@ -716,3 +716,139 @@ class TestCycleBatcherCrossRxSync(unittest.TestCase):
             self.assertEqual(len(wakes), 1)
         finally:
             b.stop()
+
+
+# ── Band-period pre-registration (fixes early-flush race) ─────────────────
+
+class TestCycleBatcherBandPrereg(unittest.TestCase):
+    """When set_bands_by_source is configured, expect_band pre-populates
+    the batch's expected_bands set at the FIRST call for a cycle, based
+    on which of the band's periods evenly divide the cycle's epoch
+    seconds.  This fixes the early-flush race where completion fired
+    after only the fastest 1-2 bands had reported.
+    """
+
+    def test_pre_registered_bands_block_early_flush(self):
+        """3 W2 bands configured.  First band finishes early and calls
+        mark_done.  Without pre-registration, completion would fire
+        (expected={b1}, completed={b1}).  With pre-registration,
+        expected={b1, b2, b3} so the flush waits for the other two."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=30.0, backstop_sec=30.0)
+        # All bands have period 120s (W2).  Cycle 07:50 has minute %
+        # 2 == 0 → all 3 bands expected.
+        b.set_bands_by_source({
+            "radiod:A": {
+                "40": [120],
+                "30": [120],
+                "20": [120],
+            },
+        })
+        try:
+            cycle = ("260512", "0750")  # epoch_min % 2 == 0
+            b.expect_band(cycle, "40",
+                          radiod_id="rx-A", rx_source="radiod:A")
+            b.mark_done(cycle, "40", rx_source="radiod:A")
+            time.sleep(0.2)
+            self.assertEqual(
+                len(sink.calls), 0,
+                "expected_bands pre-populated; flush waits for the "
+                "remaining 2 bands the static config knows about",
+            )
+            b.expect_band(cycle, "30",
+                          radiod_id="rx-A", rx_source="radiod:A")
+            b.mark_done(cycle, "30", rx_source="radiod:A")
+            b.expect_band(cycle, "20",
+                          radiod_id="rx-A", rx_source="radiod:A")
+            b.mark_done(cycle, "20", rx_source="radiod:A")
+            time.sleep(0.3)
+            self.assertEqual(len(sink.calls), 1,
+                             "All 3 expected bands reported → flush")
+        finally:
+            b.stop()
+
+    def test_w5_band_only_expected_on_w5_cycle(self):
+        """Band with periods [120, 300]: expected on cycles where
+        :MM divides BOTH 2 and 5 (e.g. :50) OR just :MM%2 (e.g. :52
+        only W2 expected, no W5 contribution)."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=30.0, backstop_sec=30.0)
+        b.set_bands_by_source({
+            "radiod:A": {
+                "40":   [120],         # W2 only
+                "80eu": [120, 300],    # W2 + W5
+            },
+        })
+        try:
+            # :52 is a W2-only cycle (52%2==0, 52%5==2).  80eu is
+            # expected because its W2 period (120) matches.
+            cy_52 = ("260512", "0752")
+            b.expect_band(cy_52, "40",
+                          radiod_id="rx-A", rx_source="radiod:A")
+            b.mark_done(cy_52, "40", rx_source="radiod:A")
+            b.expect_band(cy_52, "80eu",
+                          radiod_id="rx-A", rx_source="radiod:A")
+            b.mark_done(cy_52, "80eu", rx_source="radiod:A")
+            time.sleep(0.3)
+            self.assertEqual(len(sink.calls), 1,
+                             ":52 → both bands W2-mode → 1 flush")
+        finally:
+            b.stop()
+
+    def test_empty_config_falls_back_to_incremental(self):
+        """No set_bands_by_source call → expected_bands grows as
+        bands report (pre-fix behaviour, backwards compatible)."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=30.0, backstop_sec=30.0)
+        try:
+            cycle = ("260512", "0750")
+            b.expect_band(cycle, "40", radiod_id="rx-A")
+            b.mark_done(cycle, "40")
+            time.sleep(0.3)
+            self.assertEqual(len(sink.calls), 1,
+                             "Empty config → fall back to incremental")
+        finally:
+            b.stop()
+
+    def test_unconfigured_source_falls_back(self):
+        """Config registered for one source; expect_band on a DIFFERENT
+        source still works (just no pre-population for that one)."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=30.0, backstop_sec=30.0)
+        b.set_bands_by_source({"radiod:A": {"40": [120]}})
+        try:
+            cycle = ("260512", "0750")
+            b.expect_band(cycle, "20",
+                          radiod_id="rx-B", rx_source="radiod:B")
+            b.mark_done(cycle, "20", rx_source="radiod:B")
+            time.sleep(0.3)
+            self.assertEqual(len(sink.calls), 1)
+        finally:
+            b.stop()
+
+    def test_band_in_config_but_not_calling_expect_caught_by_backstop(self):
+        """Pre-registration says 3 bands should report; only 2 do.
+        Backstop fires with WARNING listing the missing one."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=30.0, backstop_sec=0.4)
+        b.set_bands_by_source({
+            "radiod:A": {"40": [120], "30": [120], "20": [120]},
+        })
+        try:
+            cycle = ("260512", "0750")
+            b.expect_band(cycle, "40",
+                          radiod_id="rx-A", rx_source="radiod:A")
+            b.mark_done(cycle, "40", rx_source="radiod:A")
+            b.expect_band(cycle, "30",
+                          radiod_id="rx-A", rx_source="radiod:A")
+            b.mark_done(cycle, "30", rx_source="radiod:A")
+            # 20 never reports — backstop catches at first_expect + 0.4s.
+            time.sleep(0.9)
+            self.assertEqual(
+                len(sink.calls), 1,
+                "Backstop must fire so the 2 bands that DID report "
+                "still ship — losing them while waiting on a dead "
+                "channel is worse than shipping partial",
+            )
+        finally:
+            b.stop()

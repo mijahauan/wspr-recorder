@@ -1097,6 +1097,45 @@ class WsprRecorder:
                     "%d rx sources: %s",
                     len(expected), sorted(expected),
                 )
+            # Per-band-period map — lets CycleBatcher pre-populate
+            # expected_bands at the FIRST expect_band call for a
+            # cycle (rather than growing the set incrementally as
+            # bands report in).  Without this, the completion check
+            # ``completed >= expected`` could fire after only the
+            # fastest 1-2 bands' decodes finished, producing a
+            # premature partial-cycle commit followed by a second
+            # cycle-commit log line when the slower bands finally
+            # reported.
+            from .decode_mode import DECODE_MODE_PERIODS
+            bands_by_source: dict = {}
+            for src in self.config.sources:
+                band_periods: dict = {}
+                for band_cfg in src.bands:
+                    try:
+                        bname = freq_to_band_name(band_cfg.frequency)
+                    except Exception:
+                        continue
+                    periods = []
+                    for mode_str in band_cfg.modes:
+                        try:
+                            m = DecodeMode(mode_str)
+                        except ValueError:
+                            continue
+                        p = DECODE_MODE_PERIODS.get(m)
+                        if p and p not in periods:
+                            periods.append(p)
+                    if periods:
+                        band_periods[bname] = periods
+                if band_periods:
+                    bands_by_source[src.key] = band_periods
+            if bands_by_source:
+                self.cycle_batcher.set_bands_by_source(bands_by_source)
+                logger.info(
+                    "cycle batcher: band-period pre-registration "
+                    "enabled for %d source(s), %d total bands",
+                    len(bands_by_source),
+                    sum(len(b) for b in bands_by_source.values()),
+                )
         
         # Spawn one ReceiverManager per configured source.  Each runs
         # against its own radiod control plane; band recorders are
