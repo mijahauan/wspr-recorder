@@ -531,20 +531,29 @@ class ReceiverManager:
     # ── Task #45: real recovery actions for stale channels ────────────────
 
     def reprovision_stale(self) -> int:
-        """Re-issue ``ensure_channel`` for every channel that isn't
-        currently active (no recent packets).
+        """Re-issue ``ensure_channel`` for stale or missing bands.
 
-        Cheap recovery for the common storm pattern: radiod recreated
-        the SSRC at Template defaults (TTL=0, freq=0) after a brief
-        outage, MultiStream's auto-restore timed out at 5 s.  This
-        re-pushes the channel's full config so radiod tunes it back
-        to the right frequency / sample rate / multicast group.
+        Covers two failure shapes:
 
-        Returns the count of channels that were re-provisioned.  Does
-        NOT recreate ``self._control`` — the RadiodControl connection
-        is reused.  If radiod is completely unreachable, the
-        ``ensure_channel`` calls will fail individually and this
-        returns 0 — caller can escalate to ``full_reset``.
+        1. **Stale**: channel exists in ``state.channels`` but has not
+           received samples recently (``is_active == False``) — the
+           common storm pattern where radiod recreated the SSRC at
+           Template defaults (TTL=0, freq=0) after a brief outage
+           and MultiStream's 5 s auto-restore timed out.
+        2. **Missing**: a frequency configured in
+           ``self.config.frequencies`` has no entry in
+           ``state.channels`` at all — initial ``connect()``
+           partially failed and 8 of 17 bands never got their first
+           ``ensure_channel`` to land.  Pre-fix this branch was
+           absent, so the missing bands stayed missing for the
+           service's lifetime (the health check saw
+           ``len(state.channels) == 9`` and ``active == 9`` →
+           "healthy", masking the partial provisioning).
+
+        Returns the count of (re)provisioning attempts that succeeded.
+        Reuses ``self._control`` — if radiod is completely
+        unreachable, ensure_channel calls fail individually and the
+        caller should escalate to ``full_reset``.
         """
         if self._control is None:
             logger.warning(
@@ -552,18 +561,37 @@ class ReceiverManager:
                 f"connection — caller should full_reset first"
             )
             return 0
+        configured = set(self.config.frequencies or [])
+        provisioned = {
+            ch.frequency_hz for ch in self.state.channels.values()
+        }
+        missing_freqs = sorted(configured - provisioned)
         stale = [
             ch for ch in self.state.channels.values()
             if not ch.is_active
         ]
-        if not stale:
+        if not missing_freqs and not stale:
             return 0
-        logger.warning(
-            f"reprovision_stale [{self.source_key}]: re-provisioning "
-            f"{len(stale)} stale channel(s) "
-            f"(bands={[ch.band_name for ch in stale]})"
-        )
+        if missing_freqs:
+            logger.warning(
+                f"reprovision_stale [{self.source_key}]: "
+                f"{len(missing_freqs)} MISSING band(s) never "
+                f"provisioned (freqs_hz={missing_freqs}); attempting "
+                f"first-time provisioning"
+            )
+        if stale:
+            logger.warning(
+                f"reprovision_stale [{self.source_key}]: "
+                f"re-provisioning {len(stale)} stale channel(s) "
+                f"(bands={[ch.band_name for ch in stale]})"
+            )
         n = 0
+        # Missing first — those failed initial provisioning, so giving
+        # them another shot before the stale-channel retry keeps the
+        # total burst smaller per ensure_channel.
+        for freq_hz in missing_freqs:
+            if self._provision(freq_hz):
+                n += 1
         for ch in stale:
             # ``_provision`` rebuilds the ChannelState in place by
             # re-keying on the new SSRC; the multistream stays bound

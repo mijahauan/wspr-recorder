@@ -776,8 +776,19 @@ class WsprRecorder:
                         1 for ch in rm.state.channels.values()
                         if ch.is_active
                     )
-                    total = len(rm.state.channels)
-                    if total == 0:
+                    # ``total`` is the CONFIGURED band count, not the
+                    # provisioned count.  When initial ``connect()``
+                    # partially fails (e.g. 9 of 17 bands timed out at
+                    # ensure_channel), pre-fix code computed total =
+                    # len(state.channels) = 9 and active = 9 → "healthy
+                    # 9/9", silently masking the 8 missing bands for the
+                    # service's lifetime.  Comparing against the
+                    # configured count means a partial-provision shows
+                    # as 9/17 — degraded → ``reprovision_stale`` now
+                    # picks up the missing bands.
+                    total = len(rm.config.frequencies or [])
+                    provisioned = len(rm.state.channels)
+                    if total == 0 or provisioned == 0:
                         # Source has NO provisioned channels — startup
                         # connect() failed (radiod was in trouble at
                         # boot, channel SSRCs not verified within 5 s).
