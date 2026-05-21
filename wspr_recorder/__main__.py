@@ -1081,6 +1081,22 @@ class WsprRecorder:
                 "pipeline-v2 decode pool enabled (rx_call=%r, rx_grid=%r)",
                 rx_call, rx_grid,
             )
+            # Cross-rx sync: when multiple sources are configured, the
+            # CycleBatcher waits until ALL configured rx have committed
+            # their per-rx batch before firing the upload wake.  Result
+            # is one wsprnet pump per cycle covering all rx — instead
+            # of N (which race wsprnet's server-side cross-rx dedup
+            # and cause spurious duplicate rejections — task #48
+            # background).  Empty / single-source skips cross-rx
+            # sync and falls back to per-flush wake.
+            if len(self.config.sources) > 1:
+                expected = {src.key for src in self.config.sources}
+                self.cycle_batcher.set_expected_rx_sources(expected)
+                logger.info(
+                    "cycle batcher: cross-rx sync enabled for "
+                    "%d rx sources: %s",
+                    len(expected), sorted(expected),
+                )
         
         # Spawn one ReceiverManager per configured source.  Each runs
         # against its own radiod control plane; band recorders are

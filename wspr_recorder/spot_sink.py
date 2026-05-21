@@ -24,7 +24,7 @@ import socket
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Tuple
 
 from .decoder import RawSpot
 from .noise import NoiseMeasurement
@@ -769,6 +769,24 @@ class CycleBatcher:
         # rx_source.  Single-source callers passing rx_source="" still
         # get a stable key (the empty string is hashable).
         self._batches: dict = {}   # ((date, hhmm), rx_source) -> _CycleBatch
+        # Cross-rx sync state.  When set_expected_rx_sources is called
+        # with a non-empty set, the upload wake fires ONCE per cycle —
+        # at the moment the LAST expected rx commits its batch — rather
+        # than per-rx flush.  This bundles all 3 (or N) receivers'
+        # spots into a single wsprnet pump so the server's cross-rx
+        # dedup sees them together (today's per-rx wake races wsprnet's
+        # server-side dedup of earlier rx's spots — task #48 territory).
+        # Empty set = today's behaviour (wake per flush).
+        self._expected_rx_sources: set = set()
+        # cycle_key -> set of rx_source values that have committed
+        self._cycle_committed_rx: dict = {}
+        # cycle_key -> monotonic timestamp of FIRST rx commit (for
+        # the cross-rx backstop — fires if some rx never reports).
+        self._cycle_first_commit_at: dict = {}
+        # cycle_keys whose upload wake has already fired (so we don't
+        # double-wake if a late rx commits after backstop already
+        # tripped, or after all-rx-done already fired the wake).
+        self._cycle_wake_fired: set = set()
         self._stop = threading.Event()
         # Wake callback — invoked after every flush that committed
         # spots so an in-process uploader can pump immediately
@@ -798,6 +816,32 @@ class CycleBatcher:
         a None.
         """
         self._wake_callback = callback
+
+    def set_expected_rx_sources(self, sources: Iterable[str]) -> None:
+        """Configure cross-rx sync.
+
+        When called with a non-empty set, the upload wake_callback
+        fires ONCE per (cycle_key) — at the moment the LAST listed
+        rx_source has flushed its per-rx batch.  All receivers'
+        spots reach wsprnet in a single batch so the server's
+        cross-rx dedup operates on the full set at once instead of
+        racing one rx's late arrival against another rx's already-
+        uploaded spots.
+
+        Empty set (or never called) → wake fires per-flush, today's
+        behaviour.  Useful for single-source hosts where there's
+        nothing to sync.
+
+        Idempotent — call again with a different set on reconfigure.
+        """
+        with self._lock:
+            self._expected_rx_sources = set(sources)
+            # Reset any in-flight cycle state so the new set takes
+            # effect on the next cycle — partial state under the old
+            # configuration would mis-attribute completion.
+            self._cycle_committed_rx.clear()
+            self._cycle_first_commit_at.clear()
+            self._cycle_wake_fired.clear()
 
     # --- producer side (completion tracking) -----------------------------
 
@@ -948,10 +992,13 @@ class CycleBatcher:
         nearest deadline; flushes any batch that is either
         completion-complete (every expected band has called
         ``mark_done``) or whose wall-clock backstop has passed.
+        Also fires the cross-rx wake when the per-cycle backstop
+        expires and not all expected rx_sources have reported.
         Sink writes happen only here, so the underlying sqlite3
         connection stays in this thread."""
         while not self._stop.is_set():
             ready: List[Tuple[_CycleBatch, bool]] = []  # (batch, is_backstop_flush)
+            cross_rx_backstop_fires: List[Tuple[Any, set, set]] = []  # (cycle_key, committed, missing)
             with self._cond:
                 now = time.monotonic()
                 wait_until: Optional[float] = None
@@ -974,7 +1021,36 @@ class CycleBatcher:
                     else:
                         wait_until = (b.deadline if wait_until is None
                                       else min(wait_until, b.deadline))
-                if not ready:
+                # Cross-rx backstop: if some rx never commits for a
+                # cycle (entire receiver down, channel wedged), the
+                # cross-rx wake would wait forever.  Fire it after
+                # first_commit_at + backstop_sec with whatever rx
+                # did report.  Uses the same backstop window as the
+                # per-rx batch deadline since first_commit_at is
+                # always >= any per-rx batch's deadline.
+                if self._expected_rx_sources:
+                    for cycle_key in list(self._cycle_first_commit_at.keys()):
+                        if cycle_key in self._cycle_wake_fired:
+                            continue
+                        first_at = self._cycle_first_commit_at[cycle_key]
+                        if now >= first_at + self._backstop_sec:
+                            committed = self._cycle_committed_rx.get(
+                                cycle_key, set(),
+                            )
+                            missing = (
+                                self._expected_rx_sources - committed
+                            )
+                            cross_rx_backstop_fires.append(
+                                (cycle_key, committed, missing),
+                            )
+                            self._cycle_wake_fired.add(cycle_key)
+                            del self._cycle_first_commit_at[cycle_key]
+                            self._cycle_committed_rx.pop(cycle_key, None)
+                        else:
+                            cross_wait = first_at + self._backstop_sec
+                            wait_until = (cross_wait if wait_until is None
+                                          else min(wait_until, cross_wait))
+                if not ready and not cross_rx_backstop_fires:
                     # Wait for the nearest deadline OR a notify().
                     # 5 s ceiling lets stop() unblock quickly.
                     timeout = (max(0.05, wait_until - now)
@@ -996,6 +1072,21 @@ class CycleBatcher:
                         sorted(missing),
                     )
                 self._flush(batch)
+            # Cross-rx backstops fire the wake AFTER any pending
+            # per-rx flushes so the late rx's spots are visible to
+            # the uploader pump.
+            for cycle_key, committed, missing in cross_rx_backstop_fires:
+                logger.warning(
+                    "cycle batcher: cycle %s cross-rx backstop fired "
+                    "(%d/%d rx reported); firing wake anyway — "
+                    "missing rx: %s",
+                    cycle_key,
+                    len(committed),
+                    len(self._expected_rx_sources),
+                    sorted(missing),
+                )
+                if self._wake_callback is not None:
+                    self._schedule_wake()
 
     def _flush(self, batch: _CycleBatch) -> None:
         date, hhmm = batch.cycle_key
@@ -1061,7 +1152,51 @@ class CycleBatcher:
         #     the next UTC 15 s boundary + settle, so the
         #     wsprdaemon-tar transport's pump reads both wspr.spots
         #     AND the most recent psk.spots in one tar.
-        if n > 0 and self._wake_callback is not None:
+        if n > 0:
+            self._on_per_rx_committed(batch)
+
+    def _on_per_rx_committed(self, batch: _CycleBatch) -> None:
+        """Decide whether this per-rx flush should fire the upload wake.
+
+        Without cross-rx sync (``_expected_rx_sources`` empty), every
+        per-rx flush fires the wake — today's behaviour.
+
+        With cross-rx sync, track which rx_sources have committed
+        for the cycle.  Fire the wake exactly once, when the LAST
+        expected rx commits (or when the cross-rx backstop fires
+        from ``_run``).  Late arrivals after the wake has already
+        fired are no-ops.
+        """
+        if self._wake_callback is None:
+            return
+        should_fire = False
+        with self._lock:
+            if not self._expected_rx_sources:
+                # Single-source / cross-rx sync disabled — fire now.
+                should_fire = True
+            else:
+                cycle_key = batch.cycle_key
+                if cycle_key in self._cycle_wake_fired:
+                    # Backstop already fired the wake; treat this as
+                    # a late arrival.  No-op — uploader's polling
+                    # fallback would have picked it up anyway.
+                    return
+                committed = self._cycle_committed_rx.setdefault(
+                    cycle_key, set(),
+                )
+                committed.add(batch.rx_source)
+                self._cycle_first_commit_at.setdefault(
+                    cycle_key, time.monotonic(),
+                )
+                if committed >= self._expected_rx_sources:
+                    self._cycle_wake_fired.add(cycle_key)
+                    should_fire = True
+                    # Cycle done — drop the tracking entries to keep
+                    # the dicts small.  We keep cycle_wake_fired so
+                    # late arrivals don't re-fire; trimmed below.
+                    del self._cycle_committed_rx[cycle_key]
+                    del self._cycle_first_commit_at[cycle_key]
+        if should_fire:
             self._schedule_wake()
 
     def _schedule_wake(self) -> None:

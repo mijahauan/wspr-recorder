@@ -555,3 +555,164 @@ class TestCycleBatcherCompletionTracking(unittest.TestCase):
             self.assertEqual(sink.calls[1][2], "radiod:host-b")
         finally:
             b.stop()
+
+
+# ── Cross-rx upload-wake sync ──────────────────────────────────────────────
+#
+# When set_expected_rx_sources is called with multiple receivers, the
+# upload wake fires ONCE per cycle — at the moment the LAST expected
+# rx commits its batch — rather than per-rx flush.  All receivers'
+# spots reach wsprnet in a single batch so the server's cross-rx
+# dedup sees them together (task #48 background).
+
+class TestCycleBatcherCrossRxSync(unittest.TestCase):
+
+    def _make_batcher_with_wake(self, expected_rx, *, backstop_sec=30.0):
+        """Construct a batcher with a counted wake callback."""
+        sink = _RecordingSink()
+        b = CycleBatcher(
+            sink, deadline_sec=30.0, backstop_sec=backstop_sec,
+        )
+        wakes = []
+        b.set_wake_callback(lambda: wakes.append(time.monotonic()))
+        b.set_expected_rx_sources(expected_rx)
+        return b, sink, wakes
+
+    def _complete_rx_for_cycle(self, b, cycle, rx_source, band="20",
+                                radiod_id="rx", with_spots=True):
+        b.expect_band(cycle, band, radiod_id=radiod_id, rx_source=rx_source)
+        if with_spots:
+            b.add(cycle, band, [_make_spot()],
+                  radiod_id=radiod_id, rx_source=rx_source)
+        b.mark_done(cycle, band, rx_source=rx_source)
+
+    def test_wake_fires_once_per_cycle_after_last_rx_commits(self):
+        """With 3 expected rx, completing rx-A and rx-B does not fire
+        the wake; completing rx-C does — exactly once."""
+        b, sink, wakes = self._make_batcher_with_wake(
+            {"radiod:A", "radiod:B", "radiod:C"},
+        )
+        try:
+            cycle = ("260512", "2030")
+            self._complete_rx_for_cycle(b, cycle, "radiod:A")
+            time.sleep(0.2)
+            self.assertEqual(len(sink.calls), 1)
+            self.assertEqual(
+                len(wakes), 0,
+                "Wake must NOT fire after first rx commits — cross-rx "
+                "sync waits for all expected rx",
+            )
+            self._complete_rx_for_cycle(b, cycle, "radiod:B")
+            time.sleep(0.2)
+            self.assertEqual(len(sink.calls), 2)
+            self.assertEqual(len(wakes), 0)
+            self._complete_rx_for_cycle(b, cycle, "radiod:C")
+            time.sleep(0.2)
+            self.assertEqual(len(sink.calls), 3)
+            self.assertEqual(
+                len(wakes), 1,
+                "Wake must fire EXACTLY once after the LAST expected "
+                "rx commits — not per-rx",
+            )
+        finally:
+            b.stop()
+
+    def test_late_rx_arrival_after_wake_does_not_refire(self):
+        """If a 4th rx commits late (after wake already fired for the
+        first 3), no additional wake fires — uploader's polling
+        fallback handles the late arrival."""
+        b, sink, wakes = self._make_batcher_with_wake(
+            {"radiod:A", "radiod:B"},
+        )
+        try:
+            cycle = ("260512", "2030")
+            self._complete_rx_for_cycle(b, cycle, "radiod:A")
+            self._complete_rx_for_cycle(b, cycle, "radiod:B")
+            time.sleep(0.2)
+            self.assertEqual(len(wakes), 1)
+            # Late rx that wasn't in expected_rx — should NOT refire.
+            self._complete_rx_for_cycle(b, cycle, "radiod:LATE")
+            time.sleep(0.2)
+            self.assertEqual(
+                len(wakes), 1,
+                "Cycle wake already fired; late arrivals are no-ops",
+            )
+        finally:
+            b.stop()
+
+    def test_cross_rx_backstop_fires_when_an_rx_never_reports(self):
+        """If an expected rx never commits (entire receiver down),
+        the cross-rx backstop fires the wake anyway after backstop_sec
+        with a WARNING listing the missing rx."""
+        b, sink, wakes = self._make_batcher_with_wake(
+            {"radiod:A", "radiod:B", "radiod:DEAD"},
+            backstop_sec=0.4,
+        )
+        try:
+            cycle = ("260512", "2030")
+            self._complete_rx_for_cycle(b, cycle, "radiod:A")
+            self._complete_rx_for_cycle(b, cycle, "radiod:B")
+            # DEAD never commits.  Backstop should fire wake at
+            # first_commit + 0.4s.
+            time.sleep(0.9)
+            self.assertEqual(
+                len(wakes), 1,
+                "Cross-rx backstop must fire wake with whatever rx "
+                "did report — losing the others' spots while waiting "
+                "for a silent receiver would be worse",
+            )
+        finally:
+            b.stop()
+
+    def test_two_cycles_each_get_their_own_wake(self):
+        """Two distinct cycles each fire one wake — cross-rx state
+        is per-cycle, not global."""
+        b, sink, wakes = self._make_batcher_with_wake(
+            {"radiod:A", "radiod:B"},
+        )
+        try:
+            c1 = ("260512", "2030")
+            c2 = ("260512", "2032")
+            # Interleaved commits — c1 A, c2 A, c1 B, c2 B.
+            self._complete_rx_for_cycle(b, c1, "radiod:A")
+            self._complete_rx_for_cycle(b, c2, "radiod:A")
+            time.sleep(0.2)
+            self.assertEqual(len(wakes), 0)
+            self._complete_rx_for_cycle(b, c1, "radiod:B")
+            time.sleep(0.2)
+            self.assertEqual(len(wakes), 1, "c1 complete → 1 wake")
+            self._complete_rx_for_cycle(b, c2, "radiod:B")
+            time.sleep(0.2)
+            self.assertEqual(len(wakes), 2, "c2 complete → 2nd wake")
+        finally:
+            b.stop()
+
+    def test_empty_expected_set_uses_per_flush_wake(self):
+        """set_expected_rx_sources(set()) disables cross-rx sync —
+        the wake fires per flush as before.  Default state too."""
+        b, sink, wakes = self._make_batcher_with_wake(set())
+        try:
+            cycle = ("260512", "2030")
+            # No cross-rx sync; rx-A's flush fires the wake immediately.
+            self._complete_rx_for_cycle(b, cycle, "radiod:A")
+            time.sleep(0.2)
+            self.assertEqual(
+                len(wakes), 1,
+                "With empty expected_rx, wake fires per-flush "
+                "(today's behaviour, backwards-compat)",
+            )
+        finally:
+            b.stop()
+
+    def test_single_expected_rx_fires_wake_on_its_flush(self):
+        """Single-source host with cross-rx 'sync' configured to one
+        rx still fires immediately — the set is satisfied by the
+        first (and only) commit."""
+        b, sink, wakes = self._make_batcher_with_wake({"radiod:only"})
+        try:
+            cycle = ("260512", "2030")
+            self._complete_rx_for_cycle(b, cycle, "radiod:only")
+            time.sleep(0.2)
+            self.assertEqual(len(wakes), 1)
+        finally:
+            b.stop()
