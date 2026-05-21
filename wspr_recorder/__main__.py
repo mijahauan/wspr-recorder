@@ -778,7 +778,36 @@ class WsprRecorder:
                     )
                     total = len(rm.state.channels)
                     if total == 0:
-                        # Source not yet provisioned (still starting).
+                        # Source has NO provisioned channels — startup
+                        # connect() failed (radiod was in trouble at
+                        # boot, channel SSRCs not verified within 5 s).
+                        # This is the WORST case: 0 active, 0 total,
+                        # no cycles ever decoded.  ``reprovision_stale``
+                        # can't help (it iterates over existing
+                        # channels — there are none).  Go straight to
+                        # ``full_reset`` which re-runs the full
+                        # connect() flow.  Pre-fix this branch was
+                        # ``continue`` — treating "never provisioned"
+                        # as "still starting up" — and the dead source
+                        # silently stayed dead for hours.
+                        n = degraded_count.get(src_key, 0) + 1
+                        degraded_count[src_key] = n
+                        logger.warning(
+                            "Channel health (%s): NEVER PROVISIONED "
+                            "(0 channels, degraded check #%d) — "
+                            "running full_reset to retry connect()",
+                            src_key, n,
+                        )
+                        try:
+                            ok = rm.full_reset()
+                            if ok and rm.state.channels:
+                                degraded_count[src_key] = 0
+                        except Exception:
+                            logger.exception(
+                                "Channel health (%s): full_reset "
+                                "raised on zero-channel recovery",
+                                src_key,
+                            )
                         continue
                     if active == total:
                         # Recovered (or never failed).  Reset ladder.
