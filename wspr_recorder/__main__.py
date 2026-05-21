@@ -736,13 +736,36 @@ class WsprRecorder:
                 logger.error(f"Status write error: {e}")
     
     async def _health_check_loop(self) -> None:
-        """Periodically log channel health.
+        """Periodically check channel health and take recovery action
+        when a source's channels are degraded.
 
-        Channel recovery is handled automatically by ka9q-python's
-        MultiStream (auto-restore on stream drop). This loop only
-        logs status.
+        Task #45: ka9q-python's MultiStream auto-restore covers
+        transient stream drops, but on the recurring storm pattern
+        (radiod recreates SSRCs at Template defaults with TTL=0
+        after a brief outage) MultiStream's per-channel 5 s verify
+        times out and the channel stays stale.  Pre-fix, the loop
+        just logged "recovery handled by ReceiverManager" — a lie
+        operators learned to read as "restart the service".
+
+        Recovery ladder per source:
+          0 degraded checks  → no action, all healthy
+          1 degraded check   → ``reprovision_stale()`` — re-issue
+                               ensure_channel for any non-active
+                               channel.  Cheap, reuses RadiodControl.
+          2 degraded checks  → ``reprovision_stale()`` again, with
+                               escalation warning.
+          ≥3 degraded checks → ``full_reset()`` — shutdown +
+                               reconnect this ONE source (other
+                               sources keep running).  Mirrors what
+                               a service restart does, scoped.
+        Counter resets the instant a source is back to full health,
+        so a single bad check followed by recovery doesn't ratchet
+        toward full_reset on a future incident.
         """
         await asyncio.sleep(self.STARTUP_GRACE_PERIOD)
+
+        # source_key -> consecutive degraded-check count
+        degraded_count: Dict[str, int] = {}
 
         while self._running:
             try:
@@ -754,11 +777,44 @@ class WsprRecorder:
                         if ch.is_active
                     )
                     total = len(rm.state.channels)
-                    if active < total:
-                        logger.warning(
-                            "Channel health (%s): %d/%d active "
-                            "(recovery handled by ReceiverManager)",
-                            src_key, active, total,
+                    if total == 0:
+                        # Source not yet provisioned (still starting).
+                        continue
+                    if active == total:
+                        # Recovered (or never failed).  Reset ladder.
+                        if degraded_count.get(src_key, 0) > 0:
+                            logger.info(
+                                "Channel health (%s): recovered to "
+                                "%d/%d active — clearing degraded "
+                                "counter", src_key, active, total,
+                            )
+                            degraded_count[src_key] = 0
+                        continue
+                    # Degraded: bump counter and decide what to do.
+                    n = degraded_count.get(src_key, 0) + 1
+                    degraded_count[src_key] = n
+                    logger.warning(
+                        "Channel health (%s): %d/%d active "
+                        "(degraded check #%d)",
+                        src_key, active, total, n,
+                    )
+                    try:
+                        if n >= 3:
+                            # Escalation: full source reset.
+                            ok = rm.full_reset()
+                            if ok:
+                                # Reconnect succeeded — give it a
+                                # full check interval before judging
+                                # health again.
+                                degraded_count[src_key] = 0
+                        else:
+                            # Cheap recovery: re-provision stale channels.
+                            rm.reprovision_stale()
+                    except Exception:
+                        logger.exception(
+                            "Channel health (%s): recovery action "
+                            "raised — will retry next check",
+                            src_key,
                         )
 
             except asyncio.CancelledError:

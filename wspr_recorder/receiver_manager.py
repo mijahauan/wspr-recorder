@@ -528,6 +528,107 @@ class ReceiverManager:
             except Exception as e:
                 logger.debug(f"Error stopping MultiStream: {e}")
 
+    # ── Task #45: real recovery actions for stale channels ────────────────
+
+    def reprovision_stale(self) -> int:
+        """Re-issue ``ensure_channel`` for every channel that isn't
+        currently active (no recent packets).
+
+        Cheap recovery for the common storm pattern: radiod recreated
+        the SSRC at Template defaults (TTL=0, freq=0) after a brief
+        outage, MultiStream's auto-restore timed out at 5 s.  This
+        re-pushes the channel's full config so radiod tunes it back
+        to the right frequency / sample rate / multicast group.
+
+        Returns the count of channels that were re-provisioned.  Does
+        NOT recreate ``self._control`` — the RadiodControl connection
+        is reused.  If radiod is completely unreachable, the
+        ``ensure_channel`` calls will fail individually and this
+        returns 0 — caller can escalate to ``full_reset``.
+        """
+        if self._control is None:
+            logger.warning(
+                f"reprovision_stale [{self.source_key}]: no control "
+                f"connection — caller should full_reset first"
+            )
+            return 0
+        stale = [
+            ch for ch in self.state.channels.values()
+            if not ch.is_active
+        ]
+        if not stale:
+            return 0
+        logger.warning(
+            f"reprovision_stale [{self.source_key}]: re-provisioning "
+            f"{len(stale)} stale channel(s) "
+            f"(bands={[ch.band_name for ch in stale]})"
+        )
+        n = 0
+        for ch in stale:
+            # ``_provision`` rebuilds the ChannelState in place by
+            # re-keying on the new SSRC; the multistream stays bound
+            # to the same multicast group so no MultiStream restart
+            # is needed.
+            if self._provision(ch.frequency_hz):
+                n += 1
+        # The verify-and-retry sweep covers the case where the burst
+        # of ensure_channel calls perturbed the OTHER source's
+        # channels in dual-source deployments (Task #46 mechanism).
+        if n > 0:
+            self._verify_and_retry_provisioned()
+        return n
+
+    def full_reset(self) -> bool:
+        """Full source reset — shutdown + reconnect.
+
+        Escalation path when ``reprovision_stale`` hasn't recovered
+        the source after a few attempts.  Mirrors what a service
+        restart does for THIS source only — leaves the other
+        ReceiverManagers (and the surrounding WsprRecorder)
+        untouched.  Returns True if the reconnect succeeded.
+
+        After this returns, the caller's ChannelSink references are
+        stale (new ChannelState objects exist) — but band recorders
+        re-attach via the next stream-restored callback from
+        MultiStream as packets arrive, so callers don't need to
+        rewire them explicitly.
+        """
+        logger.warning(
+            f"full_reset [{self.source_key}]: shutting down + "
+            f"reconnecting (last-resort recovery)"
+        )
+        try:
+            self.stop_streams()
+        except Exception:
+            logger.exception(f"full_reset [{self.source_key}]: stop_streams")
+        if self._control is not None:
+            try:
+                self._control.close()
+            except Exception:
+                logger.exception(
+                    f"full_reset [{self.source_key}]: control.close"
+                )
+            self._control = None
+        # Drop everything provisioning created so connect() starts
+        # from a clean slate (otherwise stale ChannelState entries
+        # with bad SSRCs would confuse the post-restart sweep).
+        self.state.channels.clear()
+        self._multi_by_group.clear()
+        self._lifetime_entries.clear()
+        ok = self.connect()
+        if ok:
+            self.start_streams()
+            logger.warning(
+                f"full_reset [{self.source_key}]: reconnect OK — "
+                f"{len(self.state.channels)} channels re-provisioned"
+            )
+        else:
+            logger.error(
+                f"full_reset [{self.source_key}]: reconnect FAILED — "
+                f"source will retry on next health check"
+            )
+        return ok
+
     def shutdown(self) -> None:
         self.stop_streams()
         if self._control is not None:
