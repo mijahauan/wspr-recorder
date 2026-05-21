@@ -457,53 +457,77 @@ class WsprRecorder:
             request.start_wallclock.strftime("%y%m%d"),
             request.start_wallclock.strftime("%H%M"),
         )
-        for mode in request.modes:
-            try:
-                if mode == DecodeMode.W2:
-                    spots = runner.decode_wspr(decoder_wav)
-                    # wsprd's `-c` flag wrote the C2 file in the same
-                    # work_dir.  Compute per-cycle noise immediately so
-                    # we don't race the next decode that would overwrite
-                    # it.  Only W2 decodes produce C2 — F-modes use
-                    # jt9 without C2 output, and they share the same
-                    # cycle so this single noise reading covers them.
-                    self._submit_noise_for_cycle(
-                        request, decoder_wav, runner.work_dir,
-                        radiod_id=radiod_id, cycle_key=cycle_key,
+        # Tell the batcher to expect this band's decode result.  The
+        # matching mark_done call in the ``finally`` below fires
+        # regardless of mode success/failure or spot count — that's
+        # the v3-style "I attempted, here is my result (or absence
+        # thereof)" signal.  Without this pair the batcher couldn't
+        # know when the cycle is actually done and would fall back
+        # to its wall-clock backstop (slower + emits a WARNING).
+        self.cycle_batcher.expect_band(
+            cycle_key, request.band_name,
+            radiod_id=radiod_id,
+            rx_source=request.rx_source,
+        )
+        try:
+            for mode in request.modes:
+                try:
+                    if mode == DecodeMode.W2:
+                        spots = runner.decode_wspr(decoder_wav)
+                        # wsprd's `-c` flag wrote the C2 file in the same
+                        # work_dir.  Compute per-cycle noise immediately so
+                        # we don't race the next decode that would overwrite
+                        # it.  Only W2 decodes produce C2 — F-modes use
+                        # jt9 without C2 output, and they share the same
+                        # cycle so this single noise reading covers them.
+                        self._submit_noise_for_cycle(
+                            request, decoder_wav, runner.work_dir,
+                            radiod_id=radiod_id, cycle_key=cycle_key,
+                        )
+                    else:
+                        spots = runner.decode_fst4w(
+                            decoder_wav,
+                            period=request.period_seconds,
+                            mode=mode,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "%s %s: decode failed (%s); skipping batch",
+                        request.band_name, mode.value, exc,
                     )
-                else:
-                    spots = runner.decode_fst4w(
-                        decoder_wav,
-                        period=request.period_seconds,
-                        mode=mode,
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "%s %s: decode failed (%s); skipping batch",
-                    request.band_name, mode.value, exc,
+                    continue
+                if not spots:
+                    continue
+                # FST4 spots have empty date/time on the RawSpot — fill
+                # from cycle context so spot_to_row's strptime succeeds.
+                for s in spots:
+                    if not s.date:
+                        s.date = cycle_key[0]
+                    if not s.time:
+                        s.time = cycle_key[1]
+                # Enqueue to the cycle batcher — does NOT write to SQLite
+                # here.  All Writer.insert() calls happen on the batcher's
+                # dedicated thread; this avoids the sqlite cross-thread
+                # restriction that band-pool workers would otherwise hit.
+                self.cycle_batcher.add(
+                    cycle_key, request.band_name, spots,
+                    radiod_id=radiod_id,
+                    rx_source=request.rx_source,
                 )
-                continue
-            if not spots:
-                continue
-            # FST4 spots have empty date/time on the RawSpot — fill
-            # from cycle context so spot_to_row's strptime succeeds.
-            for s in spots:
-                if not s.date:
-                    s.date = cycle_key[0]
-                if not s.time:
-                    s.time = cycle_key[1]
-            # Enqueue to the cycle batcher — does NOT write to SQLite
-            # here.  All Writer.insert() calls happen on the batcher's
-            # dedicated thread; this avoids the sqlite cross-thread
-            # restriction that band-pool workers would otherwise hit.
-            self.cycle_batcher.add(
-                cycle_key, request.band_name, spots,
-                radiod_id=radiod_id,
+                logger.debug(
+                    "%s %s: %d spots → cycle batcher (key=%s)",
+                    request.band_name, mode.value, len(spots), cycle_key,
+                )
+        finally:
+            # v3-style "decode attempt complete" signal.  Fires whether
+            # any spots were produced, all decoders failed, or wsprd
+            # found nothing — the batcher uses this to know the cycle
+            # is one band closer to flushable.  In a ``finally`` so an
+            # unexpected exception in the loop still releases the
+            # batcher's wait on this band.
+            self.cycle_batcher.mark_done(
+                cycle_key, request.band_name,
                 rx_source=request.rx_source,
-            )
-            logger.debug(
-                "%s %s: %d spots → cycle batcher (key=%s)",
-                request.band_name, mode.value, len(spots), cycle_key,
             )
     
     def _submit_noise_for_cycle(

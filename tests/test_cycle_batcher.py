@@ -393,3 +393,165 @@ class TestCycleBatcherMultiSource(unittest.TestCase):
             self.assertEqual(sink.calls[0][2], "")
         finally:
             b.stop()
+
+
+# ── Completion tracking (wsprdaemon-v3 pattern) ────────────────────────────
+#
+# `expect_band` registers a band's intent to decode for a cycle.
+# `mark_done` signals the decode attempt has finished — even if zero
+# spots were produced (the v3 equivalent of writing a zero-sized
+# spot file).  The batch flushes once expected == completed (non-empty),
+# regardless of the per-add() deadline.  Wall-clock backstop fires
+# only if some band never calls mark_done.
+
+class TestCycleBatcherCompletionTracking(unittest.TestCase):
+
+    def test_flush_when_all_expected_bands_marked_done(self):
+        """The batch flushes the instant the last expected band calls
+        mark_done — no wait for the 30 s legacy deadline, no wait for
+        the 3 min backstop."""
+        sink = _RecordingSink()
+        # Generous legacy deadline + backstop so the test fails fast
+        # if completion-tracking isn't triggering the flush.
+        b = CycleBatcher(sink, deadline_sec=30.0, backstop_sec=30.0)
+        try:
+            cycle = ("260512", "2030")
+            b.expect_band(cycle, "20", radiod_id="rx-A")
+            b.expect_band(cycle, "40", radiod_id="rx-A")
+            b.expect_band(cycle, "30", radiod_id="rx-A")
+            b.add(cycle, "20", [_make_spot("A1")], radiod_id="rx-A")
+            b.add(cycle, "30", [_make_spot("C1")], radiod_id="rx-A")
+            # 40m produced no spots — still must call mark_done.
+            b.mark_done(cycle, "20")
+            b.mark_done(cycle, "40")
+            # Not yet — 30 still outstanding.
+            time.sleep(0.2)
+            self.assertEqual(
+                len(sink.calls), 0,
+                "Should NOT flush before all expected bands are done",
+            )
+            b.mark_done(cycle, "30")
+            # Give the writer thread one wakeup to flush.
+            time.sleep(0.3)
+            self.assertEqual(len(sink.calls), 1)
+            items, _radiod, _rx, _ = sink.calls[0]
+            self.assertEqual(
+                sorted(band for band, _ in items),
+                ["20", "30"],
+                "40m had no spots so it's absent from the items list "
+                "even though it counted toward completion",
+            )
+        finally:
+            b.stop()
+
+    def test_zero_spot_bands_still_close_the_cycle(self):
+        """The v3 invariant: a band that produced no spots still
+        signals completion via mark_done.  This is the whole point
+        of the explicit-completion model — the deadline-based v2
+        version had no way to know a silent band was actually done
+        vs still working."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=30.0, backstop_sec=30.0)
+        try:
+            cycle = ("260512", "2030")
+            b.expect_band(cycle, "20", radiod_id="rx-A")
+            b.expect_band(cycle, "40", radiod_id="rx-A")
+            # NEITHER band produced spots.  Both still call mark_done.
+            b.mark_done(cycle, "20")
+            b.mark_done(cycle, "40")
+            time.sleep(0.3)
+            # Flush ran but with empty items (no spots to ship).
+            # Crucially the batch is REMOVED from the in-memory dict
+            # so a later cycle doesn't leak into it.
+            self.assertEqual(len(sink.calls), 1)
+            items, _radiod, _rx, _ = sink.calls[0]
+            self.assertEqual(items, [],
+                             "Empty cycle ships an empty items list")
+            self.assertEqual(len(b._batches), 0)  # noqa: SLF001
+        finally:
+            b.stop()
+
+    def test_backstop_fires_when_a_band_never_reports(self):
+        """If a band registers expect_band but never calls mark_done
+        (decoder hung, channel went stale), the wall-clock backstop
+        flushes the partial batch with a WARNING listing the missing
+        bands so operators see what dropped."""
+        sink = _RecordingSink()
+        # Tight backstop so the test runs quickly.
+        b = CycleBatcher(sink, deadline_sec=30.0, backstop_sec=0.4)
+        try:
+            cycle = ("260512", "2030")
+            b.expect_band(cycle, "20", radiod_id="rx-A")
+            b.expect_band(cycle, "40", radiod_id="rx-A")  # never marks done
+            b.add(cycle, "20", [_make_spot("A1")], radiod_id="rx-A")
+            b.mark_done(cycle, "20")
+            # Wait past the backstop without marking 40m done.
+            time.sleep(0.9)
+            self.assertEqual(
+                len(sink.calls), 1,
+                "Backstop must flush the partial batch — losing "
+                "the 20m spot for hours waiting on 40m would be "
+                "worse than shipping it without the missing band",
+            )
+        finally:
+            b.stop()
+
+    def test_legacy_add_without_expect_still_uses_deadline(self):
+        """Existing test_flush_after_deadline path: code paths that
+        haven't been wired to call expect_band yet still flush via
+        the 30 s deadline.  Backwards-compat for out-of-tree callers
+        and the FT4 / FT8 hot path until psk-recorder is converted."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=0.2, backstop_sec=30.0)
+        try:
+            cycle = ("260512", "2030")
+            # No expect_band — legacy producer.
+            b.add(cycle, "20", [_make_spot()], radiod_id="rx-A")
+            time.sleep(0.6)
+            self.assertEqual(len(sink.calls), 1)
+        finally:
+            b.stop()
+
+    def test_mark_done_for_unknown_batch_is_a_no_op_with_warning(self):
+        """A mark_done arriving after the backstop already flushed —
+        e.g. an extra-slow decoder finished long after we gave up —
+        should not blow up.  Logs a warning so operators can correlate
+        it with the backstop's earlier WARNING."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=30.0, backstop_sec=30.0)
+        try:
+            # Nothing in the dict — mark_done finds nothing.
+            b.mark_done(("260512", "2030"), "20")
+            # No flush, no crash, no batch created.
+            self.assertEqual(len(sink.calls), 0)
+            self.assertEqual(len(b._batches), 0)  # noqa: SLF001
+        finally:
+            b.stop()
+
+    def test_multi_source_completion_independent(self):
+        """Two sources reporting on the same cycle complete
+        independently — rx-A's expect/done set is separate from
+        rx-B's.  Each flushes when ITS bands are all done."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=30.0, backstop_sec=30.0)
+        try:
+            cycle = ("260512", "2030")
+            b.expect_band(cycle, "20",
+                          radiod_id="rx-A", rx_source="radiod:host-a")
+            b.expect_band(cycle, "20",
+                          radiod_id="rx-B", rx_source="radiod:host-b")
+            b.add(cycle, "20", [_make_spot("A1")],
+                  radiod_id="rx-A", rx_source="radiod:host-a")
+            b.add(cycle, "20", [_make_spot("B1")],
+                  radiod_id="rx-B", rx_source="radiod:host-b")
+            b.mark_done(cycle, "20", rx_source="radiod:host-a")
+            # rx-A flushed; rx-B still pending.
+            time.sleep(0.3)
+            self.assertEqual(len(sink.calls), 1)
+            self.assertEqual(sink.calls[0][2], "radiod:host-a")
+            b.mark_done(cycle, "20", rx_source="radiod:host-b")
+            time.sleep(0.3)
+            self.assertEqual(len(sink.calls), 2)
+            self.assertEqual(sink.calls[1][2], "radiod:host-b")
+        finally:
+            b.stop()

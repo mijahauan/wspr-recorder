@@ -632,10 +632,20 @@ class _CycleBatch:
 
     Lives entirely under CycleBatcher's lock; not thread-safe on its
     own.  Tracked by (date, time) cycle key matching wsprd output.
+
+    Completion tracking (the wsprdaemon-v3 pattern): producers call
+    ``expect_band`` when a band's recording period finishes (decode
+    about to start), then ``mark_done`` after the decoder returns —
+    even if zero spots came out.  The batch is ready to flush when
+    ``expected_bands == completed_bands`` (non-empty).  ``deadline``
+    is a wall-clock backstop: it flushes the batch with a WARNING
+    if some band never calls ``mark_done`` (decoder hang, radiod
+    glitch, etc.) so the cycle doesn't stall forever.
     """
 
     __slots__ = ("cycle_key", "deadline", "bands", "noise", "radiod_id",
-                 "rx_source")
+                 "rx_source", "expected_bands", "completed_bands",
+                 "first_expect_at")
 
     def __init__(self, cycle_key: Tuple[str, str], deadline: float):
         self.cycle_key = cycle_key
@@ -648,6 +658,16 @@ class _CycleBatch:
         # writer thread can flush each source's spots independently
         # (Phase 5's wsprnet dedup keys on this).
         self.rx_source: str = ""
+        # v3-style completion tracking — populated by expect_band /
+        # mark_done.  Empty sets mean the batch is running in the
+        # legacy deadline-only mode (no producer wired up to call
+        # the new API yet; falls through to deadline-based flush).
+        self.expected_bands: set = set()
+        self.completed_bands: set = set()
+        # Monotonic timestamp of first ``expect_band`` call.  Used by
+        # the backstop deadline calculation and by the WARNING emitted
+        # when the cycle flushes incomplete.
+        self.first_expect_at: float = 0.0
 
     def add(self, band: str, spots: Iterable[RawSpot]) -> None:
         self.bands.setdefault(band, []).extend(spots)
@@ -666,8 +686,8 @@ class _CycleBatch:
 
 
 class CycleBatcher:
-    """Collect decoded spots per cycle, flush once per cycle on a
-    dedicated thread.
+    """Collect decoded spots per cycle, flush exactly once per cycle
+    when every band's decode attempt has reported in.
 
     Why: `BandRecorder` dispatches `_on_period_complete` via a
     `ThreadPoolExecutor`, so per-band decodes run on different
@@ -679,16 +699,30 @@ class CycleBatcher:
     to the underlying `SpotSink` only from its own writer thread,
     so the sqlite connection stays in one thread.
 
-    Flush trigger: per-cycle deadline (default 30 s after the first
-    add() for that cycle).  We don't wait for "all bands reported"
-    because some bands legitimately produce zero spots in a cycle
-    and would never call add() — the deadline-only model handles
-    that naturally.  The 30 s window matches the upload side's
-    `min_age_sec` so the upload pipeline doesn't ship a cycle
-    before its batch lands.
+    Flush trigger (wsprdaemon-v3 pattern): the batch is ready to
+    flush when every band that registered an ``expect_band`` call
+    has subsequently called ``mark_done`` — even if it produced
+    zero spots.  That's the equivalent of v3's zero-sized
+    per-band spot file: an explicit "I tried, here's my result
+    (or absence thereof)" signal, not an implicit timeout.  The
+    bonus is uploads fire exactly once per cycle (both wsprnet
+    and the wsprdaemon-tar SFTP pipeline pump at the same wake
+    event) instead of 2-4× as the v2 deadline-based flush emitted.
 
-    Bonus: one Writer.insert() per cycle instead of per-band ≅
-    13× fewer SQLite transactions per WSPR period.
+    Wall-clock backstop: ``backstop_sec`` (default 180 s after the
+    first ``expect_band`` for that cycle).  If some band never
+    reports done — decoder hung, radiod glitched, the channel
+    went stale — the batch flushes with a WARNING listing the
+    missing bands so operators see when natural-completion
+    failed.  3 minutes is long enough that even a slow F30
+    decode finishes; tune via ``WSPR_CYCLE_BACKSTOP_SEC`` if you
+    run on a host where decodes routinely take longer.
+
+    Legacy fallback: if a producer calls ``add`` or ``add_noise``
+    without first calling ``expect_band``, the batch falls back
+    to the old deadline-based flush (30 s).  This is purely for
+    backwards compatibility with out-of-tree callers; in-tree
+    code should always use the expect_band/mark_done pair.
     """
 
     def __init__(
@@ -696,10 +730,27 @@ class CycleBatcher:
         sink: "SpotSink",
         *,
         deadline_sec: float = 30.0,
+        backstop_sec: Optional[float] = None,
         ft_settle_sec: Optional[float] = None,
     ):
         self._sink = sink
         self._deadline_sec = float(deadline_sec)
+        # Wall-clock backstop for completion-tracked batches.  The env
+        # var override is for operators running on slow hardware (or
+        # with F30 / F300 bands) where the default 3 min isn't enough.
+        if backstop_sec is None:
+            raw_backstop = os.environ.get("WSPR_CYCLE_BACKSTOP_SEC")
+            try:
+                backstop_sec = (float(raw_backstop) if raw_backstop
+                                else 180.0)
+            except ValueError:
+                logger.warning(
+                    "WSPR_CYCLE_BACKSTOP_SEC=%r is not a number; "
+                    "using 180 s default",
+                    raw_backstop,
+                )
+                backstop_sec = 180.0
+        self._backstop_sec = float(backstop_sec)
         # Phase 2 PR 6: optional delay between WSPR cycle commit and
         # uploader wake, so the wsprdaemon-tar transport picks up
         # both wspr.spots and the most recent psk.spots in the same
@@ -748,7 +799,76 @@ class CycleBatcher:
         """
         self._wake_callback = callback
 
-    # --- producer side ---------------------------------------------------
+    # --- producer side (completion tracking) -----------------------------
+
+    def expect_band(
+        self,
+        cycle_key: Tuple[str, str],
+        band: str,
+        *,
+        radiod_id: str,
+        rx_source: str = "",
+    ) -> None:
+        """Register that ``band`` is about to decode for this cycle/rx.
+
+        Called from BandRecorder's _on_period_complete right after the
+        recording period finishes, BEFORE the decoder is invoked.  The
+        batcher uses this to know which bands to wait for.  Idempotent
+        for the same (cycle_key, rx_source, band) tuple.
+
+        Creates a fresh batch with the wall-clock backstop deadline
+        if one doesn't exist yet for this (cycle_key, rx_source).
+        """
+        key = (cycle_key, rx_source)
+        with self._cond:
+            batch = self._batches.get(key)
+            if batch is None:
+                now = time.monotonic()
+                batch = _CycleBatch(
+                    cycle_key=cycle_key,
+                    deadline=now + self._backstop_sec,
+                )
+                batch.radiod_id = radiod_id
+                batch.rx_source = rx_source
+                batch.first_expect_at = now
+                self._batches[key] = batch
+            batch.expected_bands.add(band)
+            self._cond.notify()
+
+    def mark_done(
+        self,
+        cycle_key: Tuple[str, str],
+        band: str,
+        *,
+        rx_source: str = "",
+    ) -> None:
+        """Signal that ``band`` has finished its decode attempt.
+
+        Called from BandRecorder AFTER the decoder returns, regardless
+        of whether any spots came out — that's the equivalent of v3's
+        zero-sized per-band spot file.  When all expected bands have
+        called mark_done, the writer thread flushes the batch on its
+        next wakeup (or immediately, via the condition variable
+        notify).
+
+        A mark_done for an unknown (cycle_key, rx_source) is a no-op
+        with a warning — usually means a late-arriving decode for a
+        cycle that was already flushed by the backstop.
+        """
+        key = (cycle_key, rx_source)
+        with self._cond:
+            batch = self._batches.get(key)
+            if batch is None:
+                logger.warning(
+                    "cycle batcher: mark_done for unknown batch "
+                    "%s/%s band=%s (cycle already flushed?)",
+                    cycle_key, rx_source, band,
+                )
+                return
+            batch.completed_bands.add(band)
+            self._cond.notify()
+
+    # --- producer side (spot/noise additions) ---------------------------
 
     def add(
         self,
@@ -824,19 +944,32 @@ class CycleBatcher:
     # --- consumer side ---------------------------------------------------
 
     def _run(self) -> None:
-        """Writer-thread loop.  Wakes on add() or on the nearest
-        deadline; flushes any batch whose deadline has passed.
+        """Writer-thread loop.  Wakes on producer activity or on the
+        nearest deadline; flushes any batch that is either
+        completion-complete (every expected band has called
+        ``mark_done``) or whose wall-clock backstop has passed.
         Sink writes happen only here, so the underlying sqlite3
         connection stays in this thread."""
         while not self._stop.is_set():
-            ready: List[_CycleBatch] = []
+            ready: List[Tuple[_CycleBatch, bool]] = []  # (batch, is_backstop_flush)
             with self._cond:
                 now = time.monotonic()
                 wait_until: Optional[float] = None
                 for k in list(self._batches.keys()):
                     b = self._batches[k]
-                    if now >= b.deadline:
-                        ready.append(b)
+                    is_complete = (
+                        bool(b.expected_bands)
+                        and b.completed_bands >= b.expected_bands
+                    )
+                    if is_complete:
+                        ready.append((b, False))
+                        del self._batches[k]
+                    elif now >= b.deadline:
+                        # Backstop fired — completion never arrived.
+                        # Surface the gap so operators see which band
+                        # silently dropped; the partial batch still
+                        # ships so we don't lose what we DID get.
+                        ready.append((b, True))
                         del self._batches[k]
                     else:
                         wait_until = (b.deadline if wait_until is None
@@ -849,7 +982,19 @@ class CycleBatcher:
                     self._cond.wait(timeout=timeout)
                     continue
             # Flush outside the lock so add() doesn't block on SQLite.
-            for batch in ready:
+            for batch, is_backstop in ready:
+                if is_backstop and batch.expected_bands:
+                    missing = batch.expected_bands - batch.completed_bands
+                    logger.warning(
+                        "cycle batcher: cycle %s rx=%s backstop fired "
+                        "(%d/%d bands reported); shipping partial — "
+                        "missing: %s",
+                        batch.cycle_key,
+                        batch.rx_source or batch.radiod_id or "?",
+                        len(batch.completed_bands),
+                        len(batch.expected_bands),
+                        sorted(missing),
+                    )
                 self._flush(batch)
 
     def _flush(self, batch: _CycleBatch) -> None:
