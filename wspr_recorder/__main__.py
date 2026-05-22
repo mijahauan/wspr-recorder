@@ -1311,14 +1311,33 @@ class WsprRecorder:
             # Provision all channels across every source.  Per-source
             # failures are independently logged; the recorder keeps
             # running as long as at least one source connected.
-            logger.info("Connecting to radiod...")
+            #
+            # Parallel across sources (2026-05-22): each rm.connect()
+            # talks to a different radiod (different status_address,
+            # different multicast group) so calls are independent.
+            # Pre-2026-05-22 this was a serial loop — on B4-100's
+            # 3-rx config that meant ~3.6 min of provisioning instead
+            # of ~1 min.  The chrony gate inside connect() is
+            # process-latched (see receiver_manager) so all 3 rx
+            # share the single 10-60 s chrony wait, not 3× it.
+            logger.info("Connecting to radiod (parallel across %d source(s))...",
+                        len(self.receiver_managers))
+            keys = list(self.receiver_managers.keys())
+            connect_results = await asyncio.gather(
+                *[
+                    asyncio.to_thread(self.receiver_managers[k].connect)
+                    for k in keys
+                ],
+                return_exceptions=True,
+            )
             n_connected = 0
-            for src_key, rm in self.receiver_managers.items():
-                if rm.connect():
+            for k, res in zip(keys, connect_results):
+                if isinstance(res, Exception):
+                    logger.error("Source %s: connect raised: %s", k, res)
+                elif res:
                     n_connected += 1
                 else:
-                    logger.error("Source %s: failed to connect to radiod",
-                                 src_key)
+                    logger.error("Source %s: failed to connect to radiod", k)
             if n_connected == 0:
                 logger.error(
                     "All %d source(s) failed to connect — aborting startup",
@@ -1327,11 +1346,16 @@ class WsprRecorder:
                 return
 
             # Start shared-socket MultiStreams (begins sample delivery)
-            # for every connected source.
-            logger.info("Starting MultiStreams...")
-            for rm in self.receiver_managers.values():
-                if rm.state.connected:
-                    rm.start_streams()
+            # for every connected source.  Also parallelized.
+            logger.info("Starting MultiStreams (parallel)...")
+            await asyncio.gather(
+                *[
+                    asyncio.to_thread(rm.start_streams)
+                    for rm in self.receiver_managers.values()
+                    if rm.state.connected
+                ],
+                return_exceptions=True,
+            )
 
             # Start IPC server
             await self._setup_ipc_server()

@@ -53,6 +53,15 @@ SETTLE_POLL_SEC = 5.0
 SETTLE_TIMEOUT_SEC = 60.0
 
 
+# Process-wide latch: once chrony has been confirmed settled OR the
+# gate has timed out into degraded mode in this process, subsequent
+# ``_wait_for_chrony_settled()`` calls return immediately.  Chrony is
+# a host-wide service — once it's stable for one rx, it's stable for
+# all rx on the same host.  Pre-2026-05-22 the gate ran per rx, so 3
+# rx serially could spend 0-180 s on redundant chrony probes.
+_chrony_gate_satisfied = False
+
+
 def _parse_chronyc_last_offset(text: str) -> Optional[float]:
     """Parse ``Last offset`` (seconds) from ``chronyc tracking``."""
     for line in (text or "").splitlines():
@@ -75,7 +84,16 @@ def _wait_for_chrony_settled() -> bool:
     ``SETTLE_REQUIRED_CYCLES`` consecutive readings.  Returns True if
     settled, False on timeout or if chronyc is unavailable (degraded
     mode, logged loudly).
+
+    The gate is process-wide: once it returns (settled or timed-out),
+    subsequent calls are no-ops.  Chrony is host-shared state — once
+    the system clock is stable, every rx that follows benefits.
+    Running this gate per rx (the pre-2026-05-22 behaviour) added up
+    to ~60 s × (n_rx - 1) to startup with no benefit.
     """
+    global _chrony_gate_satisfied
+    if _chrony_gate_satisfied:
+        return True
     try:
         subprocess.run(["chronyc", "-h"], capture_output=True, timeout=2.0)
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
@@ -139,6 +157,7 @@ def _wait_for_chrony_settled() -> bool:
                     "wspr-recorder settled-capture: chrony settled after "
                     "%.1fs — proceeding to provision channels", elapsed,
                 )
+                _chrony_gate_satisfied = True
                 return True
         else:
             if consecutive > 0:
@@ -157,6 +176,9 @@ def _wait_for_chrony_settled() -> bool:
         "moves the system clock by >>100 µs)",
         SETTLE_TIMEOUT_SEC,
     )
+    # Latch even on timeout: no point making every subsequent rx pay
+    # the same 60 s for the same chrony state on the same host.
+    _chrony_gate_satisfied = True
     return False
 
 

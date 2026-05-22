@@ -1238,8 +1238,12 @@ class CycleBatcher:
         # `smd watch wspr` as the recurring two-cycles-per-POST
         # artifact).  Flushing here makes the cross-rx-sync wake
         # event causally correct: by the time it fires, every rx's
-        # spots are durable in pending_uploads.
-        self._sink.flush()
+        # spots are durable in pending_uploads.  Some sink stand-ins
+        # (test mocks) don't expose ``flush`` — tolerate that since
+        # the production SpotSink does.
+        sink_flush = getattr(self._sink, "flush", None)
+        if sink_flush is not None:
+            sink_flush()
         if n == 0 and n_noise == 0 and not self._sink.enabled:
             # Disabled sink — silent.  Avoids a log line per cycle
             # on hosts that don't have the env flag set.
