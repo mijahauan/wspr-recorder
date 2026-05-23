@@ -49,14 +49,49 @@ def _install_sighup_handler() -> None:
 
 
 def _configure_root_logging(quiet: bool) -> None:
+    """Set up root logging with a non-blocking QueueHandler.
+
+    Every ``logger.info()`` call places a LogRecord on a queue and
+    returns in microseconds — the actual formatting + I/O happens
+    in a dedicated background listener thread that doesn't compete
+    with the multicast receiver threads for the GIL.
+
+    Pre-2026-05-23 we used a synchronous ``StreamHandler(sys.stderr)``;
+    py-spy showed ``logging.warning → _decode_status_response`` as a
+    notable GIL holder during channel-status bursts.  The queue
+    decoupling moves that work off the hot path.
+    """
     root = logging.getLogger()
     root.setLevel(logging.WARNING if quiet else _resolve_log_level())
-    if not root.handlers:
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(
-            logging.Formatter("%(levelname)s:%(name)s:%(message)s")
-        )
-        root.addHandler(handler)
+    if root.handlers:
+        return  # already configured (test reentry, etc.)
+
+    # The actual sink — a StreamHandler that runs in the listener
+    # thread, not the producer thread.
+    output_handler = logging.StreamHandler(sys.stderr)
+    output_handler.setFormatter(
+        logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+    )
+
+    # Unbounded queue — log volume on this service is in the low
+    # hundreds of records/min in steady state; back-pressure on the
+    # producer would be worse than memory growth in a pathological case.
+    import logging.handlers as _logh
+    import queue as _queue
+    log_queue: _queue.Queue = _queue.Queue(-1)
+    queue_handler = _logh.QueueHandler(log_queue)
+    root.addHandler(queue_handler)
+
+    listener = _logh.QueueListener(
+        log_queue, output_handler, respect_handler_level=True,
+    )
+    listener.start()
+
+    # Stop the listener on interpreter exit so log records aren't lost
+    # at shutdown.  ``atexit`` handlers run after the main loop returns;
+    # systemd's SIGTERM path triggers them via Python's signal handler.
+    import atexit
+    atexit.register(listener.stop)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -94,6 +129,10 @@ def main(argv: list[str] | None = None) -> None:
     _add_common(sub_ver)
 
     sub_daemon = subparsers.add_parser("daemon")
+    sub_daemon.add_argument(
+        "--memprofile", action="store_true",
+        help="Enable tracemalloc; log top allocators every minute.",
+    )
     _add_common(sub_daemon)
 
     # Configuration interview (CONTRACT-v0.5 §14).
@@ -219,6 +258,8 @@ def _handle_daemon(args) -> None:
     legacy_argv = [sys.argv[0]]
     if args.config:
         legacy_argv += ["-c", str(args.config)]
+    if getattr(args, "memprofile", False):
+        legacy_argv += ["--memprofile"]
     sys.argv = legacy_argv
     legacy.main()
 
