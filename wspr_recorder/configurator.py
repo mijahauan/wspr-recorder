@@ -51,6 +51,38 @@ def _wizard_script() -> Optional[Path]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# sigmond.wizard_dispatch delegation.
+#
+# Same shape as mag-recorder commit 52190e7 and psk-recorder commit
+# c3b0b8d.  Differences for wspr-recorder:
+#
+#   - parse="kv": the wizard echoes "STATUS_ADDRESS=<value>" on
+#     stdout and Python applies it via _replace_radiod_field
+#     (preserving the source file's comments).  Not parse=None like
+#     mag/psk-recorder, whose wizards self-apply via `config apply`.
+#
+#   - sigmond.wizard_dispatch 1.x defaults parse="kv" to
+#     interactive=False -- captures stdout for parsing.  The wizard
+#     renders its UI via fd-swap (`3>&1 1>&2 2>&3`) inside the
+#     script, so capturing stdout doesn't hide the UI.
+#
+# When sigmond isn't importable, fall back to the original local
+# implementation (identical to the pre-extraction code) so wspr-recorder
+# still works standalone.
+# ---------------------------------------------------------------------------
+
+try:
+    import sigmond.wizard_dispatch as _sigmond_wd
+    assert _sigmond_wd.SIGMOND_WIZARD_DISPATCH_API == "1", (
+        f"sigmond.wizard_dispatch API "
+        f"{_sigmond_wd.SIGMOND_WIZARD_DISPATCH_API!r} != '1' "
+        f"(expected by wspr-recorder)"
+    )
+except (ImportError, AssertionError):
+    _sigmond_wd = None
+
+
 def _wizard_available(args) -> bool:
     """True when the whiptail wizard should be used.
 
@@ -58,13 +90,19 @@ def _wizard_available(args) -> bool:
     operator passed --non-interactive, whiptail isn't on PATH, or the
     wizard script can't be located.
     """
+    script = _wizard_script()
+    if script is None:
+        return False
+    if _sigmond_wd is not None:
+        return _sigmond_wd.is_wizard_available(args, script)
+    # Local fallback (verbatim from pre-extraction).
     if getattr(args, "non_interactive", False):
         return False
     if not sys.stdout.isatty():
         return False
     if shutil.which("whiptail") is None:
         return False
-    return _wizard_script() is not None
+    return True
 
 
 def _exec_wizard(args, target: Path) -> Optional[dict]:
@@ -75,6 +113,27 @@ def _exec_wizard(args, target: Path) -> Optional[dict]:
     script = _wizard_script()
     if script is None:
         return None
+
+    if _sigmond_wd is not None:
+        # parse="kv": wizard echoes STATUS_ADDRESS=<value> on stdout.
+        # sigmond defaults to interactive=False here, which captures
+        # stdout for parsing; the wizard's UI rendering reaches the
+        # terminal via the fd-swap inside the script.
+        result = _sigmond_wd.exec_wizard(
+            script,
+            extra_env={"WSPR_RECORDER_CONFIG": str(target)},
+            parse="kv",
+        )
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+        if result.error:
+            _err(result.error)
+            return None
+        if result.returncode != 0:
+            return None
+        return result.fields or {}
+
+    # Local fallback (sigmond not importable; verbatim from pre-extraction).
     env = {**os.environ, "WSPR_RECORDER_CONFIG": str(target)}
     try:
         proc = subprocess.run([str(script)], env=env,

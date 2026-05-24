@@ -30,27 +30,47 @@ set -euo pipefail
 
 CONFIG_PATH="${WSPR_RECORDER_CONFIG:-/etc/wspr-recorder/config.toml}"
 CACHE_PATH="${SIGMOND_ENV_CACHE:-/var/lib/sigmond/environment-cache.json}"
+
+# --- shared shell helpers ---------------------------------------------------
+#
+# Source sigmond's Tier-1 wizard helpers (preflight_or_exit_2, _info /
+# _warn / _err, recommended HEIGHT/WIDTH/LIST_HEIGHT/BACKTITLE
+# defaults).  Python's _exec_wizard (wspr_recorder/configurator.py) sets
+# SIGMOND_WIZARD_LIB_SH in the env via sigmond.wizard_dispatch when
+# the lib is installed; the :- default below covers direct-invocation
+# safety.
+#
+# Inline-fallback block keeps this script working when sigmond's
+# library isn't on the host -- same behaviour as before the
+# extraction.
+SIGMOND_WIZARD_LIB_SH="${SIGMOND_WIZARD_LIB_SH:-/opt/git/sigmond/sigmond/lib/sigmond/wizard_dispatch/wizard_dispatch.sh}"
+if [[ -r "$SIGMOND_WIZARD_LIB_SH" ]]; then
+    # shellcheck disable=SC1090
+    . "$SIGMOND_WIZARD_LIB_SH"
+else
+    # Local fallback (verbatim from pre-extraction shape so behaviour
+    # is identical regardless of which path runs).
+    HEIGHT=20; WIDTH=78; LIST_HEIGHT=10
+    _info() { printf '  %s\n'                "$*" >&2; }
+    _warn() { printf '  \033[33m⚠\033[0m %s\n' "$*" >&2; }
+    _err()  { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; }
+    preflight_or_exit_2() {
+        command -v whiptail >/dev/null 2>&1 \
+            || { _err "whiptail not on PATH"; exit 2; }
+        [[ -t 1 ]] \
+            || { _err "stdout is not a TTY"; exit 2; }
+    }
+fi
+
+# Override BACKTITLE to client-specific (lib default is generic).
 BACKTITLE="wspr-recorder configuration"
-WIDTH=78
-HEIGHT=20
-LIST_HEIGHT=10
-
-# --- stderr helpers (stdout is reserved for the protocol) -------------------
-
-_info() { printf '  %s\n' "$*" >&2; }
-_warn() { printf '  \033[33m⚠\033[0m %s\n' "$*" >&2; }
-_err()  { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; }
 
 # --- whiptail sanity --------------------------------------------------------
-
-if ! command -v whiptail >/dev/null 2>&1; then
-    _err "whiptail not found on PATH; this script should not have been invoked."
-    exit 2
-fi
-if [[ ! -t 1 ]]; then
-    _err "stdout is not a TTY; this script should not have been invoked."
-    exit 2
-fi
+# Belt-and-braces: Python's is_wizard_available() already gated for both
+# conditions before exec'ing us, but operators sometimes invoke this
+# script directly during dev.  Exit 2 distinguishes "shouldn't have
+# been called" from operator-cancel (exit 0) and real error (exit 1).
+preflight_or_exit_2
 
 # --- current status_address extraction --------------------------------------
 # tomllib via python is the most reliable parser; bash-side regex breaks on

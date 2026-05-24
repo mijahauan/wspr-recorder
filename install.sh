@@ -150,7 +150,12 @@ install_application() {
     # would try PyPI first.  pyproject.toml's [tool.uv.sources] overrides
     # are uv-only.  Pre-install from local paths so pip's resolver finds
     # them already-satisfied when it processes wspr-recorder's deps.
-    local SIBLING_REPOS=("callhash" "hs-uploader")
+    # sigmond joins the list: wspr-recorder's configurator lazy-imports
+    # `sigmond.wizard_dispatch` for the shared whiptail wizard
+    # dispatch helpers (same lib mag-recorder and psk-recorder use).
+    # Falls back to a local implementation when absent so adding it
+    # here is recommended-not-required for the standalone path.
+    local SIBLING_REPOS=("callhash" "hs-uploader" "sigmond")
     local sibling_args=()
     for repo in "${SIBLING_REPOS[@]}"; do
         local candidate="$SCRIPT_DIR/../$repo"
