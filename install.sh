@@ -53,19 +53,29 @@ check_root() {
     fi
 }
 
-_ensure_uv() {
-    if command -v uv >/dev/null 2>&1; then
-        info "uv $(uv --version 2>/dev/null | awk '{print $2}') at $(command -v uv)"
-        return
-    fi
-    info "uv not found -- installing system-wide to /usr/local/bin"
-    command -v curl >/dev/null || error "curl not found (apt install curl)"
-    if ! curl -LsSf https://astral.sh/uv/install.sh | env XDG_BIN_HOME=/usr/local/bin UV_NO_MODIFY_PATH=1 sh; then
-        error "uv installer failed"
-    fi
-    command -v uv >/dev/null || error "uv installer ran but uv is still not on PATH"
-    info "uv $(uv --version 2>/dev/null | awk '{print $2}') installed"
-}
+# Delegates to sigmond's shared helper if present; inline fallback for
+# the bootstrap case.  Keep the fallback in sync with
+# sigmond/scripts/install/ensure_uv.sh.
+_ENSURE_UV_SH="/opt/git/sigmond/sigmond/scripts/install/ensure_uv.sh"
+if [[ -r "$_ENSURE_UV_SH" ]]; then
+    # shellcheck source=/dev/null
+    source "$_ENSURE_UV_SH"
+else
+    _ensure_uv() {
+        if command -v uv >/dev/null 2>&1; then
+            printf '[INFO]  uv %s at %s\n' "$(uv --version 2>/dev/null | awk '{print $2}')" "$(command -v uv)"
+            return 0
+        fi
+        printf '[INFO]  uv not found -- installing system-wide to /usr/local/bin\n'
+        command -v curl >/dev/null || { printf '[ERROR] curl not found (apt install curl)\n' >&2; return 1; }
+        if ! curl -LsSf https://astral.sh/uv/install.sh | env XDG_BIN_HOME=/usr/local/bin UV_NO_MODIFY_PATH=1 sh; then
+            printf '[ERROR] uv installer failed\n' >&2
+            return 1
+        fi
+        command -v uv >/dev/null || { printf '[ERROR] uv installer ran but uv is still not on PATH\n' >&2; return 1; }
+        printf '[INFO]  uv %s installed\n' "$(uv --version 2>/dev/null | awk '{print $2}')"
+    }
+fi
 
 check_dependencies() {
     info "Checking dependencies..."
@@ -85,7 +95,7 @@ check_dependencies() {
 
     info "Found Python $PYTHON_VERSION"
 
-    _ensure_uv
+    _ensure_uv || error "_ensure_uv failed"
 }
 
 create_user() {
