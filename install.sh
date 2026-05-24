@@ -53,33 +53,39 @@ check_root() {
     fi
 }
 
+_ensure_uv() {
+    if command -v uv >/dev/null 2>&1; then
+        info "uv $(uv --version 2>/dev/null | awk '{print $2}') at $(command -v uv)"
+        return
+    fi
+    info "uv not found -- installing system-wide to /usr/local/bin"
+    command -v curl >/dev/null || error "curl not found (apt install curl)"
+    if ! curl -LsSf https://astral.sh/uv/install.sh | env XDG_BIN_HOME=/usr/local/bin UV_NO_MODIFY_PATH=1 sh; then
+        error "uv installer failed"
+    fi
+    command -v uv >/dev/null || error "uv installer ran but uv is still not on PATH"
+    info "uv $(uv --version 2>/dev/null | awk '{print $2}') installed"
+}
+
 check_dependencies() {
     info "Checking dependencies..."
-    
+
     # Check for Python 3.9+
     if ! command -v python3 &> /dev/null; then
         error "Python 3 is required but not installed"
     fi
-    
+
     PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     PYTHON_MAJOR=$(echo $PYTHON_VERSION | cut -d. -f1)
     PYTHON_MINOR=$(echo $PYTHON_VERSION | cut -d. -f2)
-    
+
     if [[ $PYTHON_MAJOR -lt 3 ]] || [[ $PYTHON_MAJOR -eq 3 && $PYTHON_MINOR -lt 9 ]]; then
         error "Python 3.9+ is required (found $PYTHON_VERSION)"
     fi
-    
+
     info "Found Python $PYTHON_VERSION"
-    
-    # Check for venv module
-    if ! python3 -c "import venv" &> /dev/null; then
-        error "Python venv module is required. Install with: apt install python3-venv"
-    fi
-    
-    # Check for pip
-    if ! python3 -c "import pip" &> /dev/null; then
-        error "Python pip is required. Install with: apt install python3-pip"
-    fi
+
+    _ensure_uv
 }
 
 create_user() {
@@ -121,62 +127,56 @@ install_application() {
 
     # Create installation directory
     mkdir -p "$INSTALL_DIR"
-    
+
+    local SCRIPT_DIR
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
     # Check if this is an upgrade
     local IS_UPGRADE=false
     if [[ -d "$INSTALL_DIR/venv" ]]; then
         IS_UPGRADE=true
         info "Existing installation detected - performing upgrade"
-    fi
-    
-    # Create or upgrade virtual environment
-    if [[ "$IS_UPGRADE" == true ]]; then
-        info "Upgrading virtual environment..."
-        python3 -m venv --upgrade "$INSTALL_DIR/venv"
     else
         info "Creating virtual environment..."
-        python3 -m venv "$INSTALL_DIR/venv"
+        # --seed populates pip/setuptools/wheel for compatibility with tooling
+        # that shells out to pip; harmless overhead otherwise.
+        uv venv "$INSTALL_DIR/venv" --python 3.11 --seed --quiet
     fi
-    
-    # Upgrade pip and wheel
-    "$INSTALL_DIR/venv/bin/pip" install --upgrade pip wheel
 
-    # Install/upgrade the package and all dependencies
-    info "Installing/upgrading wspr-recorder and dependencies..."
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-    # Sibling repos that aren't on PyPI yet — wspr-recorder declares them
-    # as standard deps (callhash>=1.0.0, hs-uploader>=0.1.0) so plain pip
-    # would try PyPI first.  pyproject.toml's [tool.uv.sources] overrides
-    # are uv-only.  Pre-install from local paths so pip's resolver finds
-    # them already-satisfied when it processes wspr-recorder's deps.
-    # sigmond joins the list: wspr-recorder's configurator lazy-imports
-    # `sigmond.wizard_dispatch` for the shared whiptail wizard
-    # dispatch helpers (same lib mag-recorder and psk-recorder use).
-    # Falls back to a local implementation when absent so adding it
-    # here is recommended-not-required for the standalone path.
-    local SIBLING_REPOS=("callhash" "hs-uploader" "sigmond")
-    local sibling_args=()
-    for repo in "${SIBLING_REPOS[@]}"; do
-        local candidate="$SCRIPT_DIR/../$repo"
-        if [[ -f "$candidate/pyproject.toml" ]]; then
-            sibling_args+=("$candidate")
-        else
-            warn "Sibling repo $repo not found at $candidate — pip will try PyPI"
-        fi
-    done
+    # Install/upgrade the package and all dependencies.  uv sync reads
+    # pyproject.toml + uv.lock, resolves [tool.uv.sources] (callhash,
+    # hs-uploader, ka9q-python all editable from sibling paths), installs
+    # wspr-recorder editable into the venv, and pins exactly what's in
+    # uv.lock.  --no-dev skips dev extras; --frozen requires uv.lock to
+    # be current (regenerate locally with `uv lock` if siblings or deps
+    # have shifted).  --upgrade is the equivalent of the old pip
+    # --force-reinstall (re-evaluate every dep against the lock).
+    info "Syncing wspr-recorder + siblings (callhash, hs-uploader, ka9q-python) into $INSTALL_DIR/venv"
+    local sync_args=(--project "$SCRIPT_DIR" --no-dev --quiet)
     if [[ "$IS_UPGRADE" == true ]]; then
-        # Force upgrade of all dependencies including ka9q-python
-        "$INSTALL_DIR/venv/bin/pip" install --upgrade --force-reinstall \
-            "${sibling_args[@]}" "$SCRIPT_DIR"
+        sync_args+=(--upgrade)
     else
-        "$INSTALL_DIR/venv/bin/pip" install \
-            "${sibling_args[@]}" "$SCRIPT_DIR"
+        sync_args+=(--frozen)
     fi
-    
+    UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" uv sync "${sync_args[@]}"
+
+    # sigmond is the host-wide orchestrator; wspr-recorder lazy-imports
+    # sigmond.wizard_dispatch from the configurator + sigmond.hamsci_sink
+    # from the SQLite spot path.  Not declared in pyproject.toml's
+    # [tool.uv.sources] so uv sync doesn't install it; explicit
+    # uv pip install when the sibling exists.  uv pip install needs
+    # --python (UV_PROJECT_ENVIRONMENT only applies to project commands).
+    if [[ -d /opt/git/sigmond/sigmond ]]; then
+        info "Installing sigmond (editable) into venv"
+        uv pip install --quiet --python "$INSTALL_DIR/venv/bin/python3" -e /opt/git/sigmond/sigmond
+    else
+        warn "sigmond repo not found at /opt/git/sigmond/sigmond -- SQLite spot sink"
+        warn "  and whiptail wizard will use fallback / no-op paths."
+    fi
+
     # Set ownership
     chown -R "$SERVICE_USER:$SERVICE_GROUP" "$INSTALL_DIR"
-    
+
     if [[ "$IS_UPGRADE" == true ]]; then
         info "Application upgraded"
     else
