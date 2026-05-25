@@ -1657,17 +1657,23 @@ Examples:
         return 1
 
     # Per-instance config carries reporter_id in its [instance] block;
-    # legacy shared config has None — fall back to --instance value so
-    # spot rows still carry a meaningful reporter_id during the
-    # deprecation window.
+    # legacy shared config has None, and we deliberately do NOT fall
+    # back to args.instance.  During the cutover, args.instance is the
+    # systemd %i which is typically a radiod identifier (e.g.
+    # "my-rx888"), not a reporter ID — using it as reporter_id would
+    # propagate a misleading value into spot rows.  Leave reporter_id
+    # None; spot_to_row's row-construction layer falls back to
+    # radiod_id (the existing legacy field's semantic) so the row
+    # field is still present, honestly tagged.  Operators set a real
+    # reporter_id by populating the [instance] block in the per-
+    # instance config (sigmond Phase 8 `smd instance migrate` is the
+    # planned interactive setup path).
     reporter_id = extract_reporter_id(resolved_config_path)
-    if args.instance and reporter_id is None:
-        reporter_id = args.instance
-    if reporter_id:
-        logger.info(
-            "wspr-recorder daemon: reporter_id=%s, config=%s",
-            reporter_id, resolved_config_path,
-        )
+    logger.info(
+        "wspr-recorder daemon: reporter_id=%s, config=%s",
+        reporter_id or "<derived from radiod_id at row time>",
+        resolved_config_path,
+    )
 
     # Override output directory if specified
     if args.output_dir:
