@@ -18,7 +18,8 @@ from unittest.mock import MagicMock, patch
 
 from wspr_recorder.decoder import RawSpot
 from wspr_recorder.spot_sink import (
-    SpotSink, SCHEMA_VERSION, spot_to_row, resolve_reporter_identity,
+    SpotSink, SCHEMA_VERSION, spot_to_row, noise_to_row,
+    resolve_reporter_identity,
 )
 
 
@@ -433,3 +434,84 @@ class TestRxSourceField(unittest.TestCase):
             rx_source="radiod:bee2-status.local",
         )
         self.assertEqual(row_explicit["rx_source"], "radiod:bee2-status.local")
+
+
+# ---------------------------------------------------------------------------
+# Phase-4 (sigmond MULTI-INSTANCE-ARCHITECTURE.md §7): reporter_id field
+# ---------------------------------------------------------------------------
+
+class TestReporterIdSpot(unittest.TestCase):
+    """spot_to_row tags rows with reporter_id, fallback to radiod_id."""
+
+    def _spot(self):
+        return RawSpot(
+            date="260519", time="1620",
+            sync_quality=0.95, snr=-15, dt=0.5,
+            freq=14.0956, drift=0, jitter=0, blocksize=0,
+            metric=0.0, cycles=0, decodetype=1, ipass=1,
+            nhardmin=0, pkt_mode=2, call="K1ABC", grid="FN42",
+            power=10,
+        )
+
+    def test_explicit_reporter_id(self):
+        row = spot_to_row(
+            self._spot(),
+            band="20", radiod_id="my-rx888",
+            rx_call="AC0G/B4", rx_grid="EM38ww",
+            reporter_id="AC0G-B1",
+        )
+        self.assertEqual(row["reporter_id"], "AC0G-B1")
+        # radiod_id is its own field — unchanged by reporter_id presence
+        self.assertEqual(row["radiod_id"], "my-rx888")
+
+    def test_reporter_id_falls_back_to_radiod_id(self):
+        row = spot_to_row(
+            self._spot(),
+            band="20", radiod_id="my-rx888",
+            rx_call="AC0G/B4", rx_grid="EM38ww",
+        )
+        self.assertEqual(row["reporter_id"], "my-rx888")
+
+
+class TestReporterIdNoise(unittest.TestCase):
+    """noise_to_row tags rows with reporter_id, same fallback rule."""
+
+    def _noise(self):
+        from wspr_recorder.noise import NoiseMeasurement
+        return NoiseMeasurement(
+            rms_noise_dbm=-110.5, fft_noise_dbm=-118.2, overload_count=0,
+        )
+
+    def test_explicit_reporter_id(self):
+        row = noise_to_row(
+            self._noise(),
+            band="20", cycle_key=("260519", "1620"),
+            radiod_id="my-rx888",
+            rx_call="AC0G/B4", rx_grid="EM38ww",
+            reporter_id="AC0G-B1",
+        )
+        self.assertEqual(row["reporter_id"], "AC0G-B1")
+
+    def test_reporter_id_falls_back_to_radiod_id(self):
+        row = noise_to_row(
+            self._noise(),
+            band="20", cycle_key=("260519", "1620"),
+            radiod_id="my-rx888",
+            rx_call="AC0G/B4", rx_grid="EM38ww",
+        )
+        self.assertEqual(row["reporter_id"], "my-rx888")
+
+
+class TestSpotSinkPlumbsReporterId(unittest.TestCase):
+    """SpotSink stores reporter_id at construction time."""
+
+    def test_stored(self):
+        sink = SpotSink(
+            rx_call="AC0G", rx_grid="EM38",
+            enabled=False, reporter_id="AC0G-B1",
+        )
+        self.assertEqual(sink.reporter_id, "AC0G-B1")
+
+    def test_default_none(self):
+        sink = SpotSink(rx_call="AC0G", rx_grid="EM38", enabled=False)
+        self.assertIsNone(sink.reporter_id)

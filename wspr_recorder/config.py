@@ -8,6 +8,7 @@ import os
 import sys
 import re
 import logging
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -20,6 +21,88 @@ else:
     import tomli as tomllib
 
 logger = logging.getLogger(__name__)
+
+
+# Per-instance config layout — sigmond MULTI-INSTANCE-ARCHITECTURE.md §4.
+DEFAULT_CONFIG_PATH = Path(
+    os.environ.get("WSPR_RECORDER_CONFIG", "/etc/wspr-recorder/config.toml"),
+)
+PER_INSTANCE_CONFIG_DIR = Path("/etc/wspr-recorder")
+
+
+def resolve_config_path(
+    instance: Optional[str] = None,
+    explicit_path: Optional[Path] = None,
+) -> Path:
+    """Resolve which config file to load for this invocation.
+
+    Resolution order (most → least specific):
+      1. `explicit_path` (operator passed --config / -c) — always wins.
+      2. `$WSPR_RECORDER_CONFIG` env var — explicit override.
+      3. `/etc/wspr-recorder/<instance>.toml` when `instance` is given
+         and the file exists — the per-instance v0.8 world (sigmond's
+         MULTI-INSTANCE-ARCHITECTURE.md §4).
+      4. `/etc/wspr-recorder/config.toml` (legacy shared) — emits a
+         DeprecationWarning when `instance` was given but the
+         per-instance file does not exist (operator hasn't run
+         `sudo smd instance migrate` yet).
+      5. `/etc/wspr-recorder/config.toml` (legacy shared) silently
+         when no instance was given (pre-instance world).
+    """
+    if explicit_path is not None:
+        return Path(explicit_path)
+    env_override = os.environ.get("WSPR_RECORDER_CONFIG")
+    if env_override:
+        return Path(env_override)
+    if instance:
+        per_instance = PER_INSTANCE_CONFIG_DIR / f"{instance}.toml"
+        if per_instance.exists():
+            return per_instance
+        warnings.warn(
+            f"per-instance config {per_instance} not found; falling "
+            f"back to legacy shared config {DEFAULT_CONFIG_PATH}. "
+            f"Migrate this host with `sudo smd instance migrate` "
+            f"(MULTI-INSTANCE-ARCHITECTURE.md §6) — the legacy path "
+            f"will be removed after the deprecation window.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return DEFAULT_CONFIG_PATH
+
+
+def extract_reporter_id(config_or_path) -> Optional[str]:
+    """Read the reporter ID from the per-instance `[instance]` block.
+
+    Accepts either a raw TOML dict (already parsed) or a Path to a
+    TOML file (reads it).  The `[instance]` block is sigmond's
+    addition and isn't part of wspr-recorder's `Config` dataclass —
+    `load_config()` ignores it — so this helper walks the raw TOML
+    independently.
+
+    Returns None when the config has no `[instance]` block (legacy
+    shared-config world).  Callers fall back to a derived identifier
+    (e.g. the systemd instance name or radiod_id) so every spot row
+    still carries a meaningful reporter_id during the deprecation
+    window.
+    """
+    if isinstance(config_or_path, dict):
+        raw = config_or_path
+    else:
+        path = Path(config_or_path)
+        if not path.exists():
+            return None
+        try:
+            with open(path, "rb") as f:
+                raw = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError):
+            return None
+    inst = raw.get("instance")
+    if not isinstance(inst, dict):
+        return None
+    rid = inst.get("reporter_id")
+    if not isinstance(rid, str) or not rid:
+        return None
+    return rid
 
 
 # WSPR frequency bands with wsprdaemon-compatible directory names

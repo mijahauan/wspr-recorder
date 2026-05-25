@@ -208,6 +208,7 @@ def spot_to_row(
     host_id: Optional[str] = None,
     decoder_depth: int = 3,
     rx_source: str = "",
+    reporter_id: Optional[str] = None,
 ) -> dict:
     """Convert one RawSpot → JSON-serializable row dict.
 
@@ -252,12 +253,18 @@ def spot_to_row(
     # GROUP BY runs on (cycle_iso, callsign, frequency_hz, rx_source)
     # and picks the max(snr_db).
     rx_source_eff = rx_source or radiod_id
+    # Phase-4 (sigmond MULTI-INSTANCE-ARCHITECTURE.md §7): reporter_id is
+    # the first-class per-instance identifier.  Falls back to radiod_id
+    # when not provided (legacy single-instance world) so every row has
+    # a meaningful value during the deprecation window.
+    reporter_id_eff = reporter_id or radiod_id
     return {
         "time":            ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "band":            band,
         "mode":            mode,
         "radiod_id":       radiod_id,
         "rx_source":       rx_source_eff,
+        "reporter_id":     reporter_id_eff,
         "host_id":         host_id,
         "frequency_hz":    int(round(spot.freq * 1_000_000)),
         "callsign":        callsign,
@@ -303,6 +310,7 @@ def noise_to_row(
     rx_grid: str,
     host_id: Optional[str] = None,
     rx_source: str = "",
+    reporter_id: Optional[str] = None,
 ) -> dict:
     """Convert a per-(band, cycle) NoiseMeasurement → row dict for
     sink.db's wspr.noise table.
@@ -327,11 +335,13 @@ def noise_to_row(
         )
         ts = datetime.now(timezone.utc).replace(microsecond=0)
     rx_source_eff = rx_source or radiod_id
+    reporter_id_eff = reporter_id or radiod_id
     return {
         "time":            ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "band":            band,
         "radiod_id":       radiod_id,
         "rx_source":       rx_source_eff,
+        "reporter_id":     reporter_id_eff,
         "host_id":         host_id,
         "rx_call":         rx_call,
         "rx_grid":         rx_grid,
@@ -365,11 +375,18 @@ class SpotSink:
         host_id: Optional[str] = None,
         decoder_depth: int = 3,
         writer=None,
+        reporter_id: Optional[str] = None,
     ):
         self.rx_call = rx_call
         self.rx_grid = rx_grid
         self.host_id = host_id or socket.gethostname()
         self.decoder_depth = decoder_depth
+        # Phase-4 (sigmond MULTI-INSTANCE-ARCHITECTURE.md §3) — set
+        # by WsprRecorder from the per-instance config's [instance]
+        # block (or the --instance CLI fallback).  None in legacy
+        # single-instance deployments; spot_to_row falls back to
+        # radiod_id so every row still has a meaningful reporter_id.
+        self.reporter_id = reporter_id
 
         if enabled is None:
             enabled = _enabled()
@@ -441,6 +458,7 @@ class SpotSink:
                     rx_grid=self.rx_grid,
                     host_id=self.host_id,
                     decoder_depth=self.decoder_depth,
+                    reporter_id=self.reporter_id,
                 ))
             except Exception as exc:
                 logger.warning(
@@ -501,6 +519,7 @@ class SpotSink:
                         host_id=self.host_id,
                         decoder_depth=self.decoder_depth,
                         rx_source=rx_source,
+                        reporter_id=self.reporter_id,
                     ))
                 except Exception as exc:
                     logger.warning(
@@ -574,6 +593,7 @@ class SpotSink:
                     rx_call=self.rx_call, rx_grid=self.rx_grid,
                     host_id=self.host_id,
                     rx_source=rx_source,
+                    reporter_id=self.reporter_id,
                 ))
             except Exception as exc:
                 logger.warning(

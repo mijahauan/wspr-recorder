@@ -368,3 +368,30 @@ radiod S16BE wire → ka9q-python RadiodStream (S16BE→float32, resequenced, ga
 ```
 
 **Requires:** ka9q-python ≥ 3.7.1 (PyPI: `pip install ka9q-python>=3.7.1`).
+
+## Per-instance cutover (Phase 4 of sigmond multi-instance architecture)
+
+The systemd unit (`wspr-recorder@%i.service`) now passes `--instance %i`
+to the daemon.  `config.resolve_config_path()` prefers
+`/etc/wspr-recorder/<instance>.toml` when it exists; otherwise falls
+back to the legacy shared `/etc/wspr-recorder/config.toml` with a
+one-line `DeprecationWarning`.
+
+For operators currently running radiod-keyed instance names
+(`wspr-recorder@my-rx888.service`), no action is required — the
+daemon continues to read the shared config under the legacy path.
+Migrating to reporter-keyed instance names is a one-shot operation
+via `sudo smd instance migrate` (sigmond Phase 8, not yet shipped).
+After migration, the per-instance config holds an `[instance]` block
+with `reporter_id = "AC0G-B1"`, and the daemon stops emitting the
+deprecation warning.
+
+Spot rows (and noise rows) now carry a first-class `reporter_id`
+field, derived from the per-instance config's `[instance]` block when
+present, or falling back to `radiod_id` for legacy single-instance
+deployments.  Downstream consumers should switch to `reporter_id` as
+the primary per-receiver identifier.  The `radiod_id` and `rx_source`
+fields remain unchanged.
+
+See `/opt/git/sigmond/sigmond/docs/MULTI-INSTANCE-ARCHITECTURE.md`
+for the architecture, file-layout, and phase plan.

@@ -21,7 +21,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .config import Config, load_config, freq_to_band_name
+from .config import (
+    Config, extract_reporter_id, freq_to_band_name, load_config,
+    resolve_config_path,
+)
 from .receiver_manager import ReceiverManager, ChannelState, ChannelSink
 from .band_recorder import BandRecorder, GapEvent, DecodeRequest
 from .wav_writer import WavWriter
@@ -54,7 +57,13 @@ class WsprRecorder:
     MEMPROFILE_INTERVAL = 60  # tracemalloc snapshot cadence (seconds)
     MEMPROFILE_TOP_N = 15     # top allocators reported per snapshot
     
-    def __init__(self, config: Config, memprofile: bool = False):
+    def __init__(
+        self,
+        config: Config,
+        memprofile: bool = False,
+        *,
+        reporter_id: Optional[str] = None,
+    ):
         """
         Initialize WSPR recorder.
 
@@ -62,10 +71,18 @@ class WsprRecorder:
             config: Loaded configuration
             memprofile: If True, enable tracemalloc and log top allocators
                 periodically. See MEMPROFILE_INTERVAL / MEMPROFILE_TOP_N.
+            reporter_id: Per-instance reporter identifier from sigmond's
+                MULTI-INSTANCE-ARCHITECTURE.md §3 (e.g. ``AC0G-B1``).
+                Passed to ``SpotSink`` so every spot row carries it;
+                ``None`` in legacy single-instance deployments —
+                ``SpotSink`` falls back to ``radiod_id`` so spot rows
+                still have a meaningful identifier during the deprecation
+                window.
         """
         self.config = config
         self._memprofile = memprofile
         self._memprofile_baseline: Optional[tracemalloc.Snapshot] = None
+        self._reporter_id = reporter_id
         
         # Components
         # Dict keyed by SourceConfig.key — one ReceiverManager per
@@ -1186,7 +1203,10 @@ class WsprRecorder:
         # wsprdaemon-client's envgen — see resolve_reporter_identity()
         # for the var precedence + fallback.
         rx_call, rx_grid = resolve_reporter_identity()
-        self.spot_sink = SpotSink(rx_call=rx_call, rx_grid=rx_grid)
+        self.spot_sink = SpotSink(
+            rx_call=rx_call, rx_grid=rx_grid,
+            reporter_id=self._reporter_id,
+        )
         if self.spot_sink.enabled:
             # Persist the callsign-hash table to disk so the (call,
             # hash) mappings learned from <call> announcements survive
@@ -1553,8 +1573,14 @@ Examples:
     
     parser.add_argument(
         "-c", "--config",
-        required=True,
-        help="Path to config.toml",
+        required=False, default=None,
+        help="Path to config.toml (overrides --instance resolution)",
+    )
+    parser.add_argument(
+        "--instance", default=None,
+        help="Reporter-ID instance (loads /etc/wspr-recorder/<instance>.toml "
+             "when present; falls back to shared config otherwise). "
+             "See sigmond's MULTI-INSTANCE-ARCHITECTURE.md §6.",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -1611,22 +1637,46 @@ Examples:
                     "(prevents RSS growth from per-cycle numpy slice "
                     "fragmentation)")
     
+    # Phase-3/4 cutover (sigmond MULTI-INSTANCE-ARCHITECTURE.md §4):
+    # prefer per-instance config when --instance is given and the file
+    # exists; fall back to legacy shared config with a deprecation
+    # warning otherwise.  --config (-c) still wins over both.
+    resolved_config_path = resolve_config_path(
+        instance=args.instance,
+        explicit_path=Path(args.config) if args.config else None,
+    )
+
     # Load configuration
     try:
-        config = load_config(args.config)
+        config = load_config(str(resolved_config_path))
     except FileNotFoundError as e:
         logger.error(f"Config file not found: {e}")
         return 1
     except ValueError as e:
         logger.error(f"Invalid configuration: {e}")
         return 1
-    
+
+    # Per-instance config carries reporter_id in its [instance] block;
+    # legacy shared config has None — fall back to --instance value so
+    # spot rows still carry a meaningful reporter_id during the
+    # deprecation window.
+    reporter_id = extract_reporter_id(resolved_config_path)
+    if args.instance and reporter_id is None:
+        reporter_id = args.instance
+    if reporter_id:
+        logger.info(
+            "wspr-recorder daemon: reporter_id=%s, config=%s",
+            reporter_id, resolved_config_path,
+        )
+
     # Override output directory if specified
     if args.output_dir:
         config.recorder.output_dir = args.output_dir
-    
+
     # Create recorder
-    recorder = WsprRecorder(config, memprofile=args.memprofile)
+    recorder = WsprRecorder(
+        config, memprofile=args.memprofile, reporter_id=reporter_id,
+    )
     
     # Setup signal handlers
     def signal_handler(sig, frame):

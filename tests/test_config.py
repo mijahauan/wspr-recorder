@@ -3,9 +3,13 @@
 import pytest
 import tempfile
 import os
+import warnings
+from pathlib import Path
 from wspr_recorder.config import (
     parse_frequency, freq_to_band_name, Config, ChannelDefaults,
     BandConfig, load_config,
+    DEFAULT_CONFIG_PATH, PER_INSTANCE_CONFIG_DIR,
+    resolve_config_path, extract_reporter_id,
 )
 
 
@@ -407,3 +411,88 @@ frequency = "14095600"
                 load_config(path)
         finally:
             os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Per-instance config resolution (sigmond MULTI-INSTANCE-ARCHITECTURE.md §4)
+# ---------------------------------------------------------------------------
+
+class TestResolveConfigPath:
+    """Five-rung precedence ladder for config resolution."""
+
+    def setup_method(self, method):
+        self._old_env = os.environ.get("WSPR_RECORDER_CONFIG")
+        os.environ.pop("WSPR_RECORDER_CONFIG", None)
+
+    def teardown_method(self, method):
+        if self._old_env is None:
+            os.environ.pop("WSPR_RECORDER_CONFIG", None)
+        else:
+            os.environ["WSPR_RECORDER_CONFIG"] = self._old_env
+
+    def test_explicit_path_wins(self):
+        explicit = Path("/tmp/some-config.toml")
+        assert resolve_config_path(instance="AC0G-B1", explicit_path=explicit) == explicit
+
+    def test_env_var_wins_over_instance(self):
+        os.environ["WSPR_RECORDER_CONFIG"] = "/tmp/from-env.toml"
+        assert resolve_config_path(instance="AC0G-B1") == Path("/tmp/from-env.toml")
+
+    def test_per_instance_when_file_exists(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance_file = Path(tmp) / "AC0G-B1.toml"
+            instance_file.write_text("[instance]\nreporter_id = 'AC0G-B1'\n")
+            monkeypatch.setattr(
+                "wspr_recorder.config.PER_INSTANCE_CONFIG_DIR", Path(tmp)
+            )
+            assert resolve_config_path(instance="AC0G-B1") == instance_file
+
+    def test_deprecation_warning_when_instance_file_missing(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = resolve_config_path(instance="NEVER-EXISTS-XYZ")
+        assert result == DEFAULT_CONFIG_PATH
+        assert any(issubclass(w.category, DeprecationWarning) for w in caught), \
+            f"expected DeprecationWarning, got {[w.category for w in caught]}"
+
+    def test_silent_fallback_when_no_instance(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = resolve_config_path()
+        assert result == DEFAULT_CONFIG_PATH
+        assert not any(issubclass(w.category, DeprecationWarning) for w in caught), \
+            "no instance arg = pre-instance world; should not warn"
+
+
+class TestExtractReporterId:
+    """[instance] block extraction — dict and path inputs both work."""
+
+    def test_dict_present(self):
+        assert extract_reporter_id({"instance": {"reporter_id": "AC0G-B1"}}) == "AC0G-B1"
+
+    def test_dict_missing_block(self):
+        assert extract_reporter_id({"recorder": {}}) is None
+
+    def test_dict_block_without_key(self):
+        assert extract_reporter_id({"instance": {"antenna": "loop"}}) is None
+
+    def test_dict_empty_string(self):
+        assert extract_reporter_id({"instance": {"reporter_id": ""}}) is None
+
+    def test_dict_non_string(self):
+        assert extract_reporter_id({"instance": {"reporter_id": 42}}) is None
+
+    def test_path_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.toml"
+            path.write_text("[instance]\nreporter_id = 'KP4MD-RPI4'\n")
+            assert extract_reporter_id(path) == "KP4MD-RPI4"
+
+    def test_path_missing_file(self):
+        assert extract_reporter_id(Path("/nonexistent/path/xyz.toml")) is None
+
+    def test_path_malformed_toml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad.toml"
+            path.write_text("not [ valid TOML")
+            assert extract_reporter_id(path) is None

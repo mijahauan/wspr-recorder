@@ -130,6 +130,12 @@ def main(argv: list[str] | None = None) -> None:
 
     sub_daemon = subparsers.add_parser("daemon")
     sub_daemon.add_argument(
+        "--instance", default=None,
+        help="Reporter-ID instance (loads /etc/wspr-recorder/<instance>.toml "
+             "when present; falls back to shared config otherwise). "
+             "See sigmond's MULTI-INSTANCE-ARCHITECTURE.md §6.",
+    )
+    sub_daemon.add_argument(
         "--memprofile", action="store_true",
         help="Enable tracemalloc; log top allocators every minute.",
     )
@@ -258,6 +264,8 @@ def _handle_daemon(args) -> None:
     legacy_argv = [sys.argv[0]]
     if args.config:
         legacy_argv += ["-c", str(args.config)]
+    if getattr(args, "instance", None):
+        legacy_argv += ["--instance", str(args.instance)]
     if getattr(args, "memprofile", False):
         legacy_argv += ["--memprofile"]
     sys.argv = legacy_argv

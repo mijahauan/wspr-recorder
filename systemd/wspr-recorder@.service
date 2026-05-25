@@ -40,8 +40,15 @@ ExecStartPre=+/bin/mkdir -p /var/log/wspr-recorder
 ExecStartPre=+/usr/bin/chown -R wsprrec:wsprrec /dev/shm/wspr-recorder
 ExecStartPre=+/usr/bin/chown -R wsprrec:wsprrec /var/log/wspr-recorder
 
+# Phase-4 cutover (sigmond MULTI-INSTANCE-ARCHITECTURE.md):
+# --instance %i picks up /etc/wspr-recorder/%i.toml when the operator
+# has run `sudo smd instance migrate` (Phase 8).  Until then, the
+# per-instance config doesn't exist and the daemon falls back to the
+# legacy /etc/wspr-recorder/config.toml with a one-line deprecation
+# warning.  --config is intentionally omitted — passing it would force
+# the legacy path always (explicit_path wins in resolve_config_path).
 ExecStart=/opt/wspr-recorder/venv/bin/python3 -m wspr_recorder.cli daemon \
-    --config /etc/wspr-recorder/config.toml
+    --instance %i
 
 # Generous: connecting to radiod + provisioning ~17 WSPR band
 # channels before the daemon sends sd_notify READY=1.  Matches
