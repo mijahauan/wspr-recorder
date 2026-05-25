@@ -32,25 +32,39 @@ With both flags set, wspr-recorder supersedes `wsprdaemon-client`'s
 ## Commands
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
+# Development — uv is canonical (sigmond-suite convention); creates .venv/
+uv sync --extra dev
+uv run pytest tests/
+uv run pytest tests/test_config.py -v                 # one file
+uv run pytest tests/test_config.py::TestClass::test  # one test
+uv run pytest -k ring_buffer -v                       # by keyword
 
-# Run tests
-pytest tests/
-pytest -v tests/test_config.py          # single file
-pytest -v tests/test_config.py -k "test_name"  # single test
+# Run-from-source without install:
+PYTHONPATH=. python3 -m wspr_recorder -c config.toml
 
-# Run the recorder (requires radiod)
-python3 -m wspr_recorder -c config.toml
+# Production install / upgrade (uses sigmond's shared _ensure_uv helper)
+sudo ./scripts/install.sh           # first-run: user, venv (via uv), config, systemd
+sudo ./scripts/deploy.sh            # ongoing: refresh + restart instances
 
 # Run with CPU isolation (production-like)
 ./run_isolated.sh
 
-# Control interface
+# Daemon CLI (current — verify against `wspr-recorder --help`)
+wspr-recorder inventory --json       # per-instance resource view
+wspr-recorder validate --json        # config validation
+wspr-recorder version --json         # version + git sha
+wspr-recorder daemon --config <path> --radiod-id <id>
+wspr-recorder config init|edit      # whiptail wizard, sigmond.wizard_dispatch
+
+# Control interface (separate CLI, talks to IPCServer)
 wspr-ctl status
 wspr-ctl health
 wspr-ctl bands
 ```
+
+The test suite is large (~361 tests collected). When iterating, target
+the affected file with `uv run pytest tests/test_<area>.py -v` rather
+than the whole suite.
 
 ## Architecture
 
@@ -160,6 +174,34 @@ The +120 s headroom above the longest period exists so that the W2 cycle that st
 - **sd_notify without a dependency**: The unit is `Type=notify` with `WatchdogSec`. `_sd_notify()` sends `READY=1` / `WATCHDOG=1` datagrams over the `NOTIFY_SOCKET` `AF_UNIX` socket using only stdlib — no `sdnotify`/`systemd` package. Until `READY=1` the unit sits in `activating` and systemd would time it out at `TimeoutStartSec` (180 s); the watchdog ping at `WATCHDOG_USEC/2` lets systemd restart a wedged daemon. Both calls no-op when the env vars are absent, so standalone runs are unaffected. This is the same pattern psk-recorder / hfdl-recorder use. (Before this was implemented, the daemon never notified and systemd crash-looped it.)
 - **Restart-on-stream-restore**: After a real radiod outage, an in-place `BandRecorder` reset leaves ring-buffer minute alignment off by an unknowable offset and wsprd decodes zero spots. `on_stream_restored` instead `os._exit(75)`s so systemd's `Restart=always` brings the process back for a clean re-sync on the next minute boundary.
 
+## Client contract (v0.7)
+
+wspr-recorder implements the HamSCI client contract at version 0.7
+(authoritative source: `/opt/git/sigmond/sigmond/docs/CLIENT-CONTRACT.md`).
+`wspr_recorder/contract.py` carries `CONTRACT_VERSION = "0.7"`.
+
+Sections implemented:
+
+- **§1 / §2 / §3 / §4 / §5** — native TOML config, radiod-id binding,
+  self-describe CLI (`inventory`/`validate`/`version` `--json`),
+  `Type=notify` systemd unit, `deploy.toml` manifest.
+- **§6 / §7** — uses ka9q-python `MultiStream`; data destination
+  read from `ChannelInfo`, never client-specified.
+- **§8** — `RADIOD_<id>_CHAIN_DELAY_NS` read from `coordination.env`.
+- **§10 / §11** — `log_paths` in inventory (journal-routed, not
+  per-instance files); `WSPR_RECORDER_LOG_LEVEL` / `CLIENT_LOG_LEVEL`.
+- **§12** — validate hardening: SSRC uniqueness across
+  `(freq, preset, sample_rate, encoding)`, absolute config path,
+  ka9q-python PyPI-lag warning.
+- **§14** — `config init`/`edit` via `configurator.py` (whiptail
+  wizard + `sigmond.wizard_dispatch`; third consumer of the lib).
+- **§17** — output sinks in inventory (SQLite sink + per-mode log
+  files / journal).
+- **§18 (timing authority)** — capability boolean declared;
+  `timing_authority_applied` always `null` (RTP-default mode). A
+  subscriber path via `authority_reader.py` exists but is not yet
+  wired into the recording pipeline.
+
 ## Configuration
 
 See `config.toml.example`. Key sections: `[recorder]` (output), `[radiod]` (connection), `[timing]` (authority), `[channel_defaults]` (sample rate, filters). Pipeline-v2 behaviour (decode, sink, upload) is driven entirely by **environment variables**, not the TOML — see [docs/CONFIG.md](docs/CONFIG.md) for the full table.
@@ -207,7 +249,7 @@ Band names in `config.py:WSPR_BANDS` must match wsprdaemon conventions (e.g., "2
 
 ## Testing
 
-pytest with pytest-asyncio (`asyncio_mode = "auto"`). Tests are in `tests/`, ~258 tests covering:
+pytest with pytest-asyncio (`asyncio_mode = "auto"`). Tests are in `tests/`, ~361 collected, covering:
 
 - `test_decode_mode.py` — scheduling logic, period boundaries, mode grouping
 - `test_ring_buffer.py` — write/extract, wrap-around, gap handling, eviction
@@ -326,11 +368,3 @@ radiod S16BE wire → ka9q-python RadiodStream (S16BE→float32, resequenced, ga
 ```
 
 **Requires:** ka9q-python ≥ 3.7.1 (PyPI: `pip install ka9q-python>=3.7.1`).
-
-1. Don’t assume. Don’t hide confusion. Surface tradeoffs.
-
-2. Minimum code that solves the problem. Nothing speculative.
-
-3. Touch only what you must. Clean up only your own mess.
-
-4. Define success criteria. Loop until verified.
