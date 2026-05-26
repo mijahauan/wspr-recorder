@@ -88,7 +88,8 @@ class InitCommandTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             text = target.read_text()
-            self.assertIn('status_address = "bee1-status.local"', text)
+            # RADIOD-IDENTIFICATION.md §3.1 — canonical field is `status`.
+            self.assertIn('status = "bee1-status.local"', text)
             # No station block should be touched (wspr-recorder schema lacks one).
             self.assertNotIn('[station]', text)
             self.assertNotIn('AC0G', text)
@@ -113,7 +114,9 @@ class InitCommandTests(unittest.TestCase):
                                  clear=False):
                 rc = configurator.cmd_config_init(args)
             self.assertEqual(rc, 0)
-            self.assertIn('status_address = "rx2-status.local"',
+            # RADIOD-IDENTIFICATION.md §3.1: canonical field is
+            # `status` (post-Phase-3), no longer `status_address`.
+            self.assertIn('status = "rx2-status.local"',
                           target.read_text())
 
 

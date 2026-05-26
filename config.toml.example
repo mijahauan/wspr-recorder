@@ -79,9 +79,20 @@ ipc_socket = "/run/wspr-recorder/control.sock"
 authority = "auto"
 
 [radiod]
-# radiod status/control multicast address (mDNS name like xxx-status.local)
-# Example: bee1-hf-status.local, rx888-status.local
-status_address = "bee3-status.local"
+# REQUIRED: the mDNS control/status multicast name of the radiod to
+# consume from.  Discover available radiods on the LAN with:
+#   wspr-recorder config init      (interactive wizard, picks one)
+#   ka9q-python list               (raw discovery)
+# Examples: "bee1-status.local", "rx888-status.local".  Leave the
+# placeholder unchanged to make the daemon refuse to start until
+# the operator runs the configurator.
+status = "<configure-via-config-init>"
+
+# Legacy field name accepted during the Phase 3 deprecation window
+# (RADIOD-IDENTIFICATION.md §6).  Greenfield installs should use
+# `status` above; existing deployments can keep this until they
+# re-run the configurator.
+# status_address = "bee3-status.local"
 
 # RTP multicast destination is not configured here — radiod advertises
 # per-channel multicast groups via its status stream (discovered through

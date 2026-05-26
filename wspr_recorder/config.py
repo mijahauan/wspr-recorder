@@ -552,8 +552,22 @@ def load_config(config_path: str) -> Config:
     # when no [[source]] entries are present.
     if "radiod" in data:
         rad = data["radiod"]
+        # RADIOD-IDENTIFICATION.md §3.1 — `status` is the new canonical
+        # field name for the mDNS multicast.  Accept legacy
+        # `status_address` during the Phase 3 deprecation window with
+        # a DeprecationWarning.  When both are present, `status` wins.
+        status_value = rad.get("status")
+        if status_value is None and "status_address" in rad:
+            warnings.warn(
+                "[radiod] status_address is deprecated; rename to "
+                "[radiod] status per RADIOD-IDENTIFICATION.md §3.1",
+                DeprecationWarning, stacklevel=2,
+            )
+            status_value = rad["status_address"]
+        if status_value is None:
+            status_value = config.radiod.status_address  # fall back to default
         config.radiod = RadiodConfig(
-            status_address=rad.get("status_address", config.radiod.status_address),
+            status_address=status_value,
             port=rad.get("port", config.radiod.port),
         )
 

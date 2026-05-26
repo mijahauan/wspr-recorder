@@ -185,7 +185,11 @@ def cmd_config_init(args) -> int:
 
     body = template.read_text()
     values = _collect_init_values(args)
-    body = _replace_radiod_field(body, "status_address", values["radiod_status"])
+    # RADIOD-IDENTIFICATION.md §3.1 — canonical field is `status`;
+    # legacy `status_address` line is a commented example in the
+    # template post-Phase 3.  Phase 4 will replace _collect_init_values'
+    # env-var-driven defaults with ka9q-python discovery.
+    body = _replace_radiod_field(body, "status", values["radiod_status"])
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body)
@@ -197,7 +201,7 @@ def cmd_config_init(args) -> int:
         fields = _exec_wizard(args, target)
         if fields and "status_address" in fields:
             body = target.read_text()
-            body = _replace_radiod_field(body, "status_address",
+            body = _replace_radiod_field(body, "status",
                                           fields["status_address"])
             target.write_text(body)
             values["radiod_status"] = fields["status_address"]
