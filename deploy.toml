@@ -15,22 +15,22 @@ edit = ["/usr/local/bin/wspr-recorder", "config", "edit"]
 
 [build]
 steps = [
-    "python3 -m venv /opt/wspr-recorder/venv",
-    "/opt/wspr-recorder/venv/bin/pip install --upgrade pip setuptools wheel",
-    "/opt/wspr-recorder/venv/bin/pip install -e /opt/git/sigmond/wspr-recorder",
+    "python3 -m venv /opt/git/sigmond/wspr-recorder/venv",
+    "/opt/git/sigmond/wspr-recorder/venv/bin/pip install --upgrade pip setuptools wheel",
+    "/opt/git/sigmond/wspr-recorder/venv/bin/pip install -e /opt/git/sigmond/wspr-recorder",
 ]
 produces = [
-    "/opt/wspr-recorder/venv/bin/wspr-recorder",
+    "/opt/git/sigmond/wspr-recorder/venv/bin/wspr-recorder",
 ]
 
 [[install.steps]]
 kind = "link"
-src  = "/opt/wspr-recorder/venv/bin/wspr-recorder"
+src  = "/opt/git/sigmond/wspr-recorder/venv/bin/wspr-recorder"
 dst  = "/usr/local/bin/wspr-recorder"
 
 [[install.steps]]
 kind = "link"
-src  = "/opt/wspr-recorder/venv/bin/wspr-ctl"
+src  = "/opt/git/sigmond/wspr-recorder/venv/bin/wspr-ctl"
 dst  = "/usr/local/bin/wspr-ctl"
 
 [[install.steps]]
@@ -63,12 +63,12 @@ units = ["wspr-recorder@.service"]
 [[deps.pypi]]
 name    = "ka9q-python"
 version = "3.8.0"
-venv    = "/opt/wspr-recorder/venv"
+venv    = "/opt/git/sigmond/wspr-recorder/venv"
 
 [[deps.pypi]]
 name    = "numpy"
 version = "1.20.0"
-venv    = "/opt/wspr-recorder/venv"
+venv    = "/opt/git/sigmond/wspr-recorder/venv"
 
 [[deps.apt]]
 name = "wsjtx"

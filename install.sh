@@ -3,7 +3,7 @@
 # wspr-recorder installation/upgrade script
 #
 # Installs or upgrades wspr-recorder as a systemd service with:
-# - Virtual environment in /opt/wspr-recorder
+# - Virtual environment in /opt/git/sigmond/wspr-recorder
 # - Configuration in /etc/wspr-recorder
 # - Runtime files in /run/wspr-recorder (tmpfs)
 # - WAV output in /dev/shm/wspr-recorder (tmpfs)
@@ -20,7 +20,7 @@
 set -e
 
 # Configuration
-INSTALL_DIR="/opt/wspr-recorder"
+INSTALL_DIR="/opt/git/sigmond/wspr-recorder"
 CONFIG_DIR="/etc/wspr-recorder"
 RUN_DIR="/run/wspr-recorder"
 OUTPUT_DIR="/dev/shm/wspr-recorder"

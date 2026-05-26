@@ -25,7 +25,7 @@ EnvironmentFile=-/etc/wspr-recorder/env/%i.env
 # allocator-contention cost for this workload.
 Environment=MALLOC_ARENA_MAX=2
 
-WorkingDirectory=/opt/wspr-recorder
+WorkingDirectory=/opt/git/sigmond/wspr-recorder
 
 # /var/lib/wspr-recorder holds the persistent callsign-hash DB
 # (callhash/wspr-callhash.json).  StateDirectory= asks systemd to
@@ -47,7 +47,7 @@ ExecStartPre=+/usr/bin/chown -R wsprrec:wsprrec /var/log/wspr-recorder
 # legacy /etc/wspr-recorder/config.toml with a one-line deprecation
 # warning.  --config is intentionally omitted — passing it would force
 # the legacy path always (explicit_path wins in resolve_config_path).
-ExecStart=/opt/wspr-recorder/venv/bin/python3 -m wspr_recorder.cli daemon \
+ExecStart=/opt/git/sigmond/wspr-recorder/venv/bin/python3 -m wspr_recorder.cli daemon \
     --instance %i
 
 # Generous: connecting to radiod + provisioning ~17 WSPR band
