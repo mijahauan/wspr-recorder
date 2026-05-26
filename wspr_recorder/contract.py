@@ -68,9 +68,15 @@ def build_inventory(config: Config, config_path: Path) -> dict:
     for bc in config.bands:
         modes_union.update(bc.modes)
 
+    # RADIOD-IDENTIFICATION.md §3.2 — inventory radiod_id is the
+    # mDNS control/status multicast name (the only functional
+    # identifier).  Fall back to the local instance_id when no
+    # status_address is declared so legacy configs still produce
+    # parseable inventory.
+    inventory_radiod_id = config.radiod.status_address or instance_id
     instance = {
         "instance": instance_id,
-        "radiod_id": instance_id,
+        "radiod_id": inventory_radiod_id,
         "host": "localhost",
         "radiod_status_dns": config.radiod.status_address,
         "data_destination": None,
