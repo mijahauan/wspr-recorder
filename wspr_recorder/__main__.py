@@ -290,17 +290,23 @@ class WsprRecorder:
     def _resolve_decoder_binaries(self) -> tuple:
         """Locate (wsprd_path, wsprd_spread_path, jt9_path) for this host.
 
-        Mirrors the legacy wd-decode bash arch-switch: binaries live at
-        /opt/wsprdaemon-client/bin/decoders/{wsprd,jt9}-<arch>-vNN.
-        Falls back to PATH lookup if the decoder dir is absent (e.g.
-        test rigs, kiwi-only deployments).  The spreading variant
-        isn't shipped as a separate binary today; DecoderRunner
-        handles a missing spread path by silently no-op'ing the
-        second pass and using the standard pass alone.
+        Resolution order (most → least specific):
+          1. In-repo `bin/decoders/<binary>-<arch>-vNN` — the
+             precompiled binaries are committed alongside the recorder
+             source, so a `git pull` is the only thing needed to keep
+             decoder versions matched with recorder code.
+          2. Legacy `/opt/wsprdaemon-client/bin/decoders/...` — kept
+             for hosts that still install the wsprdaemon-client tree
+             separately.
+          3. PATH lookup (`wsprd`, `jt9`) — last resort for test rigs
+             and ad-hoc setups.
+
+        The spreading variant follows the same precedence; when no
+        spreading binary is found anywhere, the spread pass is
+        silently skipped by DecoderRunner.
         """
         import platform
         arch = platform.machine()
-        decoder_dir = Path("/opt/wsprdaemon-client/bin/decoders")
         wsprd_name = {
             "x86_64":  "wsprd-x86-v27",
             "aarch64": "wsprd-arm64-v27",
@@ -313,32 +319,39 @@ class WsprRecorder:
             "armv7l":  "jt9-arm32-v26",
             "armhf":   "jt9-arm32-v26",
         }.get(arch)
-        if wsprd_name and (decoder_dir / wsprd_name).exists():
-            wsprd_path = str(decoder_dir / wsprd_name)
-        else:
-            wsprd_path = "wsprd"   # last-resort PATH lookup
-        if jt9_name and (decoder_dir / jt9_name).exists():
-            jt9_path = str(decoder_dir / jt9_name)
-        else:
-            jt9_path = "jt9"
-        # Spreading-variant binary isn't shipped today.  Probe for it
-        # at the usual locations; if not present, return None so the
-        # DecoderRunner skips the second pass entirely (no per-cycle
-        # FileNotFoundError noise in the journal).  Auto-enables when
-        # someone drops a spreading binary into the decoder dir or
-        # onto PATH — no code change needed at that point.
-        wsprd_spread: Optional[str] = None
-        for candidate in (
-            decoder_dir / "wsprd.spreading",
-            decoder_dir / f"wsprd.spreading-{arch}",
-            decoder_dir / "wsprd-spread",
-        ):
-            if candidate.exists():
-                wsprd_spread = str(candidate)
-                break
-        if wsprd_spread is None:
+        # Note the inconsistent ARM64 naming in the committed
+        # binaries: `wsprd.spread.arm64-v27` uses dots instead of the
+        # dash-separator used by every other variant.  Carry that
+        # quirk here so we find the file as shipped.
+        spread_name = {
+            "x86_64":  "wsprd.spread-x86-v27",
+            "aarch64": "wsprd.spread.arm64-v27",
+            "armv7l":  "wsprd.spread-armhf-v26",
+            "armhf":   "wsprd.spread-armhf-v26",
+        }.get(arch)
+
+        repo_decoder_dir = (
+            Path(__file__).resolve().parent.parent / "bin" / "decoders"
+        )
+        legacy_decoder_dir = Path("/opt/wsprdaemon-client/bin/decoders")
+        search_dirs = (repo_decoder_dir, legacy_decoder_dir)
+
+        def _find(name: Optional[str], fallback: str) -> Optional[str]:
+            if name is None:
+                return None
+            for d in search_dirs:
+                cand = d / name
+                if cand.exists():
+                    return str(cand)
+            # PATH lookup keyed on the unversioned name — historically
+            # operators dropped `wsprd` / `jt9` into /usr/local/bin
+            # outside of the per-arch convention.
             import shutil
-            wsprd_spread = shutil.which("wsprd.spreading")
+            return shutil.which(fallback)
+
+        wsprd_path = _find(wsprd_name, "wsprd") or "wsprd"
+        jt9_path = _find(jt9_name, "jt9") or "jt9"
+        wsprd_spread = _find(spread_name, "wsprd.spreading")
         return wsprd_path, wsprd_spread, jt9_path
 
     def _resolve_decoder(
