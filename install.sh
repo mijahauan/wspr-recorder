@@ -221,7 +221,15 @@ install_config() {
     fi
     
     chown -R "$SERVICE_USER:$SERVICE_GROUP" "$CONFIG_DIR"
-    chmod 640 "$CONFIG_DIR/config.toml"
+    # 644 (not 640): the config has no secrets (station identity,
+    # frequency lists, mDNS addresses — all public) and sigmond's
+    # cross-user inventory query (build_system_view shells out to
+    # `wspr-recorder inventory --json` from the operator's user,
+    # not wsprrec) needs read access.  Other recorders
+    # (psk/hfdl/codar) ship their configs at 644 for the same
+    # reason.  Pre-fix 640 caused frequency_coverage to skip wspr
+    # silently when validate ran from any user other than wsprrec.
+    chmod 644 "$CONFIG_DIR/config.toml"
 }
 
 install_systemd() {
