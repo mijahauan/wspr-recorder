@@ -285,7 +285,72 @@ def _resolve_target(args) -> Path:
     return Path(getattr(args, "config", None) or DEFAULT_CONFIG_PATH)
 
 
+def _discover_radiods(timeout: float = 5.0) -> list[dict]:
+    """Return discovered radiods or [] on failure (avahi missing, etc.).
+
+    Lazy-imports ka9q.discovery so the configurator still works when
+    ka9q-python isn't installed yet.  Each entry is
+    {"name", "hostname", "address", "port"} — `hostname` is the mDNS
+    multicast control/status name (the canonical identifier per
+    RADIOD-IDENTIFICATION.md §2).
+    """
+    try:
+        from ka9q.discovery import discover_radiod_services
+        return discover_radiod_services(timeout=timeout) or []
+    except Exception:
+        return []
+
+
+def _pick_radiod_status_from_discovery(
+    discovered: list[dict], env_status: str, instance_hint: str,
+) -> str:
+    """Interactive discovery flow per RADIOD-IDENTIFICATION.md §4."""
+    if not discovered:
+        print("\033[33m⚠\033[0m  No radiod instances broadcasting on the "
+              "local network.")
+        _info("Install + start radiod before continuing:")
+        _info("  sudo smd install ka9q-radio")
+        _info("Continuing with manual entry — the daemon will refuse "
+              "to start if the multicast name is unreachable.")
+        default = env_status or (
+            f"{instance_hint}-status.local" if instance_hint else "")
+        return _prompt(
+            "Radiod status DNS (manual entry)", default, required=True)
+
+    if len(discovered) == 1:
+        only = discovered[0]
+        _info(f"One radiod discovered: {only['hostname']!r} "
+              f"(advertised: {only['name']!r})")
+        confirm = _prompt(
+            f"Use {only['hostname']!r}? [Y/n]", "Y").strip().lower()
+        if confirm in ("", "y", "yes"):
+            return only["hostname"]
+        return _prompt(
+            "Radiod status DNS (manual entry)",
+            env_status or only["hostname"], required=True)
+
+    _info("Multiple radiods discovered on the LAN:")
+    for i, svc in enumerate(discovered, 1):
+        _info(f"  [{i}] {svc['hostname']:<32} (advertised: {svc['name']!r})")
+    while True:
+        choice = _prompt(
+            f"Pick a radiod [1-{len(discovered)}]", "1").strip()
+        try:
+            idx = int(choice) - 1
+        except ValueError:
+            print("\033[33m⚠\033[0m  Enter a number from the menu.")
+            continue
+        if 0 <= idx < len(discovered):
+            return discovered[idx]["hostname"]
+        print(f"\033[33m⚠\033[0m  Out of range; pick 1-{len(discovered)}.")
+
+
 def _collect_init_values(args) -> dict:
+    """Build the substitution dict for init.
+
+    Env vars are defaults; ka9q-python discovery is consulted in
+    interactive mode (RADIOD-IDENTIFICATION.md §4).
+    """
     status = os.environ.get("SIGMOND_RADIOD_STATUS", "")
     instance = os.environ.get("SIGMOND_INSTANCE", "")
     call = os.environ.get("STATION_CALL", "")
@@ -300,20 +365,27 @@ def _collect_init_values(args) -> dict:
                 + " ".join(bits))
 
     if getattr(args, "non_interactive", False):
+        # Env wins; else single-radiod auto-pick; else placeholder.
+        if status:
+            radiod_status = status
+        else:
+            discovered = _discover_radiods()
+            if len(discovered) == 1:
+                radiod_status = discovered[0]["hostname"]
+            else:
+                radiod_status = (
+                    f"{instance}-status.local"
+                    if instance else "rx888-status.local"
+                )
         return {
-            "radiod_status": status or (
-                f"{instance}-status.local" if instance else "rx888-status.local"
-            ),
+            "radiod_status": radiod_status,
             "station_note": note,
         }
 
-    default_status = status or (
-        f"{instance}-status.local" if instance else ""
-    )
-    radiod_status = _prompt(
-        "Radiod status address (mDNS, e.g. bee1-status.local)",
-        default_status, required=True,
-    )
+    # Interactive discovery-driven selection.
+    discovered = _discover_radiods()
+    radiod_status = _pick_radiod_status_from_discovery(
+        discovered, status, instance)
     return {
         "radiod_status": radiod_status,
         "station_note":  note,
