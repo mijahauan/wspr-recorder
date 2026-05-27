@@ -89,3 +89,9 @@ verb         = "wspr"
 description  = "WSPRnet upload events (per-batch start/done)"
 verbose      = true
 per_instance = true
+
+[client_features.verifier]
+verb         = "wspr"
+description  = "WSPRnet upload audit (lost / in-flight / delivered / cadence)"
+kind         = "spot_queue"
+per_instance = true
