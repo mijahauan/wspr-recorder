@@ -1,7 +1,7 @@
 [package]
 name             = "wspr-recorder"
 version          = "0.1.0"
-contract_version = "0.7"
+contract_version = "0.8"
 license          = "MIT"
 
 # Configuration interview (CONTRACT-v0.5 §14).  Sigmond invokes
