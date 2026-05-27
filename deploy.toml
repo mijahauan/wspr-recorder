@@ -78,3 +78,14 @@ note = "provides jt9 for FST4W decoding"
 name = "whiptail"
 optional = true
 note = "drives scripts/config-wizard.sh; configurator falls back to stdin prompts if absent"
+
+# ---------------------------------------------------------------------------
+# Sigmond UI hooks (drop-in registration for `smd watch` + TUI Activity).
+# Consumed by lib/sigmond/client_features.py.
+# ---------------------------------------------------------------------------
+
+[client_features.watch]
+verb         = "wspr"
+description  = "WSPRnet upload events (per-batch start/done)"
+verbose      = true
+per_instance = true
