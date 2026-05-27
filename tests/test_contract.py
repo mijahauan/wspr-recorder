@@ -73,7 +73,7 @@ class InventoryV04Tests(unittest.TestCase):
         self.assertEqual(self.data["client"], "wspr-recorder")
 
     def test_contract_version(self):
-        self.assertEqual(self.data["contract_version"], "0.7")
+        self.assertEqual(self.data["contract_version"], "0.8")
 
     def test_timing_authority_applied_explicit_null(self):
         """CONTRACT v0.7 §3/§18 — runtime-state field for the §18
