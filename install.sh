@@ -112,6 +112,21 @@ create_user() {
     if getent group audio &>/dev/null; then
         usermod -a -G audio "$SERVICE_USER" 2>/dev/null || true
     fi
+
+    # Add user to sigmond supplementary group so the recorder can write to
+    # /var/lib/hs-uploader/watermarks.db and /var/lib/sigmond/sink.db.
+    # sigmond's own install.sh creates the group; on hosts where sigmond
+    # isn't installed yet, hs-uploader's installer creates it.  If neither
+    # has run, skip silently — the membership will get picked up the next
+    # time install.sh runs.
+    if getent group sigmond &>/dev/null; then
+        if ! id -nG "$SERVICE_USER" 2>/dev/null | tr ' ' '\n' | grep -qx sigmond; then
+            usermod -a -G sigmond "$SERVICE_USER"
+            info "Added $SERVICE_USER to sigmond group"
+        fi
+    else
+        info "sigmond group not present yet — re-run after sigmond install"
+    fi
 }
 
 check_pattern_a() {
