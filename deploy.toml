@@ -95,3 +95,9 @@ verb         = "wspr"
 description  = "WSPRnet upload audit (lost / in-flight / delivered / cadence)"
 kind         = "spot_queue"
 per_instance = true
+
+[client_features.receiver_channels]
+description  = "WSPR/FST4W sub-band channels"
+per_instance = true
+parser_file  = "wspr_recorder/sigmond_tui.py"
+parser_attr  = "parse_receiver_channels"
