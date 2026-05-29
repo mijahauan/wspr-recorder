@@ -205,6 +205,10 @@ frequency = "28124600"     # 10m
 modes = ["W2"]
 
 [[band]]
+frequency = "40680000"     # 8m (40.680 MHz — recent WSPR experimental allocation)
+modes = ["W2"]
+
+[[band]]
 frequency = "50293000"     # 6m
 modes = ["W2"]
 
