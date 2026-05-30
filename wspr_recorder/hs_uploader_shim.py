@@ -104,9 +104,17 @@ class WsprUploaderHs:
         version: str = "4.0",
         sink_db: Optional[Path] = None,
         instance_name: str = "",
+        merge_reporters: Optional[set] = None,
+        merge_backstop_sec: float = 90.0,
     ) -> None:
         self._call = call
         self._grid = grid
+        # Event-driven cross-RX merge gate.  When non-empty, both upload
+        # pipelines hold a WSPR cycle until every listed reporter's
+        # per-cycle wspr.noise completion rows are present (or the cycle
+        # is past the backstop).  Empty → single-receiver behaviour.
+        self._merge_reporters = set(merge_reporters or ())
+        self._merge_backstop_sec = float(merge_backstop_sec)
         self._wsprdaemon_dir = Path(wsprdaemon_dir) if wsprdaemon_dir else None
         self._wsprnet_dir = Path(wsprnet_dir) if wsprnet_dir else None
         self._sftp_servers = list(sftp_servers)
@@ -182,6 +190,17 @@ class WsprUploaderHs:
             s.strip() for s in servers_raw.split(",") if s.strip()
         ]
         sink_db = e.get("SIGMOND_SQLITE_PATH") or None
+        # WD_MERGE_REPORTERS: comma-separated rx_call list (e.g.
+        # "AC0G/B4,AC0G/B5,AC0G/B6") enabling event-driven cross-RX
+        # completion gating.  Unset → single-receiver mode (no gate).
+        from hs_uploader.sources.wspr_completion import parse_expected_reporters
+        merge_reporters = parse_expected_reporters(e.get("WD_MERGE_REPORTERS"))
+        try:
+            merge_backstop = float(
+                (e.get("WD_MERGE_BACKSTOP_SEC") or "90").strip() or "90"
+            )
+        except ValueError:
+            merge_backstop = 90.0
         return cls(
             call=call, grid=grid,
             wsprdaemon_dir=wsprdaemon_dir,
@@ -192,6 +211,8 @@ class WsprUploaderHs:
             version=e.get("WD_VERSION") or "4.0",
             sink_db=sink_db,
             instance_name=e.get("WD_INSTANCE") or "",
+            merge_reporters=merge_reporters,
+            merge_backstop_sec=merge_backstop,
         )
 
     def start(self) -> None:
@@ -639,7 +660,11 @@ class WsprUploaderHs:
         from hs_uploader import Pipeline, RetryPolicy
         from hs_uploader.transports.wsprdaemon import WsprdaemonTarSftp
 
-        source = WsprCycleSource(db_path=self._sink_db)
+        source = WsprCycleSource(
+            db_path=self._sink_db,
+            expected_reporters=self._merge_reporters,
+            backstop_sec=self._merge_backstop_sec,
+        )
         receiver = os.environ.get("WD_RECEIVER_NAME", "") or self._instance_name
         fallback_ftp = self._build_wsprdaemon_ftp_fallback(
             spool_root=None, receiver=receiver,
@@ -902,6 +927,27 @@ class WsprUploaderHs:
         )
         return (pipeline, transport)
 
+    def _wsprnet_ship_ceiling(self, conn):
+        """Ceiling provider for the wsprnet SqliteSource: newest WSPR
+        cycle complete across all expected receivers (or past backstop).
+
+        Bounds the completion walk to the last 10 min of cycles — older
+        cycles are always past the ~3.5 min backstop, so the blocking
+        (incomplete) cycle, if any, is always recent.  Returns an ISO
+        cycle string or None when nothing is shippable yet.
+        """
+        from hs_uploader.sources.wspr_completion import shippable_ceiling
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        now = _dt.now(_tz.utc)
+        lower = (now - _td(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return shippable_ceiling(
+            conn,
+            cursor_iso=lower,
+            expected=self._merge_reporters,
+            backstop_sec=self._merge_backstop_sec,
+            now=now,
+        )
+
     def _build_wsprnet_source(self):
         """Pick SqliteSource when sigmond's sink is available; else
         fall back to FileTreeSource over the legacy ``_spots.txt``
@@ -957,6 +1003,15 @@ class WsprUploaderHs:
                 # (e.g. NI5F on 40m + 15m in the same cycle).
                 dedup_partition_by=('time', 'callsign', 'band'),
                 dedup_order_by_desc='snr_db',
+                # Event-driven cross-RX gate: hold back rows from WSPR
+                # cycles that aren't yet complete across all expected
+                # receivers (or past the backstop).  Keeping incomplete
+                # cycles OUT of the dedup CTE is what makes the cross-RX
+                # best-SNR pick correct — see wspr_completion.py.  No-op
+                # (None provider) for single-receiver deployments.
+                ceiling_column='time' if self._merge_reporters else None,
+                ceiling_provider=self._wsprnet_ship_ceiling
+                    if self._merge_reporters else None,
             )
             if sqlite_source.health() != HEALTH_NOOP:
                 logger.info(
