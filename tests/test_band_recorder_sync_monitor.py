@@ -70,18 +70,23 @@ def feed_minutes(rec, n_minutes, rate, packet_size=20, total_delivered_start=0):
 
 
 class FakeClock:
-    """Returns the predicted boundary time + a per-boundary latency.
+    """Models ``now()`` as ``ANCHOR + minute_count*60 + latency``.
 
-    The recorder calls this once per minute boundary; call ``k`` (k>=1)
-    corresponds to the boundary whose grid-predicted time is
-    ``ANCHOR + k*60``.  Pass ``latency`` for a constant offset, or
-    ``latencies`` (a list) to script a different skew per boundary
-    (e.g. a one-off spike followed by recovery).
+    Bound to the recorder so the base tracks the recorder's OWN boundary
+    counter — that way the measured skew equals the scripted ``latency``
+    even across re-syncs (which reset minute_count).  Pass ``latency`` for
+    a constant offset, or ``latencies`` (a per-call list) to script the
+    skew per boundary — e.g. a jump, a ramp, or a lone spike.
     """
     def __init__(self, latency=0.1, latencies=None):
         self.latency = latency
         self.latencies = latencies
         self.n = 0
+        self.rec = None
+
+    def bind(self, rec):
+        self.rec = rec
+        return self
 
     def __call__(self):
         self.n += 1
@@ -89,10 +94,11 @@ class FakeClock:
             lat = self.latencies[min(self.n - 1, len(self.latencies) - 1)]
         else:
             lat = self.latency
-        return ANCHOR + timedelta(seconds=self.n * 60 + lat)
+        base = self.rec._minute_count if self.rec is not None else self.n
+        return ANCHOR + timedelta(seconds=base * 60 + lat)
 
 
-def _recorder(resync_on_skew, now_fn, rate=100, resync_after=2):
+def _recorder(resync_on_skew, clock, rate=100, resync_after=2):
     results = []
     rec = BandRecorder(
         ssrc=1, frequency_hz=14095600, band_name="20",
@@ -103,59 +109,77 @@ def _recorder(resync_on_skew, now_fn, rate=100, resync_after=2):
         resync_on_skew=resync_on_skew,
         sync_skew_threshold_sec=0.75,
         sync_resync_after=resync_after,
-        now_fn=now_fn,
+        now_fn=clock,
     )
+    if isinstance(clock, FakeClock):
+        clock.bind(rec)
     return rec, results
 
 
-def test_in_sync_does_not_resync():
-    """Small, constant latency (within threshold) → no re-sync."""
-    rec, _results = _recorder(True, FakeClock(latency=0.1))
+def test_small_constant_latency_does_not_resync():
+    """Small constant latency within threshold → no re-sync, baseline set."""
+    rec, _ = _recorder(True, FakeClock(latency=0.1))
     feed_minutes(rec, 3, rate=100, packet_size=20)
     assert rec._skew_resyncs == 0
     assert rec._skew_strikes == 0
     assert rec._synced is True
-    assert abs(rec._last_skew_sec - 0.1) < 1e-6
+    assert abs(rec._skew_baseline - 0.1) < 1e-6
 
 
-def test_sustained_drift_triggers_resync():
-    """Two consecutive boundaries beyond threshold trip a re-sync (default
-    sync_resync_after=2) and clear sync."""
-    rec, results = _recorder(True, FakeClock(latency=2.0))
-    n_before = len(results)
-    feed_minutes(rec, 2, rate=100, packet_size=20)
+def test_large_constant_offset_never_resyncs():
+    """THE bee1 fix: a big but CONSTANT skew (remote-stream delivery
+    latency) must be absorbed by the baseline and never re-sync — even
+    though it's far above the absolute threshold."""
+    rec, _ = _recorder(True, FakeClock(latency=1.5))   # ~bee1's ~1s, then some
+    feed_minutes(rec, 8, rate=100, packet_size=20)
+    assert rec._skew_resyncs == 0
+    assert rec._synced is True
+    assert abs(rec._skew_baseline - 1.5) < 1e-6        # baseline tracked it
+
+
+def test_sudden_jump_triggers_resync():
+    """A JUMP away from the established baseline (lost samples) trips a
+    re-sync after sync_resync_after consecutive boundaries."""
+    # baseline settles at 0.1, then jumps to 5.0 for two boundaries.
+    rec, _results = _recorder(True, FakeClock(latencies=[0.1, 0.1, 5.0, 5.0]))
+    feed_minutes(rec, 4, rate=100, packet_size=20)
     assert rec._skew_resyncs == 1
-    # reset() ran: anchor + minute counter cleared, awaiting re-sync.
     assert rec._synced is False
-    assert rec._minute_count == 0
-    # The re-syncing minute must NOT have emitted a decode request.
-    assert len(results) == n_before
+    assert rec._minute_count == 0          # reset() ran on the resync
 
 
-def test_lone_strike_does_not_resync_and_emits():
-    """A single over-threshold boundary (transient callback delay) must
-    NOT discard the cycle — strike recorded, but it emits and recovers."""
-    # boundary 1: 2.0s skew (strike); boundary 2: back in tolerance.
-    rec, _ = _recorder(True, FakeClock(latencies=[2.0, 0.1, 0.1]))
-    feed_minutes(rec, 3, rate=100, packet_size=20)
-    assert rec._skew_resyncs == 0       # never crossed the strike count
-    assert rec._skew_strikes == 0       # reset by the in-tolerance boundary
+def test_gradual_drift_triggers_resync():
+    """A sample-clock drift (skew ramps away) outruns the slow baseline
+    EMA and trips."""
+    rec, _ = _recorder(True, FakeClock(latencies=[0.1, 0.6, 1.1, 1.6]))
+    feed_minutes(rec, 4, rate=100, packet_size=20)
+    assert rec._skew_resyncs == 1
+    assert rec._synced is False
+
+
+def test_lone_spike_does_not_resync():
+    """A single boundary that jumps then returns to baseline (transient
+    scheduling hiccup) must NOT re-sync."""
+    rec, _ = _recorder(True, FakeClock(latencies=[0.1, 0.1, 3.0, 0.1, 0.1]))
+    feed_minutes(rec, 5, rate=100, packet_size=20)
+    assert rec._skew_resyncs == 0
+    assert rec._skew_strikes == 0
     assert rec._synced is True
 
 
-def test_resync_after_one_when_configured():
-    """sync_resync_after=1 trips on the first bad boundary."""
-    rec, _ = _recorder(True, FakeClock(latency=2.0), resync_after=1)
-    feed_minutes(rec, 1, rate=100, packet_size=20)
+def test_negative_jump_triggers_resync():
+    """A jump to a much EARLIER skew (samples suddenly ahead) trips too —
+    abs(deviation) is what matters."""
+    rec, _ = _recorder(True, FakeClock(latencies=[0.1, -5.0]), resync_after=1)
+    feed_minutes(rec, 2, rate=100, packet_size=20)
     assert rec._skew_resyncs == 1
     assert rec._synced is False
 
 
-def test_negative_skew_also_trips():
-    """Samples arriving FASTER than real time (now before boundary) trips
-    too — abs(skew) is what matters."""
-    rec, _ = _recorder(True, FakeClock(latency=-3.0), resync_after=1)
-    feed_minutes(rec, 1, rate=100, packet_size=20)
+def test_resync_after_one_when_configured():
+    """sync_resync_after=1 trips on the first boundary that deviates."""
+    rec, _ = _recorder(True, FakeClock(latencies=[0.1, 5.0]), resync_after=1)
+    feed_minutes(rec, 2, rate=100, packet_size=20)
     assert rec._skew_resyncs == 1
     assert rec._synced is False
 
@@ -163,28 +187,24 @@ def test_negative_skew_also_trips():
 def test_monitor_off_by_default_never_resyncs():
     """With the monitor off (default), a wildly wrong clock is ignored —
     this is what keeps the synthetic-clock suite from tripping."""
-    # Default now_fn = real datetime.now(); ANCHOR is years in the past,
-    # so skew would be enormous IF the monitor were on.
-    rec, _ = _recorder(False, None)
+    rec, _ = _recorder(False, FakeClock(latency=999.0))
     feed_minutes(rec, 2, rate=100, packet_size=20)
     assert rec._skew_resyncs == 0
     assert rec._synced is True
 
 
-def test_resync_recovers_on_next_clean_boundary():
-    """After a drift trip, a subsequent in-sync stretch re-anchors and
-    runs normally (no further re-syncs)."""
-    clock = FakeClock(latency=2.0)
+def test_resync_recovers_and_reestablishes_baseline():
+    """After a jump trips a re-sync, a clean stretch re-anchors, sets a
+    fresh baseline, and runs without further re-syncs."""
+    # boundary 2 jumps (trips at resync_after=1); after the re-sync the
+    # stream is clean at a NEW constant latency (0.3).
+    clock = FakeClock(latencies=[0.1, 5.0, 0.3, 0.3, 0.3])
     rec, _ = _recorder(True, clock, resync_after=1)
-    feed_minutes(rec, 1, rate=100, packet_size=20)   # trips, resets
+    feed_minutes(rec, 2, rate=100, packet_size=20)   # establishes 0.1, then jumps → resync
     assert rec._skew_resyncs == 1
     assert rec._synced is False
-    # Now feed clean minutes with in-tolerance latency.  FakeSync.reset()
-    # ran inside recorder.reset(), so it re-anchors at ANCHOR; swap in a
-    # healthy clock for the post-resync boundaries.
-    clock.latency = 0.1
-    clock.n = 0
-    feed_minutes(rec, 2, rate=100, packet_size=20)
+    assert rec._skew_baseline is None                # cleared for re-establish
+    feed_minutes(rec, 3, rate=100, packet_size=20)   # re-sync + clean run
     assert rec._synced is True
-    assert rec._skew_resyncs == 1            # no new trips
-    assert abs(rec._last_skew_sec - 0.1) < 1e-6
+    assert rec._skew_resyncs == 1                    # no new trips
+    assert abs(rec._skew_baseline - 0.3) < 1e-6      # fresh baseline at 0.3

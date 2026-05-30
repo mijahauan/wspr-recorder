@@ -47,6 +47,14 @@ class GapEvent:
 RING_HEADROOM_SECONDS = 600
 
 
+# EMA weight for tracking a band's steady-state boundary skew (its
+# "baseline" — dominated by delivery latency, which for a remote receiver
+# is a constant ~1 s, not a fault).  Small so a genuine sample-clock drift
+# still pulls away from the baseline faster than the baseline can follow
+# it, while a constant offset is absorbed within a couple of boundaries.
+_SKEW_BASELINE_ALPHA = 0.1
+
+
 @dataclass
 class DecodeRequest:
     """A request to write a WAV file and decode for a completed period.
@@ -171,16 +179,18 @@ class BandRecorder:
         # threaded through.
         rx_source: str = "",
         # Wall-clock WAV-boundary skew monitor (wsprdaemon-v3 loss-of-sync
-        # detector).  When True, each minute boundary checks that we
-        # reached ``_samples_per_minute`` samples within
-        # ``sync_skew_threshold_sec`` of the grid-predicted UTC minute
-        # boundary; a larger skew means samples were lost or the sample
-        # clock drifted, so the band has fallen out of phase with the
-        # WSPR cycle (strong signal, but un-decodable) and we re-sync.
-        # OFF by default so the synthetic-clock unit tests (which feed
-        # grid timestamps far from real ``now()``) don't trip; the
-        # production recorder turns it on.  ``now_fn`` is injectable so
-        # tests can drive the monitor with a controlled clock.
+        # detector).  When True, each minute boundary measures the skew
+        # between ``now()`` and the grid-predicted UTC minute, and trips
+        # when that skew DEVIATES from the band's steady-state baseline by
+        # more than ``sync_skew_threshold_sec``.  Using the deviation (not
+        # the absolute skew) is essential: a remote receiver's RTP arrives
+        # with a constant delivery latency (~1 s) that is NOT a fault, so
+        # the baseline absorbs it; only a sample-clock drift or a lost-
+        # sample jump departs from the baseline and re-syncs.  OFF by
+        # default so the synthetic-clock unit tests (which feed grid
+        # timestamps far from real ``now()``) don't trip; the production
+        # recorder turns it on.  ``now_fn`` is injectable so tests can
+        # drive the monitor with a controlled clock.
         resync_on_skew: bool = False,
         sync_skew_threshold_sec: float = 0.75,
         # Re-sync only after this many CONSECUTIVE boundaries exceed the
@@ -216,10 +226,19 @@ class BandRecorder:
         # Consecutive over-threshold boundaries; reset to 0 by any
         # in-tolerance boundary.  A re-sync fires at _sync_resync_after.
         self._skew_strikes = 0
+        # Per-band steady-state boundary skew (EMA), established at the
+        # first boundary after each (re)sync.  The monitor trips on the
+        # DEVIATION of the current skew from this baseline, not on the
+        # absolute skew — so a remote receiver's constant delivery latency
+        # (a stable ~1 s offset) is absorbed and never resyncs, while a
+        # sample-clock drift or lost-sample jump departs from it and does.
+        self._skew_baseline: Optional[float] = None
         # Observability: cumulative skew-triggered re-syncs (survives
-        # reset()) and the most recent boundary skew in seconds.
+        # reset()), the most recent raw boundary skew, and its deviation
+        # from the baseline (both seconds).
         self._skew_resyncs = 0
         self._last_skew_sec = 0.0
+        self._last_skew_deviation_sec = 0.0
 
         self._decode_modes = decode_modes or [DecodeMode.W2]
         self.stats = BandRecorderStats()
@@ -396,34 +415,48 @@ class BandRecorder:
         if self._resync_on_skew and self._synced:
             skew = (self._now_fn() - minute_wallclock).total_seconds()
             self._last_skew_sec = skew
-            if abs(skew) > self._sync_skew_threshold:
+            if self._skew_baseline is None:
+                # First boundary after (re)sync: adopt the current skew as
+                # the band's steady-state baseline (delivery latency). No
+                # deviation yet, so never trips here.
+                self._skew_baseline = skew
+                deviation = 0.0
+            else:
+                deviation = skew - self._skew_baseline
+            self._last_skew_deviation_sec = deviation
+            if abs(deviation) > self._sync_skew_threshold:
                 self._skew_strikes += 1
                 logger.warning(
-                    "%s: WAV boundary skew %.3fs exceeds %.3fs threshold "
-                    "(reached %d samples %s the predicted UTC minute) "
-                    "[strike %d/%d]",
-                    self.band_name, skew, self._sync_skew_threshold,
-                    self._samples_per_minute,
-                    "after" if skew >= 0 else "before",
+                    "%s: WAV boundary skew %.3fs deviates %+.3fs from "
+                    "baseline %.3fs (> %.3fs) [strike %d/%d]",
+                    self.band_name, skew, deviation, self._skew_baseline,
+                    self._sync_skew_threshold,
                     self._skew_strikes, self._sync_resync_after,
                 )
                 if self._skew_strikes >= self._sync_resync_after:
-                    # Sustained skew — sample loss / sample-clock drift has
-                    # desynced this band from the WSPR cycle.  Discard and
-                    # re-sync on the next clean :59→:00 boundary.
+                    # Sustained DEPARTURE from the steady-state skew —
+                    # sample loss / sample-clock drift has desynced this
+                    # band from the WSPR cycle (a constant offset would not
+                    # deviate).  Discard and re-sync on the next clean
+                    # :59→:00 boundary; the baseline re-establishes there.
                     self._skew_resyncs += 1
                     self._skew_strikes = 0
                     logger.warning(
-                        "%s: sustained boundary skew — re-syncing this "
+                        "%s: sustained skew deviation — re-syncing this "
                         "band from the next minute boundary [resync #%d]",
                         self.band_name, self._skew_resyncs,
                     )
                     self._resync_requested = True
                     return
                 # Lone strike: could be a transient callback delay, and
-                # the audio may be fine — emit this minute normally.
+                # the audio may be fine — emit this minute normally, and
+                # do NOT move the baseline toward this outlier.
             else:
                 self._skew_strikes = 0
+                # In tolerance: slowly track legitimate drift in the
+                # steady-state latency so it doesn't accumulate into a
+                # false trip, using a small EMA weight.
+                self._skew_baseline += _SKEW_BASELINE_ALPHA * deviation
 
         # Close the minute in the ring buffer
         self._ring.close_minute(minute_wallclock, minute_rtp)
@@ -527,6 +560,10 @@ class BandRecorder:
         # Loss-of-sync monitor observability.
         stats["skew_resyncs"] = self._skew_resyncs
         stats["last_skew_sec"] = round(self._last_skew_sec, 3)
+        stats["last_skew_deviation_sec"] = round(self._last_skew_deviation_sec, 3)
+        stats["skew_baseline_sec"] = (
+            round(self._skew_baseline, 3) if self._skew_baseline is not None else None
+        )
         return stats
 
     def reset(self) -> None:
@@ -554,6 +591,9 @@ class BandRecorder:
         self._synced = False
         self._resync_requested = False
         self._skew_strikes = 0
+        # Re-establish the steady-state skew baseline at the first boundary
+        # after the upcoming re-sync (latency may have shifted).
+        self._skew_baseline = None
         self._minute_count = 0
         self._first_wallclock = None
         self._first_rtp_timestamp = None
