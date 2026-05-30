@@ -195,11 +195,23 @@ class WsprUploaderHs:
         )
 
     def start(self) -> None:
-        if not os.environ.get("WSPR_USE_HS_UPLOADER", "").strip():
+        # Proper boolean parse — matches spot_sink.py and the rest of the
+        # codebase.  The previous `if not env.strip()` only disabled on
+        # empty/unset, so WSPR_USE_HS_UPLOADER=0 (the obvious way to turn
+        # the uploader OFF) was read as a non-empty string → ENABLED.
+        # That made decode-only instances in a multi-RX merge fleet each
+        # run their own uploader, posting un-merged spots to wsprnet
+        # under their per-receiver call — defeating the single-merge-
+        # uploader design.  Observed on B4-100 2026-05-30: bee1/bee2
+        # (set =0) were posting as AC0G/B5 and AC0G/B6 alongside B4's
+        # bare-AC0G merge, three POSTs per cycle.
+        if os.environ.get(
+            "WSPR_USE_HS_UPLOADER", ""
+        ).strip().lower() not in ("1", "true", "yes", "on"):
             logger.info(
-                "wspr-uploader-hs: WSPR_USE_HS_UPLOADER unset — "
-                "shim is disabled; legacy wd-upload-* path is "
-                "expected to handle uploads"
+                "wspr-uploader-hs: WSPR_USE_HS_UPLOADER not enabled "
+                "(unset / 0 / false) — shim is disabled; this instance "
+                "decodes into the shared sink but does not upload"
             )
             return
 
