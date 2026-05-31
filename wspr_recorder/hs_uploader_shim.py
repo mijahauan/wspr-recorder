@@ -925,6 +925,10 @@ class WsprUploaderHs:
         transport = WsprNet(
             max_spots_per_upload=batch_size,
             api_base_url=wsprnet_api_base,
+            # Carry the configured WD version (default "4.0") so wsprnet's
+            # `version` field reads "WD_4.0" instead of the transport's
+            # default "WD_hs-uploader/0.1" (shown truncated as WD_hs-uplo).
+            version=self._version,
         )
         if wsprnet_api_base:
             logger.info(
