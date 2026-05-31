@@ -917,7 +917,20 @@ class WsprUploaderHs:
             batch_size = 1
         if batch_size > 999:
             batch_size = 999
-        transport = WsprNet(max_spots_per_upload=batch_size)
+        # Optional async upload API (W1GJM).  WSPRNET_API_BASE, e.g.
+        # https://wsprnet.org/api/upload/v1 — when set, the transport
+        # submits to <base>/upload (immediate nonce) and polls
+        # <base>/status/<nonce>.  Unset → legacy meptspots.php POST.
+        wsprnet_api_base = (os.environ.get("WSPRNET_API_BASE") or "").strip() or None
+        transport = WsprNet(
+            max_spots_per_upload=batch_size,
+            api_base_url=wsprnet_api_base,
+        )
+        if wsprnet_api_base:
+            logger.info(
+                "wspr-uploader-hs: wsprnet async upload API enabled (%s)",
+                wsprnet_api_base,
+            )
         if batch_size != 999:
             logger.info(
                 "wspr-uploader-hs: wsprnet batch size capped at %d "
