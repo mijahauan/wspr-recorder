@@ -1264,9 +1264,17 @@ class CycleBatcher:
         sink_flush = getattr(self._sink, "flush", None)
         if sink_flush is not None:
             sink_flush()
-        if n == 0 and n_noise == 0 and not self._sink.enabled:
-            # Disabled sink — silent.  Avoids a log line per cycle
-            # on hosts that don't have the env flag set.
+        if n == 0 and n_noise == 0:
+            # Nothing decoded AND no noise rows — stay silent.  A W2
+            # cycle always carries its per-band noise (n_noise=17), so
+            # this only fires for the late FST4W periods (F5/F15/F30)
+            # that found no spots: their cycle_key's noise was already
+            # written by the earlier W2 flush, so they arrive with 0
+            # spots and 0 noise.  Those bands are rarely transmitted, so
+            # the "0 spots" line is pure "no signal this period" noise in
+            # `smd watch wspr` — suppress it (a disabled sink is silent
+            # for the same reason).  Periods that DO decode (n>0) still
+            # log.
             return
         elapsed_ms = int((time.monotonic() - wall_start) * 1000)
         # Include rx_source so smd watch wspr can disambiguate which
@@ -1324,6 +1332,20 @@ class CycleBatcher:
         from ``_run``).  Late arrivals after the wake has already
         fired are no-ops.
         """
+        # Cross-PROCESS wake: in a multi-receiver fleet the uploader runs
+        # in a different process than this one, so the in-process
+        # _wake_callback below can't reach it.  Send a best-effort wake
+        # datagram on every commit so the uploader (wherever it runs)
+        # pumps now instead of waiting out its polling backstop.  Fires
+        # for peer processes (bee1/bee2) that have no local uploader and
+        # therefore no _wake_callback.  See upload_wake.py.
+        try:
+            from . import upload_wake
+            upload_wake.notify()
+        except Exception:
+            logger.debug("cycle-batcher: upload_wake.notify failed",
+                         exc_info=True)
+
         if self._wake_callback is None:
             return
         should_fire = False

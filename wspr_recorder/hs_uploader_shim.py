@@ -128,6 +128,7 @@ class WsprUploaderHs:
         self._uploader = None
         self._verifier = None       # set in start() if WD_VERIFY_FLUSH=1
         self._wd_verifier = None    # set in start() if WSPRDAEMON_VERIFY=1
+        self._wake_listener = None  # cross-process wake datagram listener
         # Per-spot wsprnet upload audit: feeds the `smd verifier
         # report` command's "uploaded but never appeared in wspr.rx"
         # cohort.  Default off; opt in with WSPRNET_AUDIT=1.
@@ -387,6 +388,24 @@ class WsprUploaderHs:
             target=self._run, daemon=True, name="wspr-uploader-hs",
         )
         self._thread.start()
+
+        # Cross-process wake: peer recorder processes (other receivers in
+        # the fleet) send a datagram when they commit a cycle, so our pump
+        # fires the instant the LAST receiver finishes — not on the next
+        # polling tick.  Best-effort; a bind failure just leaves us on the
+        # polling backstop.  See upload_wake.py.
+        try:
+            from .upload_wake import WakeListener
+            self._wake_listener = WakeListener(on_wake=self.wake)
+            if not self._wake_listener.start():
+                self._wake_listener = None
+        except Exception:
+            logger.exception(
+                "wspr-uploader-hs: failed to start cross-process wake "
+                "listener; continuing on the polling backstop"
+            )
+            self._wake_listener = None
+
         logger.info(
             "wspr-uploader-hs started: %s/%s (%d pipeline(s), pump=%ds)",
             self._call, self._grid, len(pipelines), int(PUMP_INTERVAL_SEC),
@@ -425,6 +444,11 @@ class WsprUploaderHs:
                 self._wd_verifier.stop(timeout=timeout)
             except Exception:
                 logger.exception("wspr-uploader-hs: wd_verifier.stop failed")
+        if self._wake_listener is not None:
+            try:
+                self._wake_listener.stop(timeout=timeout)
+            except Exception:
+                logger.exception("wspr-uploader-hs: wake_listener.stop failed")
         for t in self._transports:
             close = getattr(t, "close", None)
             if callable(close):

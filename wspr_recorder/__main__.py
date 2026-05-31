@@ -40,6 +40,31 @@ from .hs_uploader_shim import WsprUploaderHs
 logger = logging.getLogger(__name__)
 
 
+def _radiod_is_local(status_address: str, conf_dir: str = "/etc/radio") -> bool:
+    """True when this recorder's radiod runs on THIS host.
+
+    A local radiod instance is configured via
+    ``<conf_dir>/radiod@<instance>.conf`` (and appears as a local
+    ``radiod@<instance>.service``); a remote receiver (bee1 etc.) has
+    neither here.  The instance is the status address with its
+    ``-status.local`` suffix stripped — e.g. ``B4-100-rx888mk2-status.local``
+    → ``radiod@B4-100-rx888mk2.conf``.  Used to default the wall-clock
+    skew monitor: ON for local (direct RX888 clock-wedge), OFF for remote
+    (benign network jitter would false-trip it).
+    """
+    addr = (status_address or "").strip()
+    if not addr:
+        return False
+    inst = addr
+    for suffix in ("-status.local", ".local"):
+        if inst.endswith(suffix):
+            inst = inst[: -len(suffix)]
+            break
+    if not inst:
+        return False
+    return Path(conf_dir, f"radiod@{inst}.conf").exists()
+
+
 class WsprRecorder:
     """
     Main WSPR recorder application.
@@ -144,17 +169,32 @@ class WsprRecorder:
 
         # Wall-clock WAV-boundary skew monitor (wsprdaemon-v3 loss-of-sync
         # detector).  Each band checks at every minute boundary that it
-        # reached 720k samples within WSPR_SYNC_SKEW_SEC of the predicted
-        # UTC minute; a larger skew means lost samples / sample-clock
-        # drift desynced it from the WSPR cycle (strong signal, zero
-        # decodes — the failure that silenced B4-100 for ~3 h on
-        # 2026-05-30), so the band discards and re-syncs on the next
-        # boundary instead of emitting mis-aligned WAVs forever.  On by
-        # default; set WSPR_SYNC_MONITOR=0 to disable.
-        self._resync_on_skew = (
-            os.environ.get("WSPR_SYNC_MONITOR", "1").strip().lower()
-            not in ("0", "false", "no", "off", "")
-        )
+        # reached 720k samples within WSPR_SYNC_SKEW_SEC (deviation from
+        # the band's steady-state baseline) of the predicted UTC minute; a
+        # departure means lost samples / sample-clock drift desynced it
+        # from the WSPR cycle (strong signal, zero decodes — the failure
+        # that silenced B4-100 for ~3 h on 2026-05-30), so the band
+        # discards and re-syncs.
+        #
+        # Default is AUTO: ON for a LOCAL radiod (direct RX888 whose sample
+        # clock can wedge and make WAVs undecodable — the case this
+        # catches) and OFF for a REMOTE receiver (RTP arrives over the
+        # network with benign jitter that would false-trip it and resync-
+        # loop, as bee1 did 2026-05-31).  WSPR_SYNC_MONITOR=1/0 forces it.
+        _mon = os.environ.get("WSPR_SYNC_MONITOR", "").strip().lower()
+        if _mon != "":
+            self._resync_on_skew = _mon not in ("0", "false", "no", "off")
+        else:
+            try:
+                _local = _radiod_is_local(self.config.radiod.status_address)
+            except Exception:
+                _local = False
+            self._resync_on_skew = _local
+            logger.info(
+                "skew monitor: auto-%s (radiod %s)",
+                "ON" if _local else "OFF",
+                "local" if _local else "remote",
+            )
         try:
             self._sync_skew_threshold = float(
                 os.environ.get("WSPR_SYNC_SKEW_SEC") or 0.75
