@@ -933,9 +933,25 @@ class WsprUploaderHs:
             wsprnet_api_base = None
         else:
             wsprnet_api_base = _api.strip()
+        # WSPRNET_POLL_INTERVAL_SEC: seconds between async status polls of
+        # <base>/status/<nonce>.  Default 5.0 — server processing is ~3-6s
+        # so the 1st-2nd poll still catches "done" with no practical latency
+        # cost, while easing poll load on wsprnet.org vs. the old 1s.
+        try:
+            poll_interval = float(
+                os.environ.get("WSPRNET_POLL_INTERVAL_SEC", "5").strip() or "5"
+            )
+        except ValueError:
+            logger.warning(
+                "wspr-uploader-hs: WSPRNET_POLL_INTERVAL_SEC not a float "
+                "(env=%r); using default 5.0",
+                os.environ.get("WSPRNET_POLL_INTERVAL_SEC"),
+            )
+            poll_interval = 5.0
         transport = WsprNet(
             max_spots_per_upload=batch_size,
             api_base_url=wsprnet_api_base,
+            poll_interval_sec=poll_interval,
             # Carry the configured WD version (default "4.0") so wsprnet's
             # `version` field reads "WD_4.0" instead of the transport's
             # default "WD_hs-uploader/0.1" (shown truncated as WD_hs-uplo).
