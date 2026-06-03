@@ -38,7 +38,12 @@ MemoryMax=512M
 MemorySwapMax=0
 
 NoNewPrivileges=true
-PrivateTmp=false
+# Private writable /tmp: hs-uploader's _upload_tar stages the .tbz via
+# tempfile.NamedTemporaryFile (default tmpdir), and ProtectSystem=strict
+# makes the host /tmp read-only.  The uploader has no host-/tmp dependency
+# (it talks to decoders via sink.db + upload-wake.sock under /var/lib/sigmond),
+# so an isolated private /tmp is the clean fix.
+PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 # /var/lib/sigmond: the shared sink.db (pending_uploads) + upload-wake.sock.
