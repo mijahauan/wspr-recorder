@@ -21,7 +21,7 @@ import signal
 import sys
 from pathlib import Path
 
-SUBCOMMANDS = {"inventory", "validate", "version", "daemon", "config"}
+SUBCOMMANDS = {"inventory", "validate", "version", "daemon", "uploader", "config"}
 
 DEFAULT_CONFIG_PATH = Path(
     os.environ.get("WSPR_RECORDER_CONFIG", "/etc/wspr-recorder/config.toml")
@@ -141,6 +141,13 @@ def main(argv: list[str] | None = None) -> None:
     )
     _add_common(sub_daemon)
 
+    # Standalone uploader: runs ONLY the hs-uploader pump (no radiod, no
+    # decode), draining the shared sink.db.  Lets the merge-uploader run as
+    # its own systemd unit so upload restarts don't blip any receiver's
+    # decode.  All config comes from env (WsprUploaderHs.from_env()).
+    sub_uploader = subparsers.add_parser("uploader")
+    _add_common(sub_uploader)
+
     # Configuration interview (CONTRACT-v0.5 §14).
     sub_cfg = subparsers.add_parser("config")
     cfg_sub = sub_cfg.add_subparsers(dest="config_command")
@@ -184,6 +191,9 @@ def main(argv: list[str] | None = None) -> None:
         _handle_version(args)
     elif args.command == "daemon":
         _handle_daemon(args)
+    elif args.command == "uploader":
+        from . import uploader_daemon
+        sys.exit(uploader_daemon.run())
     elif args.command == "config":
         _handle_config(args)
     else:  # pragma: no cover
