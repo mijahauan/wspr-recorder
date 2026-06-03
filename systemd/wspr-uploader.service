@@ -14,7 +14,9 @@ WatchdogSec=180
 NotifyAccess=main
 
 EnvironmentFile=-/etc/sigmond/coordination.env
-EnvironmentFile=-/etc/wspr-recorder/env/uploader.env
+# NOT under env/ — that dir is scanned for wspr-recorder@<instance> decoders,
+# and an env/uploader.env there spawns a phantom wspr-recorder@uploader unit.
+EnvironmentFile=-/etc/wspr-recorder/uploader.env
 
 WorkingDirectory=/opt/git/sigmond/wspr-recorder
 

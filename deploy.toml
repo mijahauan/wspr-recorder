@@ -39,6 +39,11 @@ src  = "systemd/wspr-recorder@.service"
 dst  = "/etc/systemd/system/wspr-recorder@.service"
 
 [[install.steps]]
+kind = "link"
+src  = "systemd/wspr-uploader.service"
+dst  = "/etc/systemd/system/wspr-uploader.service"
+
+[[install.steps]]
 kind      = "render"
 src       = "config.toml.example"
 dst       = "/etc/wspr-recorder/config.toml"
@@ -57,7 +62,12 @@ owner = "wsprrec:wsprrec"
 mode  = "0755"
 
 [systemd]
-units = ["wspr-recorder@.service"]
+# Per-instance decoders (one per radiod), expanded from configured instances.
+templated_units = ["wspr-recorder@.service"]
+# Host-local singleton: the fleet merge-uploader runs on ONE host (the merge
+# host); smd only manages it where it's actually enabled (see
+# lifecycle._resolve_optional_units), so decode-only hosts don't false-alarm.
+optional_units = ["wspr-uploader.service"]
 
 [deps]
 [[deps.pypi]]
