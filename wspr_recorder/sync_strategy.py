@@ -17,6 +17,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Protocol, TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from ka9q.discovery import ChannelInfo
+
 logger = logging.getLogger(__name__)
 
 
@@ -113,12 +116,18 @@ class RtpSyncStrategy(SyncStrategy):
         self,
         sample_rate: int = 12000,
         authority_reader: Optional["_AuthorityReaderProtocol"] = None,
+        channel_info: Optional["ChannelInfo"] = None,
     ):
         super().__init__(sample_rate)
         self.authority_reader = authority_reader
+        # radiod's published (GPS_TIME, RTP_TIMESNAP) anchor for this stream,
+        # kept fresh in place by a StatusListener.  When present it gives a
+        # per-host, GPSDO-referenced RTP->UTC origin and supersedes the
+        # wall_clock fallback (see _acquire_reference_utc).
+        self.channel_info = channel_info
         # Correlation state
         self._correlated = False
-        self._correlation_source: Optional[str] = None  # "authority" | "wall_clock"
+        self._correlation_source: Optional[str] = None  # "authority" | "status_anchor" | "wall_clock"
         self._correlation_offset_ns: Optional[int] = None
         self._next_boundary: Optional[int] = None  # unwrapped RTP ts of next boundary
         self._next_minute: Optional[datetime] = None  # UTC wall clock of next boundary
@@ -164,6 +173,13 @@ class RtpSyncStrategy(SyncStrategy):
             logger.info(
                 f"RtpSync: correlated via hf-timestd authority "
                 f"(offset={offset_ns} ns), "
+                f"next boundary at unwrapped={self._next_boundary} "
+                f"({next_minute.strftime('%H:%M:%S')}Z, {seconds_until:.3f}s away)"
+            )
+        elif source == "status_anchor":
+            logger.info(
+                f"RtpSync: correlated via radiod status anchor "
+                f"(GPS_TIME/RTP_TIMESNAP, per-host GPSDO-referenced), "
                 f"next boundary at unwrapped={self._next_boundary} "
                 f"({next_minute.strftime('%H:%M:%S')}Z, {seconds_until:.3f}s away)"
             )
@@ -213,6 +229,26 @@ class RtpSyncStrategy(SyncStrategy):
             from datetime import timedelta as _td
             utc = wall_clock + _td(seconds=offset_sec)
             return utc, "authority", snap.rtp_to_utc_offset_ns
+        # radiod's own published (GPS_TIME, RTP_TIMESNAP) anchor.  Correct
+        # host, GPSDO-referenced, free of the recorder-side wall clock and
+        # network-transit error baked into the wall_clock fallback for remote
+        # streams.  rtp_to_wallclock returns UTC for THIS rtp value directly
+        # from the anchor (applying chain-delay correction when advertised);
+        # wall_clock is passed only as the 32-bit wrap-epoch hint, not as the
+        # labeling source.
+        if self.channel_info is not None:
+            try:
+                from ka9q.rtp_recorder import rtp_to_wallclock
+                utc_sec = rtp_to_wallclock(
+                    unwrapped_rtp & 0xFFFFFFFF, self.channel_info,
+                    wallclock_hint_sec=wall_clock.timestamp(),
+                )
+            except Exception as e:
+                logger.warning("status anchor read raised: %s", e)
+                utc_sec = None
+            if utc_sec is not None:
+                return (datetime.fromtimestamp(utc_sec, tz=timezone.utc),
+                        "status_anchor", None)
         return wall_clock, "wall_clock", None
 
     @property
