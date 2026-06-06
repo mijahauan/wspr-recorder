@@ -467,7 +467,15 @@ class WsprRecorder:
 
         wsprd_path = _find(wsprd_name, "wsprd") or "wsprd"
         jt9_path = _find(jt9_name, "jt9") or "jt9"
-        wsprd_spread = _find(spread_name, "wsprd.spreading")
+        # Operator opt-out: WSPR_DISABLE_SPREAD=1 skips the second
+        # (Doppler-spreading) wsprd pass entirely, so WSPR is decoded only by
+        # the standard wsprd — one decode per cycle, ~half the WSPR decode
+        # CPU, at the cost of the spread metric and a few weak-signal spots.
+        # Default unchanged: the spread pass runs when its binary is present.
+        if os.environ.get("WSPR_DISABLE_SPREAD", "0") == "1":
+            wsprd_spread = None
+        else:
+            wsprd_spread = _find(spread_name, "wsprd.spreading")
         return wsprd_path, wsprd_spread, jt9_path
 
     def _resolve_decoder(
