@@ -921,6 +921,14 @@ class WsprRecorder:
         """
         await asyncio.sleep(self.STARTUP_GRACE_PERIOD)
 
+        # Recovery actions (full_reset / reprovision_stale) make blocking,
+        # synchronous ensure_channel calls (5 s timeout each) across every
+        # channel — on a flaky radiod that can exceed the 3 min systemd
+        # watchdog and SIGABRT the process mid-recovery.  Run them in the
+        # default executor so the event loop stays free to pet the watchdog
+        # (_watchdog_loop) while recovery proceeds on a worker thread.
+        loop = asyncio.get_running_loop()
+
         # source_key -> consecutive degraded-check count
         degraded_count: Dict[str, int] = {}
 
@@ -967,7 +975,9 @@ class WsprRecorder:
                             src_key, n,
                         )
                         try:
-                            ok = rm.full_reset()
+                            ok = await loop.run_in_executor(
+                                None, rm.full_reset
+                            )
                             if ok and rm.state.channels:
                                 degraded_count[src_key] = 0
                             else:
@@ -1001,7 +1011,9 @@ class WsprRecorder:
                     try:
                         if n >= 3:
                             # Escalation: full source reset.
-                            ok = rm.full_reset()
+                            ok = await loop.run_in_executor(
+                                None, rm.full_reset
+                            )
                             if ok:
                                 # Reconnect succeeded — give it a
                                 # full check interval before judging
@@ -1011,7 +1023,9 @@ class WsprRecorder:
                                 self._surface_radiod_diagnosis(rm)
                         else:
                             # Cheap recovery: re-provision stale channels.
-                            rm.reprovision_stale()
+                            await loop.run_in_executor(
+                                None, rm.reprovision_stale
+                            )
                     except Exception:
                         logger.exception(
                             "Channel health (%s): recovery action "
