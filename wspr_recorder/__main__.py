@@ -237,6 +237,7 @@ class WsprRecorder:
 
         sync_strategy = self.timing_service.create_sync_strategy(
             sample_rate=self.config.channel_defaults.sample_rate,
+            channel_info=channel_state.channel_info,
         )
         recorder = BandRecorder(
             ssrc=ssrc,

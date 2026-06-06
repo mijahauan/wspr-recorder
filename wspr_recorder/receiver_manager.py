@@ -292,6 +292,11 @@ class ReceiverManager:
             port=self._port,
         )
         self._control: Optional[RadiodControl] = None
+        # Background listener that refreshes each channel's
+        # (gps_time, rtp_timesnap) anchor in place from radiod's status
+        # multicast, so RtpSyncStrategy can correlate off the per-host
+        # GPSDO-referenced clock instead of the recorder's wall clock.
+        self._status_listener = None
         self._multi_by_group: Dict[Tuple[str, int], MultiStream] = {}
         # (MultiStream, ssrc) pairs for LIFETIME keep-alive — populated
         # at provisioning, consumed by an async loop in __main__.
@@ -316,6 +321,18 @@ class ReceiverManager:
                 client_id="wspr-recorder",
             )
             self.state.connected = True
+
+            # Keep each channel's timing anchor fresh from radiod's status
+            # broadcasts (~2 Hz).  Best-effort: a listener failure must not
+            # block provisioning — RtpSyncStrategy falls back to wall_clock.
+            try:
+                from ka9q.status_listener import StatusListener
+                self._status_listener = StatusListener(self._status_address)
+                self._status_listener.start()
+                logger.info(f"Status anchor listener started on {self._status_address}")
+            except Exception as e:
+                logger.warning(f"Status anchor listener unavailable: {e}")
+                self._status_listener = None
 
             success = 0
             for freq_hz in self.config.frequencies:
@@ -379,6 +396,11 @@ class ReceiverManager:
                 created_at=time.time(),
             )
             self.state.channels[info.ssrc] = state
+
+            # Register this channel's ChannelInfo so the listener mutates its
+            # anchor in place; the same object is handed to RtpSyncStrategy.
+            if self._status_listener is not None:
+                self._status_listener.register_channel(info)
 
             sink = self.sink_factory(info.ssrc, state)
 
@@ -788,6 +810,13 @@ class ReceiverManager:
 
     def shutdown(self) -> None:
         self.stop_streams()
+        if self._status_listener is not None:
+            try:
+                self._status_listener.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping status listener: {e}")
+            finally:
+                self._status_listener = None
         if self._control is not None:
             try:
                 self._control.close()
