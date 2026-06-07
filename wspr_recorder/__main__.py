@@ -683,7 +683,57 @@ class WsprRecorder:
                 cycle_key, request.band_name,
                 rx_source=request.rx_source,
             )
-    
+            # Spots + noise are now in sink.db; the /dev/shm WAV is dead
+            # weight.  Evict it (and its decode by-products) NOW instead
+            # of waiting for the age-based backstop — holding hundreds of
+            # decoded WAVs for ``max_file_age_minutes`` is the dominant
+            # /dev/shm consumer and a chronic memory-pressure source on
+            # RAM-tight hosts.  See _evict_decoded_files.
+            self._evict_decoded_files(wav_path, decoder_wav, runner.work_dir)
+
+    def _evict_decoded_files(
+        self,
+        wav_path: Path,
+        decoder_wav: Optional[Path],
+        work_dir: Path,
+    ) -> None:
+        """Delete a period WAV and its decode by-products immediately
+        after decode + noise extraction, rather than leaving them for
+        the age-based ``WavWriter.cleanup_old_files`` backstop.
+
+        In the DB-direct pipeline the ``/dev/shm`` WAV is consumed ONLY
+        by the in-process wsprd/jt9 decoder and the inline noise pass
+        (``_submit_noise_for_cycle``, which runs synchronously before we
+        reach here).  Nothing external reads it: the wsprdaemon.org tar
+        ships ``wspr.spots`` + ``wspr.noise`` from ``sink.db``, not the
+        audio, and ``lsof`` confirms no other consumer.  Holding each WAV
+        for the full ``max_file_age_minutes`` therefore pins hundreds of
+        dead files in tmpfs — measured at ~2 GB of /dev/shm on a 13-band
+        triple-receiver host, enough to drive the box into global OOM.
+        Evicting at decode time keeps tmpfs at the in-flight working set.
+
+        Best-effort: every error is swallowed so a cleanup failure can
+        never disturb decoding.  ``cleanup_old_files`` /
+        ``enforce_max_files_per_band`` stay in place as the backstop for
+        any WAV whose decode bailed out before reaching this point.
+        """
+        # Real period WAV + its JSON sidecar (mirrors cleanup_old_files).
+        try:
+            wav_path.unlink(missing_ok=True)
+            wav_path.with_suffix(".json").unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug("evict: could not remove %s: %s", wav_path.name, exc)
+        # wsprd-compatible symlink + wsprd's <stem>.c2, both in .phase2.
+        if decoder_wav is not None:
+            try:
+                decoder_wav.unlink(missing_ok=True)
+                (work_dir / f"{decoder_wav.stem}.c2").unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug(
+                    "evict: could not remove decode by-products for %s: %s",
+                    decoder_wav.name, exc,
+                )
+
     def _submit_noise_for_cycle(
         self,
         request: 'DecodeRequest',
