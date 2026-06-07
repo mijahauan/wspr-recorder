@@ -258,12 +258,11 @@ class BandRecorder:
         # Radiod RTP↔GPS offset-stability monitor (operator insight
         # 2026-06-05): once radiod starts, the GPSDO sample stream fixes the
         # offset between RTP and GPS_TIME; it must NEVER change within a
-        # session.  We derive the offset proxy (gps_ns − rtp/rate, unwrapped)
-        # from each fresh status anchor and flag a STEP — which means radiod
-        # changed its mapping without a restart (a radiod-side bug) rather
-        # than the recorder mis-anchoring.  Distinguishes root cause from the
-        # abs-divergence symptom above.
-        self._prev_origin_anchor: Optional[Tuple[int, int]] = None
+        # session.  Detection now lives in ka9q-python: ChannelInfo bumps
+        # ``anchor_epoch`` the instant the status message reports a stepped
+        # offset.  We adopt the epoch as a baseline on first sight and, when
+        # it advances, flag the STEP and re-correlate off the fresh anchor.
+        self._anchor_epoch: Optional[int] = None
         self._origin_step_faults = 0
 
         self._decode_modes = decode_modes or [DecodeMode.W2]
@@ -464,36 +463,35 @@ class BandRecorder:
                 else:
                     self._abs_div_strikes = 0
 
-            # ── Radiod RTP↔GPS offset-stability monitor ──
-            # Between consecutive status anchors the GPS-time delta must equal
-            # the RTP-sample delta / rate (the offset is fixed at radiod
-            # start).  If they disagree by a gross amount, radiod STEPPED its
-            # mapping mid-session — a radiod-side bug (or an undetected radiod
-            # restart).  This attributes the root cause to radiod, vs the
-            # abs-divergence above which only sees the recorder-side symptom.
-            anchor = ci.get_anchor() if hasattr(ci, "get_anchor") else None
-            if anchor and anchor[0] is not None and anchor[1] is not None:
-                if self._prev_origin_anchor is not None:
-                    pg, pr = self._prev_origin_anchor
-                    d_rtp = (anchor[1] - pr) & 0xFFFFFFFF
-                    if d_rtp > 0x80000000:
-                        d_rtp -= 0x100000000
-                    move_sec = (
-                        (anchor[0] - pg)
-                        - d_rtp * 1_000_000_000 / self.sample_rate
-                    ) / 1e9
-                    if abs(move_sec) > self._abs_div_threshold:
-                        self._origin_step_faults += 1
-                        logger.error(
-                            "TIMING FAULT rx=%s mode=wspr %s: radiod RTP↔GPS "
-                            "offset STEPPED %+.3fs mid-session — radiod changed "
-                            "its mapping without a (detected) restart; "
-                            "INVESTIGATE radiod (verify whether it actually "
-                            "restarted); fault #%d",
-                            self.rx_source, self.band_name, move_sec,
-                            self._origin_step_faults,
-                        )
-                self._prev_origin_anchor = anchor
+            # ── Radiod RTP↔GPS offset-step monitor (shared epoch) ──
+            # ka9q-python's ChannelInfo.update_anchor bumps ``anchor_epoch``
+            # the instant radiod reports a different RTP↔GPS offset (the
+            # offset is fixed for the life of a radiod run, so any step is a
+            # radiod-side bug or an undetected restart).  Adopt the epoch as
+            # a baseline on first sight; when it advances, raise the STEP
+            # fault and re-correlate off the fresh anchor — recovering this
+            # band on the next clean :59→:00 boundary instead of grinding
+            # the corrupted minute through wsprd.
+            cur_epoch = getattr(ci, "anchor_epoch", None)
+            if cur_epoch is not None:
+                if self._anchor_epoch is None:
+                    self._anchor_epoch = cur_epoch
+                elif cur_epoch != self._anchor_epoch:
+                    self._origin_step_faults += 1
+                    step = getattr(ci, "last_offset_step_sec", None)
+                    logger.error(
+                        "TIMING FAULT rx=%s mode=wspr %s: radiod RTP↔GPS "
+                        "offset STEPPED %s mid-session — radiod changed its "
+                        "mapping without a (detected) restart; re-correlating; "
+                        "INVESTIGATE radiod (verify whether it actually "
+                        "restarted); fault #%d",
+                        self.rx_source, self.band_name,
+                        ("%+.3fs" % step) if step is not None else "?",
+                        self._origin_step_faults,
+                    )
+                    self._anchor_epoch = cur_epoch
+                    self._resync_requested = True
+                    return
 
         # ── Wall-clock boundary skew check (wsprdaemon-v3 loss-of-sync) ──
         # We just counted a full minute's worth of samples
@@ -688,6 +686,9 @@ class BandRecorder:
         self._initialized = False
         self._synced = False
         self._resync_requested = False
+        # Re-adopt the status anchor_epoch baseline on the next boundary so a
+        # restart-driven epoch bump doesn't immediately re-trigger a resync.
+        self._anchor_epoch = None
         self._skew_strikes = 0
         # Re-establish the steady-state skew baseline at the first boundary
         # after the upcoming re-sync (latency may have shifted).
