@@ -228,7 +228,14 @@ def _handle_inventory(args) -> None:
     config_path = _config_path(args)
     try:
         config = load_config(str(config_path))
-    except FileNotFoundError:
+    except OSError as exc:
+        # The contract requires `inventory` to always emit valid JSON with
+        # structured issues — never crash.  A config that is missing OR
+        # present-but-unreadable (e.g. mode 0640 owned by the service user
+        # while sigmond probes as the operator) both land here.
+        msg = (f"config not found: {config_path}"
+               if isinstance(exc, FileNotFoundError)
+               else f"config unreadable: {config_path} ({exc.strerror or exc})")
         payload = {
             "client": "wspr-recorder",
             "version": "0.1.0",
@@ -238,7 +245,7 @@ def _handle_inventory(args) -> None:
             "issues": [{
                 "severity": "fail",
                 "instance": "all",
-                "message": f"config not found: {config_path}",
+                "message": msg,
             }],
         }
         print(json.dumps(payload, indent=2))
@@ -254,14 +261,19 @@ def _handle_validate(args) -> None:
     config_path = _config_path(args)
     try:
         config = load_config(str(config_path))
-    except FileNotFoundError:
+    except OSError as exc:
+        # See _handle_inventory: degrade gracefully on a missing OR
+        # unreadable config rather than crashing.
+        msg = (f"config not found: {config_path}"
+               if isinstance(exc, FileNotFoundError)
+               else f"config unreadable: {config_path} ({exc.strerror or exc})")
         payload = {
             "ok": False,
             "config_path": str(config_path),
             "issues": [{
                 "severity": "fail",
                 "instance": "all",
-                "message": f"config not found: {config_path}",
+                "message": msg,
             }],
         }
         print(json.dumps(payload, indent=2))
