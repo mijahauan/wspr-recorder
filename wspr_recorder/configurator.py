@@ -305,19 +305,22 @@ def _pick_radiod_status_from_discovery(
     discovered: list[dict], env_status: str, instance_hint: str,
 ) -> str:
     """Interactive discovery flow per RADIOD-IDENTIFICATION.md §4."""
-    # The host's own radiod (passed by sigmond as SIGMOND_RADIOD_STATUS) may
-    # not be broadcasting yet: during `smd bringup` the per-client config
-    # interviews run BEFORE radiod is started, so mDNS can't see it.  Inject it
-    # as the preferred (first/default) entry so the operator can select their
-    # own configured-but-not-yet-running radiod instead of an unrelated one.
+    # Put the host's own radiod (passed by sigmond as SIGMOND_RADIOD_STATUS)
+    # first so it is the default pick — whether mDNS already discovered it
+    # (radiod running) or not yet (still starting during `smd bringup`, in which
+    # case we inject it).
     discovered = list(discovered)
-    if env_status and not any(
-        d.get("hostname") == env_status for d in discovered
-    ):
-        discovered.insert(0, {
-            "hostname": env_status,
-            "name": "this host — configured, starts with bring-up",
-        })
+    if env_status:
+        local = next(
+            (d for d in discovered if d.get("hostname") == env_status), None)
+        if local is not None:
+            discovered.remove(local)
+            discovered.insert(0, local)
+        else:
+            discovered.insert(0, {
+                "hostname": env_status,
+                "name": "this host — configured, starts with bring-up",
+            })
 
     if not discovered:
         print("\033[33m⚠\033[0m  No radiod instances broadcasting on the "
