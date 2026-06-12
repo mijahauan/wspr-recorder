@@ -41,6 +41,49 @@ from .hs_uploader_shim import WsprUploaderHs
 logger = logging.getLogger(__name__)
 
 
+class _ProgressGate:
+    """Decide whether to pet the systemd watchdog from a data-path progress
+    signal, so a *wedged* (not crashed) daemon stops pinging and gets
+    restarted while a healthy-but-idle one keeps pinging.
+
+    ``update(progress, now)`` returns True to ping, False to withhold.
+    Withholds only after the progress counter has stalled past ``stall_sec``;
+    enforcement begins once progress has advanced at least once.  A separate,
+    longer ``startup_grace_sec`` covers the never-progressed (dead-from-start)
+    case without false-firing during slow provisioning.  ``progress is None``
+    means unknown -> always ping (fail-safe: uncertainty never withholds).
+    """
+
+    def __init__(self, stall_sec, startup_grace_sec=None):
+        self._stall = stall_sec
+        self._startup_grace = (
+            startup_grace_sec if startup_grace_sec is not None
+            else stall_sec * 2
+        )
+        self._last = None
+        self._last_advance = None
+        self._seen = False
+        self._start = None
+
+    def update(self, progress, now) -> bool:
+        if self._start is None:
+            self._start = now
+        if progress is None:
+            return True
+        if self._last_advance is None:
+            self._last = progress
+            self._last_advance = now
+        if progress != self._last:
+            self._last = progress
+            self._last_advance = now
+            self._seen = True
+        if self._seen:
+            stalled = (now - self._last_advance) > self._stall
+        else:
+            stalled = (now - self._start) > self._startup_grace
+        return not stalled
+
+
 def _radiod_is_local(status_address: str, conf_dir: str = "/etc/radio") -> bool:
     """True when this recorder's radiod runs on THIS host.
 
@@ -1269,14 +1312,30 @@ class WsprRecorder:
         except Exception:
             logger.debug("sd_notify %r failed (not under systemd?)", message)
 
-    async def _watchdog_loop(self) -> None:
-        """Pet the systemd watchdog (WATCHDOG=1) while running.
+    def _total_samples_received(self):
+        """Sum of RTP samples ingested across all band recorders.  Advances
+        continuously while radiod streams (independent of band activity);
+        freezes when ingestion stalls.  None on any error so the watchdog
+        fails safe and keeps pinging."""
+        try:
+            return sum(
+                br.stats.samples_received
+                for br in self.band_recorders.values()
+            )
+        except Exception:
+            return None
 
-        wspr-recorder@.service is Type=notify with WatchdogSec set;
-        systemd kills and restarts us if the pings stop.  Ping at half
-        the watchdog interval (WATCHDOG_USEC / 2), matching
-        psk-recorder / hfdl-recorder.  No-op when the unit has no
-        watchdog (WATCHDOG_USEC unset).
+    async def _watchdog_loop(self) -> None:
+        """Pet the systemd watchdog (WATCHDOG=1), but only while RTP ingestion
+        is advancing.
+
+        wspr-recorder@.service is Type=notify with WatchdogSec set; systemd
+        kills and restarts us if the pings stop.  Pinging unconditionally
+        would keep a *wedged* (not crashed) daemon alive forever; instead
+        _ProgressGate withholds the ping once no new samples have arrived for
+        the stall window (well above any radiod re-provision window), so
+        systemd restarts it.  No-op when the unit has no watchdog
+        (WATCHDOG_USEC unset).
         """
         watchdog_usec = os.environ.get("WATCHDOG_USEC")
         if not watchdog_usec:
@@ -1285,10 +1344,21 @@ class WsprRecorder:
             interval = max(int(watchdog_usec) / 1_000_000 / 2, 1.0)
         except ValueError:
             return
+        # stall_sec < WatchdogSec(180) and >> the ~50 Hz sample cadence and
+        # any radiod re-provision window, so only a real ingestion stall
+        # withholds the ping.
+        gate = _ProgressGate(stall_sec=90.0)
         while self._running:
-            self._sd_notify(b"WATCHDOG=1")
+            if gate.update(self._total_samples_received(), time.monotonic()):
+                self._sd_notify(b"WATCHDOG=1")
+            else:
+                logger.error(
+                    "no RTP samples ingested across %d band(s) for the stall "
+                    "window; withholding systemd watchdog ping so the unit is "
+                    "restarted", len(self.band_recorders),
+                )
             try:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(min(interval, 5.0))
             except asyncio.CancelledError:
                 break
 
