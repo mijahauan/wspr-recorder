@@ -282,6 +282,11 @@ class WsprRecorder:
         sync_strategy = self.timing_service.create_sync_strategy(
             sample_rate=self.config.channel_defaults.sample_rate,
         )
+        # Feed ka9q ChannelInfo so RtpSyncStrategy correlates via
+        # rtp_to_wallclock (RTP/GPS timebase) rather than the client wall
+        # clock (S3). No-op for non-RTP strategies. channel_state is
+        # freshly populated from ensure_channel() at this point.
+        sync_strategy.set_channel_info(channel_state.channel_info)
         recorder = BandRecorder(
             ssrc=ssrc,
             frequency_hz=channel_state.frequency_hz,
@@ -346,6 +351,9 @@ class WsprRecorder:
             channel_state.restore_count += 1
             try:
                 recorder.reset()
+                # radiod restarted its RTP counter + RTP_TIMESNAP; the
+                # new ChannelInfo must drive the re-correlation (S3).
+                recorder.sync_strategy.set_channel_info(channel_info)
             except Exception:
                 # Fallback to the legacy process-exit path if anything
                 # goes wrong in the in-place reset — os._exit(75) leaves

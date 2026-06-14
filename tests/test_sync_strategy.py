@@ -2,6 +2,7 @@
 
 import pytest
 from datetime import datetime, timezone
+from unittest import mock
 
 from wspr_recorder.sync_strategy import (
     RtpSyncStrategy,
@@ -270,6 +271,61 @@ class TestRtpSyncStrategyWithAuthority:
         for i in range(5):
             strategy.should_start_minute(100_000 + i * 240, 240, utc(second=58))
         assert calls["n"] == 1  # only the first packet triggers correlation
+
+
+class _FakeChannelInfo:
+    """Minimal stand-in for ka9q ChannelInfo (rtp_to_wallclock is mocked)."""
+
+
+class TestRtpSyncStrategyChannelInfo:
+    """S3: when channel_info is provided, correlation derives UTC from RTP
+    via rtp_to_wallclock (+ authority offset) rather than the client wall
+    clock — matching codar/psk/msk144."""
+
+    def test_channel_info_uses_rtp_to_wallclock_with_authority(self):
+        strategy = RtpSyncStrategy(
+            SAMPLE_RATE,
+            authority_reader=_FakeReader(_FakeSnap(offset_usable=True, offset_ns=4_250)),
+        )
+        strategy.set_channel_info(_FakeChannelInfo())
+        ref_epoch = utc(second=58).timestamp()
+        with mock.patch("ka9q.rtp_to_wallclock", return_value=ref_epoch) as m:
+            strategy.should_start_minute(100_000, 240, utc(second=58))
+        assert strategy.correlation_source == "rtp_to_wallclock+authority"
+        assert strategy.correlation_offset_ns == 4_250
+        m.assert_called_once()
+        # hint passed for wrap disambiguation
+        assert "wallclock_hint_sec" in m.call_args.kwargs
+
+    def test_channel_info_without_authority_uses_rtp_to_wallclock(self):
+        strategy = RtpSyncStrategy(SAMPLE_RATE, authority_reader=_FakeReader(None))
+        strategy.set_channel_info(_FakeChannelInfo())
+        ref_epoch = utc(second=58).timestamp()
+        with mock.patch("ka9q.rtp_to_wallclock", return_value=ref_epoch):
+            strategy.should_start_minute(100_000, 240, utc(second=58))
+        assert strategy.correlation_source == "rtp_to_wallclock"
+        assert strategy.correlation_offset_ns is None
+
+    def test_rtp_to_wallclock_none_falls_back_to_authority(self):
+        strategy = RtpSyncStrategy(
+            SAMPLE_RATE,
+            authority_reader=_FakeReader(_FakeSnap(offset_usable=True, offset_ns=500)),
+        )
+        strategy.set_channel_info(_FakeChannelInfo())
+        with mock.patch("ka9q.rtp_to_wallclock", return_value=None):
+            strategy.should_start_minute(100_000, 240, utc(second=58))
+        # rtp_to_wallclock unavailable → priority-2 authority path.
+        assert strategy.correlation_source == "authority"
+        assert strategy.correlation_offset_ns == 500
+
+    def test_no_channel_info_keeps_legacy_authority_source(self):
+        # Backward-compat: without channel_info, behaviour is unchanged.
+        strategy = RtpSyncStrategy(
+            SAMPLE_RATE,
+            authority_reader=_FakeReader(_FakeSnap(offset_usable=True, offset_ns=7)),
+        )
+        strategy.should_start_minute(100_000, 240, utc(second=58))
+        assert strategy.correlation_source == "authority"
 
 
 class TestRtpSyncStrategyReset:
