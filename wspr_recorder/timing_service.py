@@ -36,7 +36,7 @@ class TimingQuality:
     B = 'B'  # < 10ms uncertainty (GPS, good NTP)
     C = 'C'  # < 100ms uncertainty (NTP pools)
     D = 'D'  # > 100ms or unknown (system clock only)
-    
+
     @staticmethod
     def from_uncertainty_ms(uncertainty_ms: float) -> str:
         """Convert uncertainty to quality tier."""
@@ -48,6 +48,21 @@ class TimingQuality:
             return TimingQuality.C
         else:
             return TimingQuality.D
+
+
+# Map hf-timestd T-levels (authority.json) to the coarse A–D quality
+# tier recorded in sidecars. T6/T5 are ns–ms class (A); T4/T3 ms class
+# (B); T2 WAN-NTP (C); T1/T0/None degraded (D). The authoritative
+# uncertainty is the published sigma_ns; this tier is a convenience label.
+_TIER_FOR_T_LEVEL = {
+    'T6': TimingQuality.A,
+    'T5': TimingQuality.A,
+    'T4': TimingQuality.B,
+    'T3': TimingQuality.B,
+    'T2': TimingQuality.C,
+    'T1': TimingQuality.C,
+    'T0': TimingQuality.D,
+}
 
 
 # =============================================================================
@@ -157,7 +172,13 @@ class TimingMetadata:
     # top of hf_uncertainty_ms.
     fusion_governor_radiod: Optional[str] = None
     client_radiod: Optional[str] = None
-    
+
+    # Canonical timing-provenance block, sourced from hf-timestd's
+    # adjudicated authority.json (authority_reader.to_timing_authority).
+    # This is the authoritative record and is identical in shape across
+    # all sigmond clients; the fields above are diagnostics/fallbacks.
+    timing_authority: Optional[Dict[str, Any]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         def dt_to_iso(dt: Optional[datetime]) -> Optional[str]:
@@ -189,6 +210,7 @@ class TimingMetadata:
             'estimated_true_end_utc': dt_to_iso(self.estimated_true_end_utc),
             'fusion_governor_radiod': self.fusion_governor_radiod,
             'client_radiod': self.client_radiod,
+            'timing_authority': self.timing_authority,
         }
 
 
@@ -415,16 +437,47 @@ class TimingService:
         # Query sources
         chrony = self.get_chrony_status()
         hf = self.get_hf_status()
-        
+
+        # Authoritative source: hf-timestd's adjudicated authority.json.
+        # This is the unified, canonical timing provenance for ALL sigmond
+        # clients (authority_reader.to_timing_authority). It supersedes the
+        # legacy fusion-API / chrony picture below — those remain only as a
+        # fallback when authority.json is unavailable, and as diagnostic
+        # sub-fields. (Historically wspr annotated from the fusion HTTP API,
+        # which predated authority.json and ignored tier/sigma adjudication;
+        # this is the S1 conformance fix.)
+        from .authority_reader import (
+            AuthorityReader, standalone_timing_authority,
+        )
+        try:
+            snap = AuthorityReader().read()
+        except Exception as e:
+            logger.debug(f"authority.json read failed: {e}")
+            snap = None
+
         # Determine best timing source and offset
         timing_source = 'SYSTEM'
         quality_tier = TimingQuality.D
         uncertainty_ms = 1000.0  # 1 second default
         system_clock_offset_ms: Optional[float] = None
         system_clock_source: Optional[str] = None
-        
-        # Check hf-timestd
-        if hf and hf.is_active:
+        # When set, the authority offset (rtp_to_utc, ns→ms, ADD to get UTC)
+        # drives the corrected-timestamp math instead of the chrony sign.
+        authority_offset_ms: Optional[float] = None
+
+        if snap is not None and snap.offset_usable:
+            t = snap.t_level_active or 'T?'
+            timing_source = f'HF_TIMESTD_{t}'
+            quality_tier = _TIER_FOR_T_LEVEL.get(t, TimingQuality.D)
+            if snap.sigma_ns is not None:
+                uncertainty_ms = snap.sigma_ns / 1_000_000
+            authority_offset_ms = snap.offset_seconds * 1000.0
+            system_clock_offset_ms = authority_offset_ms
+            system_clock_source = f'hf-timestd_authority_{t}'
+
+        # Check hf-timestd (legacy fusion-API fallback — only when the
+        # authority snapshot did not supply an offset above).
+        if authority_offset_ms is None and hf and hf.is_active:
             if hf.authority == 'fusion' and hf.is_locked:
                 timing_source = 'HF_FUSION'
                 quality_tier = hf.fusion_quality_grade or TimingQuality.B
@@ -487,25 +540,34 @@ class TimingService:
             metadata.hf_quality_grade = hf.fusion_quality_grade
             metadata.hf_locked = hf.is_locked
         
-        # Compute corrected timestamps
-        if wallclock_start and system_clock_offset_ms is not None:
+        # Compute corrected timestamps. Two sign conventions:
+        #  - authority offset is rtp_to_utc (ADD to a wall-clock-derived
+        #    start to recover UTC),
+        #  - chrony system_time_offset is "clock ahead of reference"
+        #    (SUBTRACT to recover true time).
+        if wallclock_start is not None:
             from datetime import timedelta
-            offset = timedelta(milliseconds=-system_clock_offset_ms)
-            metadata.estimated_true_start_utc = wallclock_start + offset
-            if wallclock_end:
-                metadata.estimated_true_end_utc = wallclock_end + offset
+            if authority_offset_ms is not None:
+                off = timedelta(milliseconds=authority_offset_ms)
+                metadata.estimated_true_start_utc = wallclock_start + off
+                if wallclock_end:
+                    metadata.estimated_true_end_utc = wallclock_end + off
+            elif system_clock_offset_ms is not None:
+                off = timedelta(milliseconds=-system_clock_offset_ms)
+                metadata.estimated_true_start_utc = wallclock_start + off
+                if wallclock_end:
+                    metadata.estimated_true_end_utc = wallclock_end + off
 
-        # Radiod attribution — stamped into sidecars. The governor comes
-        # from authority.json if hf-timestd is publishing it; the client
-        # comes from our own config.
+        # Radiod attribution + canonical authority block — stamped into
+        # sidecars from the single authority.json read above.
         metadata.client_radiod = self.client_radiod
-        try:
-            from .authority_reader import AuthorityReader
-            snap = AuthorityReader().read()
-            if snap is not None and snap.governor_radiod:
-                metadata.fusion_governor_radiod = snap.governor_radiod
-        except Exception as e:
-            logger.debug(f"Could not read governor_radiod from authority.json: {e}")
+        if snap is not None and snap.governor_radiod:
+            metadata.fusion_governor_radiod = snap.governor_radiod
+        metadata.timing_authority = (
+            snap.to_timing_authority(self.client_radiod)
+            if snap is not None
+            else standalone_timing_authority(self.client_radiod)
+        )
 
         return metadata
     

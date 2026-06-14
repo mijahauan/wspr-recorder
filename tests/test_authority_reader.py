@@ -119,5 +119,71 @@ class TestAuthorityReader(unittest.TestCase):
         self.assertIsNone(s.governor_radiod)
 
 
+class TestCanonicalTimingAuthority(unittest.TestCase):
+    """The unified timing-provenance block emitted into every client's
+    sidecar (authority_reader.to_timing_authority / the standalone
+    fallback). Shape must match across wspr/psk/msk144/codar."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.path = self.tmp / "authority.json"
+        self.now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _snap(self, **overrides) -> AuthoritySnapshot:
+        with self.path.open("w") as f:
+            json.dump(_good(**overrides), f)
+        s = AuthorityReader(path=self.path, now_fn=lambda: self.now).read()
+        assert s is not None
+        return s
+
+    def test_offset_seconds(self) -> None:
+        s = self._snap(rtp_to_utc_offset_ns=812_345)
+        self.assertAlmostEqual(s.offset_seconds, 812_345 / 1e9, places=12)
+
+    def test_offset_seconds_zero_when_not_usable(self) -> None:
+        s = self._snap(t_level_active=None, rtp_to_utc_offset_ns=None, sigma_ns=None)
+        self.assertEqual(s.offset_seconds, 0.0)
+
+    def test_to_timing_authority_block(self) -> None:
+        s = self._snap(
+            t_level_active="T6", rtp_to_utc_offset_ns=4250, sigma_ns=1000,
+            t_level_witnesses=["T5"], disagreement_flags=["TIMING_DISAGREEMENT"],
+            governor_radiod="bee3-rx888",
+        )
+        b = s.to_timing_authority(client_radiod="bee3-rx888")
+        self.assertEqual(b["source"], "hf-timestd-authority")
+        self.assertEqual(b["schema"], "v1")
+        self.assertEqual(b["t_level_active"], "T6")
+        self.assertEqual(b["rtp_to_utc_offset_ns"], 4250)
+        self.assertEqual(b["sigma_ns"], 1000)
+        self.assertEqual(b["t_level_witnesses"], ["T5"])
+        self.assertEqual(b["disagreement_flags"], ["TIMING_DISAGREEMENT"])
+        self.assertEqual(b["governor_radiod"], "bee3-rx888")
+        self.assertEqual(b["client_radiod"], "bee3-rx888")
+        self.assertEqual(b["authority_utc_published"], s.utc_published.isoformat())
+
+    def test_standalone_timing_authority_block(self) -> None:
+        from wspr_recorder.authority_reader import standalone_timing_authority
+        b = standalone_timing_authority(client_radiod="bee3-rx888")
+        self.assertEqual(b["source"], "standalone-fallback")
+        self.assertIsNone(b["t_level_active"])
+        self.assertIsNone(b["rtp_to_utc_offset_ns"])
+        self.assertIsNone(b["sigma_ns"])
+        self.assertEqual(b["disagreement_flags"], [])
+        self.assertEqual(b["client_radiod"], "bee3-rx888")
+        self.assertIsNone(b["authority_utc_published"])
+
+    def test_both_blocks_share_keys(self) -> None:
+        from wspr_recorder.authority_reader import standalone_timing_authority
+        s = self._snap()
+        self.assertEqual(
+            set(s.to_timing_authority("r").keys()),
+            set(standalone_timing_authority("r").keys()),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
