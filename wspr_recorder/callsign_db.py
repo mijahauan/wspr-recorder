@@ -2,13 +2,23 @@
 Centralized callsign database for cross-decoder hash resolution.
 
 WSPR type-3 messages encode callsigns as hashes. wsprd and jt9 use
-incompatible hash systems:
-  - wsprd: 15-bit Jenkins lookup3, seed 146. File: hashtable.txt
-  - jt9:   22-bit base-38 multiplicative.  File: fst4w_calls.txt
+different hash widths off the same Bob Jenkins lookup3 (seed 146):
+  - wsprd: 15-bit index.  File: hashtable.txt
+  - jt9 -Y: 22-bit numeric hash emitted as <NNNNNNN>.  File: fst4w_calls.txt
 
 This module maintains a single callsign database shared across all bands
 and both decoders. It pre-populates hash table files before each decode
 run and resolves jt9 -Y numeric hashes after decoding.
+
+The hash store + lookup + resolution is the **shared** ``callhash``
+library (``CallHashTable``) — the same one psk-recorder and
+meteor-scatter use — so a compound call learned anywhere resolves the
+same way everywhere.  This class is a thin wrapper that adds the
+wspr-only concerns the library deliberately doesn't know about:
+
+  * per-call grid + band metadata (for fst4w_calls.txt and forensics),
+  * the wsprnet negative-cache suppression filter (``_suppressed_for_rx``),
+  * the on-disk JSON format that carries that metadata across restarts.
 
 v4 improvement over v3: v3 discards all unresolved type-3 spots (<...>).
 v4 resolves them via cross-pollination between decoders and bands.
@@ -16,19 +26,14 @@ v4 resolves them via cross-pollination between decoders and bands.
 
 import json
 import logging
-import struct
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
+from callhash import CallHashTable, hash15, hash22
+
 logger = logging.getLogger(__name__)
-
-# Base-38 character set for jt9 hash (packjt77.f90)
-_BASE38_CHARS = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/"
-
-# Jenkins lookup3 constants
-_MASK32 = 0xFFFFFFFF
 
 
 @dataclass
@@ -77,8 +82,14 @@ class CallsignDB:
         self._rx_call = rx_call or ""
         self._sink_db_path = sink_db_path
         self._callsigns: Dict[str, CallsignEntry] = {}
-        # Reverse lookup: 22-bit hash → callsign
-        self._hash22_to_call: Dict[int, str] = {}
+        # The shared callhash table is the authoritative hash → call
+        # store (15-bit for wsprd, 22-bit for jt9 -Y).  It owns all the
+        # hashing + lookup (incl. the collision guard); this wrapper owns
+        # only the grid/bands metadata and the persistence format, so the
+        # resolution logic is identical to psk-recorder and
+        # meteor-scatter.  The table is rebuilt from `_callsigns` on load
+        # — we persist our richer JSON rather than the table's own format.
+        self._table = CallHashTable()
 
         if db_path and db_path.exists():
             self.load()
@@ -113,6 +124,21 @@ class CallsignDB:
         self._suppressed_cache_at = now
         return calls
 
+    # ---------------------------------------------------------------
+    # Observation + ingest
+    # ---------------------------------------------------------------
+
+    def observe(self, text: str) -> int:
+        """Seed the shared table from ``<call>`` announcement markers in
+        decoded text — parity with psk-recorder / meteor-scatter.
+
+        Returns the number of NEW calls added to the table.  Note these
+        announcement-only sightings do not get grid/band metadata (that
+        comes from :meth:`add_callsign` / :meth:`ingest_spots`); they
+        exist purely so a later hashed packet resolves.
+        """
+        return self._table.observe(text)
+
     def add_callsign(self, call: str, grid: str = "", band: str = "") -> bool:
         """
         Add or update a callsign. Returns True if this is a new callsign.
@@ -129,9 +155,8 @@ class CallsignDB:
                 call=call, grid=grid, first_seen=now, last_seen=now,
                 bands=[band] if band else [],
             )
-            # Update hash22 reverse lookup
-            h22 = self.ihash22(call)
-            self._hash22_to_call[h22] = call
+            # Mirror into the shared table so the 15/22-bit hashes resolve.
+            self._table.add(call)
         else:
             entry = self._callsigns[call]
             entry.last_seen = now
@@ -144,7 +169,7 @@ class CallsignDB:
 
     def resolve_hash22(self, hash_value: int) -> Optional[str]:
         """Look up a 22-bit hash from jt9 -Y output. Returns callsign or None."""
-        return self._hash22_to_call.get(hash_value)
+        return self._table.by_hash22(hash_value)
 
     def write_wsprd_hashtable(self, path: Path) -> int:
         """
@@ -152,31 +177,27 @@ class CallsignDB:
 
         Format: one line per entry, "%5d %s\\n" (index callsign).
         Returns number of entries written.  Calls flagged as
-        consistently-rejected by wsprnet (see
-        ``_suppressed_for_rx``) are silently filtered — wsprd then
-        no longer emits Type-2 hashes for them, so they stop being
-        re-uploaded into the silent-reject loop.  The underlying
-        cache entry is NOT deleted; the operator can rehabilitate
-        via ``smd verifier rehabilitate <CALL>`` if wsprnet later
-        accepts the call.
+        consistently-rejected by wsprnet (see ``_suppressed_for_rx``)
+        are silently filtered — wsprd then no longer emits Type-2
+        hashes for them, so they stop being re-uploaded into the
+        silent-reject loop.  The underlying cache entry is NOT deleted;
+        the operator can rehabilitate via ``smd verifier rehabilitate
+        <CALL>`` if wsprnet later accepts the call.
+
+        The actual write (and the 15-bit hashing) is the shared
+        ``callhash`` exporter; this wrapper only supplies the
+        wspr-specific suppression predicate + the operator log line.
         """
         suppressed = self._suppressed_for_rx()
-        count = 0
-        skipped = 0
-        with open(path, 'w') as f:
-            for call in self._callsigns:
-                if call in suppressed:
-                    skipped += 1
-                    continue
-                h15 = self.nhash15(call)
-                f.write(f"{h15:5d} {call}\n")
-                count += 1
+        count = self._table.write_wsprd_hashtable(
+            path, exclude=lambda c: c in suppressed,
+        )
+        skipped = sorted(c for c in self._callsigns if c in suppressed)
         if skipped:
             logger.info(
                 "callsign_db: filtered %d suppressed call(s) from "
                 "hashtable.txt for rx_call=%s: %s",
-                skipped, self._rx_call,
-                sorted(c for c in self._callsigns if c in suppressed),
+                len(skipped), self._rx_call, skipped,
             )
         return count
 
@@ -185,20 +206,17 @@ class CallsignDB:
         Write fst4w_calls.txt for jt9 (callsign grid pairs).
 
         Returns number of entries written.  Same negative-cache filter
-        as ``write_wsprd_hashtable`` — keeps jt9 from re-emitting
-        the same stale compounds that wsprnet rejects.
+        as ``write_wsprd_hashtable`` — keeps jt9 from re-emitting the
+        same stale compounds that wsprnet rejects.  Grids come from our
+        per-call metadata; the shared exporter renders a blank grid as
+        four spaces.
         """
         suppressed = self._suppressed_for_rx()
-        count = 0
-        skipped = 0
-        with open(path, 'w') as f:
-            for call, entry in self._callsigns.items():
-                if call in suppressed:
-                    skipped += 1
-                    continue
-                grid = entry.grid if entry.grid else "    "
-                f.write(f"{call} {grid}\n")
-                count += 1
+        grids = {call: entry.grid for call, entry in self._callsigns.items()}
+        count = self._table.write_jt9_calls(
+            path, grids=grids, exclude=lambda c: c in suppressed,
+        )
+        skipped = sum(1 for c in self._callsigns if c in suppressed)
         if skipped:
             logger.info(
                 "callsign_db: filtered %d suppressed call(s) from "
@@ -260,7 +278,7 @@ class CallsignDB:
     # ------------------------------------------------------------------
     # Hash algorithms — delegated to the canonical `callhash` library
     # (github.com/mijahauan/callhash, also used by psk-recorder +
-    # wsprdaemon-client) for cross-tool consistency.  The pre-Phase-7
+    # meteor-scatter) for cross-tool consistency.  The pre-Phase-7
     # in-tree implementation produced DIFFERENT hash22 values from
     # callhash and wsprd's own internal hash — verified KX6H giving
     # 2909634 (in-tree, wrong) vs 3206159 (callhash, matches wsprd).
@@ -272,12 +290,10 @@ class CallsignDB:
     def nhash15(callsign: str) -> int:
         """wsprd's 15-bit Jenkins lookup3 hash (seed 146).
 
-        Delegates to ``callhash.hash15`` for parity with the shared
-        library.  Callsign is upper-cased first since wsprd's hash
-        table is keyed by the canonical (upper-case) form — callhash
-        itself is case-sensitive by design.
+        Delegates to ``callhash.hash15``.  Callsign is upper-cased first
+        since wsprd's hash table is keyed by the canonical (upper-case)
+        form — callhash itself is case-sensitive by design.
         """
-        from callhash import hash15
         return hash15(callsign.upper())
 
     @staticmethod
@@ -289,7 +305,6 @@ class CallsignDB:
         value the original in-tree implementation produced (after
         its own upper-case step).
         """
-        from callhash import hash22
         return hash22(callsign.upper())
 
     # ------------------------------------------------------------------
@@ -312,8 +327,7 @@ class CallsignDB:
                     bands=entry_dict.get("bands", []),
                 )
                 self._callsigns[call] = entry
-                h22 = self.ihash22(call)
-                self._hash22_to_call[h22] = call
+                self._table.add(call)
             logger.info(f"Loaded {len(self._callsigns)} callsigns from {self._db_path}")
         except Exception as e:
             logger.warning(f"Failed to load callsign DB: {e}")
@@ -347,33 +361,3 @@ class CallsignDB:
             "size": self.size,
             "db_path": str(self._db_path) if self._db_path else None,
         }
-
-
-# ------------------------------------------------------------------
-# Jenkins lookup3 helper functions
-# ------------------------------------------------------------------
-
-def _rot(x: int, k: int) -> int:
-    """32-bit left rotate."""
-    return ((x << k) | (x >> (32 - k))) & _MASK32
-
-
-def _jenkins_mix(a: int, b: int, c: int) -> tuple[int, int, int]:
-    a = (a - c) & _MASK32; a ^= _rot(c, 4);  c = (c + b) & _MASK32
-    b = (b - a) & _MASK32; b ^= _rot(a, 6);  a = (a + c) & _MASK32
-    c = (c - b) & _MASK32; c ^= _rot(b, 8);  b = (b + a) & _MASK32
-    a = (a - c) & _MASK32; a ^= _rot(c, 16); c = (c + b) & _MASK32
-    b = (b - a) & _MASK32; b ^= _rot(a, 19); a = (a + c) & _MASK32
-    c = (c - b) & _MASK32; c ^= _rot(b, 4);  b = (b + a) & _MASK32
-    return a, b, c
-
-
-def _jenkins_final(a: int, b: int, c: int) -> tuple[int, int, int]:
-    c ^= b; c = (c - _rot(b, 14)) & _MASK32
-    a ^= c; a = (a - _rot(c, 11)) & _MASK32
-    b ^= a; b = (b - _rot(a, 25)) & _MASK32
-    c ^= b; c = (c - _rot(b, 16)) & _MASK32
-    a ^= c; a = (a - _rot(c, 4))  & _MASK32
-    b ^= a; b = (b - _rot(a, 14)) & _MASK32
-    c ^= b; c = (c - _rot(b, 24)) & _MASK32
-    return a, b, c
