@@ -21,6 +21,7 @@ Channel auto-recovery on stream drops is handled inside MultiStream.
 """
 
 import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -292,10 +293,26 @@ class ReceiverManager:
             port=self._port,
         )
         self._control: Optional[RadiodControl] = None
+        # Background listener that refreshes each channel's
+        # (gps_time, rtp_timesnap) anchor in place from radiod's status
+        # multicast, so RtpSyncStrategy can correlate off the per-host
+        # GPSDO-referenced clock instead of the recorder's wall clock.
+        self._status_listener = None
         self._multi_by_group: Dict[Tuple[str, int], MultiStream] = {}
         # (MultiStream, ssrc) pairs for LIFETIME keep-alive — populated
         # at provisioning, consumed by an async loop in __main__.
         self._lifetime_entries: List[Tuple[MultiStream, int]] = []
+        # Space out ensure_channel calls (2026-06-06): firing all bands in a
+        # tight burst perturbs radiod into reverting freshly-created channels
+        # to its global defaults (Task #46 race).  That fails verification
+        # whenever radiod's default samprate != the requested rate — e.g.
+        # bee1's radiod defaults to 24 kHz while we request 12 kHz, so its
+        # reverted channels read back wrong and time out (bee2's default is
+        # 12 kHz, which coincidentally masks the same race).  A small per-
+        # channel gap lets radiod settle each before the next.  0 disables.
+        self._provision_spacing_sec = float(
+            os.environ.get("WSPR_PROVISION_SPACING_SEC", "0.3")
+        )
 
     def connect(self) -> bool:
         """Provision all channels and register them with MultiStream(s)."""
@@ -316,6 +333,18 @@ class ReceiverManager:
                 client_id="wspr-recorder",
             )
             self.state.connected = True
+
+            # Keep each channel's timing anchor fresh from radiod's status
+            # broadcasts (~2 Hz).  Best-effort: a listener failure must not
+            # block provisioning — RtpSyncStrategy falls back to wall_clock.
+            try:
+                from ka9q.status_listener import StatusListener
+                self._status_listener = StatusListener(self._status_address)
+                self._status_listener.start()
+                logger.info(f"Status anchor listener started on {self._status_address}")
+            except Exception as e:
+                logger.warning(f"Status anchor listener unavailable: {e}")
+                self._status_listener = None
 
             success = 0
             for freq_hz in self.config.frequencies:
@@ -380,6 +409,11 @@ class ReceiverManager:
             )
             self.state.channels[info.ssrc] = state
 
+            # Register this channel's ChannelInfo so the listener mutates its
+            # anchor in place; the same object is handed to RtpSyncStrategy.
+            if self._status_listener is not None:
+                self._status_listener.register_channel(info)
+
             sink = self.sink_factory(info.ssrc, state)
 
             # Pick/create the MultiStream for this group, keyed on the
@@ -406,10 +440,43 @@ class ReceiverManager:
             if lifetime_arg is not None:
                 self._lifetime_entries.append((multi, info.ssrc))
 
+            # Reprovision ring-buffer leak fix (root-caused 2026-06-06):
+            # re-provisioning a stale band lands a fresh SSRC + a fresh sink
+            # (which holds this band's multi-MB decoder ring), but the OLD
+            # MultiStream slot for the band lingered in _slots forever, its
+            # on_samples closure keeping the superseded ring alive.  Over
+            # bee1's flaky radiod (continuous reprovision) this leaked
+            # ~1.3 GB/h and tripped the global OOM killer.  Release every
+            # prior slot on this frequency (match by freq so we also catch a
+            # slot the MultiStream health monitor re-keyed), and reconcile our
+            # own bookkeeping + the status-listener registration for them.
+            for _multi in self._multi_by_group.values():
+                for _old_ssrc in _multi.prune_frequency(
+                    float(freq_hz), keep_ssrc=info.ssrc
+                ):
+                    self.state.channels.pop(_old_ssrc, None)
+                    if self._status_listener is not None:
+                        try:
+                            self._status_listener.unregister_channel(_old_ssrc)
+                        except Exception:
+                            logger.debug(
+                                "unregister_channel(%s) failed", _old_ssrc
+                            )
+                    self._lifetime_entries = [
+                        e for e in self._lifetime_entries if e[1] != _old_ssrc
+                    ]
+
             logger.info(
                 f"Created: {band_name} ({freq_hz} Hz) -> "
                 f"SSRC {info.ssrc} @ {info.multicast_address}:{info.port}"
             )
+            # Gap before the next channel in a provisioning burst so radiod
+            # isn't perturbed into reverting this one to defaults (see
+            # _provision_spacing_sec).  Runs in a worker thread (connect via
+            # to_thread, reprovision via run_in_executor), so this blocking
+            # sleep never touches the event loop.
+            if self._provision_spacing_sec > 0:
+                time.sleep(self._provision_spacing_sec)
             return True
         except Exception as e:
             logger.error(f"Failed to provision {band_name} ({freq_hz} Hz): {e}")
@@ -788,6 +855,13 @@ class ReceiverManager:
 
     def shutdown(self) -> None:
         self.stop_streams()
+        if self._status_listener is not None:
+            try:
+                self._status_listener.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping status listener: {e}")
+            finally:
+                self._status_listener = None
         if self._control is not None:
             try:
                 self._control.close()

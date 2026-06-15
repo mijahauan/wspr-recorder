@@ -676,7 +676,7 @@ class TimingService:
 
         return 'L1'
 
-    def create_sync_strategy(self, sample_rate: int = 12000):
+    def create_sync_strategy(self, sample_rate: int = 12000, channel_info=None):
         """
         Create the appropriate SyncStrategy for the current timing authority.
 
@@ -714,7 +714,7 @@ class TimingService:
 
         if self.authority == 'rtp':
             logger.info("Timing: authority=rtp, using RtpSyncStrategy (no authority reader)")
-            return RtpSyncStrategy(sample_rate)
+            return RtpSyncStrategy(sample_rate, channel_info=channel_info)
 
         if self.authority in ('auto', 'fusion'):
             reader = AuthorityReader()
@@ -736,7 +736,8 @@ class TimingService:
                     self.authority,
                 )
             # Always use RtpSyncStrategy — reader is used opportunistically.
-            return RtpSyncStrategy(sample_rate, authority_reader=reader)
+            return RtpSyncStrategy(sample_rate, authority_reader=reader,
+                                   channel_info=channel_info)
 
         if self.authority == 'legacy-clock':
             # Deprecated but kept for operators who want the old behavior
@@ -765,7 +766,8 @@ class TimingService:
             "Timing: unknown authority=%r; defaulting to auto", self.authority,
         )
         reader = AuthorityReader()
-        return RtpSyncStrategy(sample_rate, authority_reader=reader)
+        return RtpSyncStrategy(sample_rate, authority_reader=reader,
+                               channel_info=channel_info)
 
     def _get_best_uncertainty(
         self,

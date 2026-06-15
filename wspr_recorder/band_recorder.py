@@ -9,6 +9,7 @@ Per-band recording logic:
 """
 
 import logging
+import os
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List, Tuple
@@ -239,6 +240,30 @@ class BandRecorder:
         self._skew_resyncs = 0
         self._last_skew_sec = 0.0
         self._last_skew_deviation_sec = 0.0
+        # Absolute-divergence detector: compares the grid projection against
+        # radiod's FRESH GPS reference (rtp_to_wallclock on the
+        # StatusListener-refreshed channel_info).  Unlike the deviation check
+        # above — which absorbs a constant offset into its baseline and so is
+        # blind to a frozen bad anchor — this catches an anchor that is wrong
+        # by a fixed amount.  RTP-referenced (not wall-clock-now), so it holds
+        # on remote streams too.  On sustained gross divergence: loud fault +
+        # re-correlate off the fresh anchor.
+        self._abs_div_threshold = float(
+            os.environ.get("WSPR_ABS_DIVERGENCE_SEC", "1.0"))
+        self._abs_div_after = max(
+            1, int(os.environ.get("WSPR_ABS_DIVERGENCE_AFTER", "2")))
+        self._abs_div_strikes = 0
+        self._abs_div_faults = 0
+        self._last_abs_divergence_sec = 0.0
+        # Radiod RTP↔GPS offset-stability monitor (operator insight
+        # 2026-06-05): once radiod starts, the GPSDO sample stream fixes the
+        # offset between RTP and GPS_TIME; it must NEVER change within a
+        # session.  Detection now lives in ka9q-python: ChannelInfo bumps
+        # ``anchor_epoch`` the instant the status message reports a stepped
+        # offset.  We adopt the epoch as a baseline on first sight and, when
+        # it advances, flag the STEP and re-correlate off the fresh anchor.
+        self._anchor_epoch: Optional[int] = None
+        self._origin_step_faults = 0
 
         self._decode_modes = decode_modes or [DecodeMode.W2]
         self.stats = BandRecorderStats()
@@ -396,6 +421,77 @@ class BandRecorder:
         minute_rtp = (
             (self._first_rtp_timestamp + self._minute_count * self._samples_per_minute) & 0xFFFFFFFF
         )
+
+        # ── Absolute-divergence check (catches a CONSTANT bad anchor) ──
+        # Compare the grid projection against radiod's fresh GPS reference for
+        # this boundary's RTP value.  rtp_to_wallclock reads the
+        # StatusListener-refreshed channel_info, so this is RTP-referenced
+        # (not wall-clock-now) and immune to the constant-offset blind spot of
+        # the deviation check below.  Sustained gross divergence ⇒ a frozen
+        # bad anchor / clock fault: raise it LOUD and re-correlate off the
+        # fresh anchor (operator principle 2026-06-05 — recover, never silent).
+        ci = getattr(self.sync_strategy, "channel_info", None)
+        if self._synced and ci is not None:
+            ref_sec = None
+            try:
+                from ka9q import rtp_to_wallclock
+                ref_sec = rtp_to_wallclock(
+                    minute_rtp, ci,
+                    wallclock_hint_sec=minute_wallclock.timestamp(),
+                )
+            except Exception as e:  # noqa: BLE001 — detection must not crash
+                logger.debug("%s: abs-divergence check raised: %s",
+                             self.band_name, e)
+            if ref_sec is not None:
+                abs_div = minute_wallclock.timestamp() - ref_sec
+                self._last_abs_divergence_sec = abs_div
+                if abs(abs_div) > self._abs_div_threshold:
+                    self._abs_div_strikes += 1
+                    if self._abs_div_strikes >= self._abs_div_after:
+                        self._abs_div_strikes = 0
+                        self._abs_div_faults += 1
+                        logger.error(
+                            "TIMING FAULT rx=%s mode=wspr %s: grid anchor "
+                            "diverged %+.3fs from radiod GPS reference — "
+                            "re-correlating; INVESTIGATE (frozen bad anchor / "
+                            "clock); fault #%d",
+                            self.rx_source, self.band_name, abs_div,
+                            self._abs_div_faults,
+                        )
+                        self._resync_requested = True
+                        return
+                else:
+                    self._abs_div_strikes = 0
+
+            # ── Radiod RTP↔GPS offset-step monitor (shared epoch) ──
+            # ka9q-python's ChannelInfo.update_anchor bumps ``anchor_epoch``
+            # the instant radiod reports a different RTP↔GPS offset (the
+            # offset is fixed for the life of a radiod run, so any step is a
+            # radiod-side bug or an undetected restart).  Adopt the epoch as
+            # a baseline on first sight; when it advances, raise the STEP
+            # fault and re-correlate off the fresh anchor — recovering this
+            # band on the next clean :59→:00 boundary instead of grinding
+            # the corrupted minute through wsprd.
+            cur_epoch = getattr(ci, "anchor_epoch", None)
+            if cur_epoch is not None:
+                if self._anchor_epoch is None:
+                    self._anchor_epoch = cur_epoch
+                elif cur_epoch != self._anchor_epoch:
+                    self._origin_step_faults += 1
+                    step = getattr(ci, "last_offset_step_sec", None)
+                    logger.error(
+                        "TIMING FAULT rx=%s mode=wspr %s: radiod RTP↔GPS "
+                        "offset STEPPED %s mid-session — radiod changed its "
+                        "mapping without a (detected) restart; re-correlating; "
+                        "INVESTIGATE radiod (verify whether it actually "
+                        "restarted); fault #%d",
+                        self.rx_source, self.band_name,
+                        ("%+.3fs" % step) if step is not None else "?",
+                        self._origin_step_faults,
+                    )
+                    self._anchor_epoch = cur_epoch
+                    self._resync_requested = True
+                    return
 
         # ── Wall-clock boundary skew check (wsprdaemon-v3 loss-of-sync) ──
         # We just counted a full minute's worth of samples
@@ -590,6 +686,9 @@ class BandRecorder:
         self._initialized = False
         self._synced = False
         self._resync_requested = False
+        # Re-adopt the status anchor_epoch baseline on the next boundary so a
+        # restart-driven epoch bump doesn't immediately re-trigger a resync.
+        self._anchor_epoch = None
         self._skew_strikes = 0
         # Re-establish the steady-state skew baseline at the first boundary
         # after the upcoming re-sync (latency may have shifted).

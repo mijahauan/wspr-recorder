@@ -281,6 +281,7 @@ class WsprRecorder:
 
         sync_strategy = self.timing_service.create_sync_strategy(
             sample_rate=self.config.channel_defaults.sample_rate,
+            channel_info=channel_state.channel_info,
         )
         # Feed ka9q ChannelInfo so RtpSyncStrategy correlates via
         # rtp_to_wallclock (RTP/GPS timebase) rather than the client wall
@@ -518,7 +519,15 @@ class WsprRecorder:
 
         wsprd_path = _find(wsprd_name, "wsprd") or "wsprd"
         jt9_path = _find(jt9_name, "jt9") or "jt9"
-        wsprd_spread = _find(spread_name, "wsprd.spreading")
+        # Operator opt-out: WSPR_DISABLE_SPREAD=1 skips the second
+        # (Doppler-spreading) wsprd pass entirely, so WSPR is decoded only by
+        # the standard wsprd — one decode per cycle, ~half the WSPR decode
+        # CPU, at the cost of the spread metric and a few weak-signal spots.
+        # Default unchanged: the spread pass runs when its binary is present.
+        if os.environ.get("WSPR_DISABLE_SPREAD", "0") == "1":
+            wsprd_spread = None
+        else:
+            wsprd_spread = _find(spread_name, "wsprd.spreading")
         return wsprd_path, wsprd_spread, jt9_path
 
     def _resolve_decoder(
@@ -726,7 +735,57 @@ class WsprRecorder:
                 cycle_key, request.band_name,
                 rx_source=request.rx_source,
             )
-    
+            # Spots + noise are now in sink.db; the /dev/shm WAV is dead
+            # weight.  Evict it (and its decode by-products) NOW instead
+            # of waiting for the age-based backstop — holding hundreds of
+            # decoded WAVs for ``max_file_age_minutes`` is the dominant
+            # /dev/shm consumer and a chronic memory-pressure source on
+            # RAM-tight hosts.  See _evict_decoded_files.
+            self._evict_decoded_files(wav_path, decoder_wav, runner.work_dir)
+
+    def _evict_decoded_files(
+        self,
+        wav_path: Path,
+        decoder_wav: Optional[Path],
+        work_dir: Path,
+    ) -> None:
+        """Delete a period WAV and its decode by-products immediately
+        after decode + noise extraction, rather than leaving them for
+        the age-based ``WavWriter.cleanup_old_files`` backstop.
+
+        In the DB-direct pipeline the ``/dev/shm`` WAV is consumed ONLY
+        by the in-process wsprd/jt9 decoder and the inline noise pass
+        (``_submit_noise_for_cycle``, which runs synchronously before we
+        reach here).  Nothing external reads it: the wsprdaemon.org tar
+        ships ``wspr.spots`` + ``wspr.noise`` from ``sink.db``, not the
+        audio, and ``lsof`` confirms no other consumer.  Holding each WAV
+        for the full ``max_file_age_minutes`` therefore pins hundreds of
+        dead files in tmpfs — measured at ~2 GB of /dev/shm on a 13-band
+        triple-receiver host, enough to drive the box into global OOM.
+        Evicting at decode time keeps tmpfs at the in-flight working set.
+
+        Best-effort: every error is swallowed so a cleanup failure can
+        never disturb decoding.  ``cleanup_old_files`` /
+        ``enforce_max_files_per_band`` stay in place as the backstop for
+        any WAV whose decode bailed out before reaching this point.
+        """
+        # Real period WAV + its JSON sidecar (mirrors cleanup_old_files).
+        try:
+            wav_path.unlink(missing_ok=True)
+            wav_path.with_suffix(".json").unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug("evict: could not remove %s: %s", wav_path.name, exc)
+        # wsprd-compatible symlink + wsprd's <stem>.c2, both in .phase2.
+        if decoder_wav is not None:
+            try:
+                decoder_wav.unlink(missing_ok=True)
+                (work_dir / f"{decoder_wav.stem}.c2").unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug(
+                    "evict: could not remove decode by-products for %s: %s",
+                    decoder_wav.name, exc,
+                )
+
     def _submit_noise_for_cycle(
         self,
         request: 'DecodeRequest',
@@ -964,6 +1023,14 @@ class WsprRecorder:
         """
         await asyncio.sleep(self.STARTUP_GRACE_PERIOD)
 
+        # Recovery actions (full_reset / reprovision_stale) make blocking,
+        # synchronous ensure_channel calls (5 s timeout each) across every
+        # channel — on a flaky radiod that can exceed the 3 min systemd
+        # watchdog and SIGABRT the process mid-recovery.  Run them in the
+        # default executor so the event loop stays free to pet the watchdog
+        # (_watchdog_loop) while recovery proceeds on a worker thread.
+        loop = asyncio.get_running_loop()
+
         # source_key -> consecutive degraded-check count
         degraded_count: Dict[str, int] = {}
 
@@ -1010,7 +1077,9 @@ class WsprRecorder:
                             src_key, n,
                         )
                         try:
-                            ok = rm.full_reset()
+                            ok = await loop.run_in_executor(
+                                None, rm.full_reset
+                            )
                             if ok and rm.state.channels:
                                 degraded_count[src_key] = 0
                             else:
@@ -1044,7 +1113,9 @@ class WsprRecorder:
                     try:
                         if n >= 3:
                             # Escalation: full source reset.
-                            ok = rm.full_reset()
+                            ok = await loop.run_in_executor(
+                                None, rm.full_reset
+                            )
                             if ok:
                                 # Reconnect succeeded — give it a
                                 # full check interval before judging
@@ -1054,7 +1125,9 @@ class WsprRecorder:
                                 self._surface_radiod_diagnosis(rm)
                         else:
                             # Cheap recovery: re-provision stale channels.
-                            rm.reprovision_stale()
+                            await loop.run_in_executor(
+                                None, rm.reprovision_stale
+                            )
                     except Exception:
                         logger.exception(
                             "Channel health (%s): recovery action "
@@ -1333,6 +1406,25 @@ class WsprRecorder:
         except Exception:
             return None
 
+    async def _startup_timeout_feeder(self) -> None:
+        """Keep systemd's TimeoutStartSec from firing during a long startup.
+
+        connect()/start_streams run in worker threads (event loop stays
+        free), but on a flaky radiod connect() can take minutes — per-channel
+        5 s verify timeouts plus the provisioning spacing.  READY=1 is only
+        sent after they finish, so without this systemd's TimeoutStartSec
+        (3 min) would SIGTERM us mid-connect and loop forever.
+        ``EXTEND_TIMEOUT_USEC`` resets that start timer.  The caller cancels
+        this task once startup completes, before READY=1 hands off to
+        _watchdog_loop.
+        """
+        try:
+            while True:
+                self._sd_notify(b"EXTEND_TIMEOUT_USEC=120000000")  # +120 s
+                await asyncio.sleep(45)
+        except asyncio.CancelledError:
+            pass
+
     async def _watchdog_loop(self) -> None:
         """Pet the systemd watchdog (WATCHDOG=1), but only while RTP ingestion
         is advancing.
@@ -1550,6 +1642,10 @@ class WsprRecorder:
             # of ~1 min.  The chrony gate inside connect() is
             # process-latched (see receiver_manager) so all 3 rx
             # share the single 10-60 s chrony wait, not 3× it.
+            # Extend systemd's start timeout while the (now spaced, possibly
+            # slow on a flaky radiod) provisioning runs; cancelled once
+            # MultiStreams are up, before READY=1.
+            startup_feeder = asyncio.create_task(self._startup_timeout_feeder())
             logger.info("Connecting to radiod (parallel across %d source(s))...",
                         len(self.receiver_managers))
             keys = list(self.receiver_managers.keys())
@@ -1573,6 +1669,7 @@ class WsprRecorder:
                     "All %d source(s) failed to connect — aborting startup",
                     len(self.receiver_managers),
                 )
+                startup_feeder.cancel()
                 return
 
             # Start shared-socket MultiStreams (begins sample delivery)
@@ -1586,6 +1683,10 @@ class WsprRecorder:
                 ],
                 return_exceptions=True,
             )
+
+            # Startup provisioning finished — stop extending the start
+            # timeout; _watchdog_loop (created below) takes over after READY=1.
+            startup_feeder.cancel()
 
             # Start IPC server
             await self._setup_ipc_server()

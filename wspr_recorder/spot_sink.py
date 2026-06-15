@@ -1296,12 +1296,21 @@ class CycleBatcher:
             f"{band}:{len(spots)}"
             for band, spots in batch.bands.items()
         )
+        # Average decoder dt across the cycle's spots, emitted inline (same
+        # rationale as bands above) so `smd watch wspr` can show it without
+        # racing the cross-rx dedup.  Averaged over many spots the
+        # transmitters' own timing errors cancel, so this approximates the
+        # recorder's slot-anchor offset from true UTC.
+        _dts = [s.dt for spots in batch.bands.values() for s in spots
+                if getattr(s, "dt", None) is not None]
+        avg_dt = (sum(_dts) / len(_dts)) if _dts else None
         logger.info(
             "cycle UTC %s:%s rx=%s → %d spots in wspr.spots, "
             "%d noise rows in wspr.noise (%d bands, sqlite write %d ms)"
-            "%s",
+            "%s%s",
             hhmm[:2], hhmm[2:], rx_label, n, n_noise,
             len(batch.bands) or len(batch.noise), elapsed_ms,
+            f" dt={avg_dt:+.2f}" if avg_dt is not None else "",
             f" bands=[{bands_breakdown}]" if bands_breakdown else "",
         )
         # Wake the in-process uploader.  No-op if no callback is
