@@ -14,7 +14,13 @@ WatchdogSec=180
 NotifyAccess=main
 
 EnvironmentFile=-/etc/sigmond/coordination.env
-EnvironmentFile=-/etc/wspr-recorder/env/%I.env
+# %i (escaped instance), NOT %I.  systemd unescapes '-' -> '/' in %I, so a
+# dashed instance like B4-100-rx888mk2 resolves %I to
+# env/B4/100/rx888mk2.env (which does not exist).  With the leading '-' the
+# missing file is skipped SILENTLY, so the env never loads: WD_DECODE_VIA_DB
+# is unset, SpotSink is disabled, and the receiver RECORDS but never DECODES
+# (bee1/bee2 had no dashes so they were unaffected).  Fixed 2026-06-16.
+EnvironmentFile=-/etc/wspr-recorder/env/%i.env
 
 # Limit glibc malloc arenas to 2. Default is 8*ncpus, which on a 16-core
 # host fragments heavily when F15/F30 slices allocate+free 86-172 MB

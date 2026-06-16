@@ -1472,6 +1472,23 @@ class WsprRecorder:
             rx_call=rx_call, rx_grid=rx_grid,
             reporter_id=self._reporter_id,
         )
+        # Make the decode mode LOUD at startup.  A silently-disabled SpotSink
+        # (the unit's EnvironmentFile failed to load, so WD_DECODE_VIA_DB is
+        # unset) is exactly how a receiver ends up RECORDING WAVs but never
+        # DECODING — never let that be silent again (see the %i note in
+        # systemd/wspr-recorder@.service).
+        if self.spot_sink.enabled:
+            logger.info(
+                "decode: DB-direct via SpotSink ENABLED (WD_DECODE_VIA_DB set)"
+            )
+        else:
+            logger.warning(
+                "decode: DB-direct SpotSink DISABLED (WD_DECODE_VIA_DB unset/0) "
+                "— this receiver RECORDS but will NOT decode unless a legacy "
+                "wd-decode@* chain is running. If you expected DB-direct decode, "
+                "the unit's EnvironmentFile likely did not load (instance-name "
+                "escaping — see the note in systemd/wspr-recorder@.service)."
+            )
         if self.spot_sink.enabled:
             # Persist the callsign-hash table to disk so the (call,
             # hash) mappings learned from <call> announcements survive
