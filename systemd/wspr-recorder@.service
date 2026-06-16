@@ -14,13 +14,19 @@ WatchdogSec=180
 NotifyAccess=main
 
 EnvironmentFile=-/etc/sigmond/coordination.env
-# %i (escaped instance), NOT %I.  systemd unescapes '-' -> '/' in %I, so a
-# dashed instance like B4-100-rx888mk2 resolves %I to
-# env/B4/100/rx888mk2.env (which does not exist).  With the leading '-' the
-# missing file is skipped SILENTLY, so the env never loads: WD_DECODE_VIA_DB
-# is unset, SpotSink is disabled, and the receiver RECORDS but never DECODES
-# (bee1/bee2 had no dashes so they were unaffected).  Fixed 2026-06-16.
+# Load the per-instance env by BOTH the escaped (%i) and unescaped (%I)
+# instance name, because neither specifier covers every reporter-id shape
+# on its own and a silently-skipped env file disables decode (WD_DECODE_VIA_DB
+# unset -> SpotSink off -> the receiver RECORDS but never DECODES):
+#   * %I unescapes '-' -> '/', so a HYPHENATED instance (B4-100-rx888mk2,
+#     or an SSID like W1ABC-5) only resolves via %i.   [Rob, 2026-06-16]
+#   * systemd escapes '=' -> '\x3d', so a '='-FORM instance (AC0G=S — the
+#     path-safe storage form of reporter id AC0G/S) only resolves via %I.
+# Both lines are optional ('-'); the one that matches loads, the other is
+# skipped.  Keeps decode enabled for every instance-name shape.  (The one
+# residual gap is a reporter id that mixes BOTH '=' and '-'.)
 EnvironmentFile=-/etc/wspr-recorder/env/%i.env
+EnvironmentFile=-/etc/wspr-recorder/env/%I.env
 
 # Limit glibc malloc arenas to 2. Default is 8*ncpus, which on a 16-core
 # host fragments heavily when F15/F30 slices allocate+free 86-172 MB
