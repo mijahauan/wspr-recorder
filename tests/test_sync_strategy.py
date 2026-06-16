@@ -327,6 +327,26 @@ class TestRtpSyncStrategyChannelInfo:
         strategy.should_start_minute(100_000, 240, utc(second=58))
         assert strategy.correlation_source == "authority"
 
+    def test_channel_info_is_readable_via_public_property(self):
+        """Regression: BandRecorder's RTP-referenced timing watchdogs reach
+        the live snapshot through ``getattr(strategy, "channel_info", None)``.
+        The setter stores it on ``_channel_info``; if the public read
+        surface is missing, the getattr yields None and the absolute-
+        divergence ("frozen bad anchor") + offset-step monitors silently
+        never run. Keep the public property wired."""
+        strategy = RtpSyncStrategy(SAMPLE_RATE)
+        assert getattr(strategy, "channel_info", None) is None
+        ci = _FakeChannelInfo()
+        strategy.set_channel_info(ci)
+        assert getattr(strategy, "channel_info", None) is ci
+
+    def test_channel_info_passed_at_construction_is_readable(self):
+        """The kwarg path (TimingService.create_sync_strategy) must expose
+        the same public property as the setter path."""
+        ci = _FakeChannelInfo()
+        strategy = RtpSyncStrategy(SAMPLE_RATE, channel_info=ci)
+        assert getattr(strategy, "channel_info", None) is ci
+
 
 class TestRtpSyncStrategyReset:
     """Phase 2 fix 2026-05-19: RtpSyncStrategy.reset() forgets stale correlation.

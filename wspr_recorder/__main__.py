@@ -92,9 +92,9 @@ def _radiod_is_local(status_address: str, conf_dir: str = "/etc/radio") -> bool:
     ``radiod@<instance>.service``); a remote receiver (bee1 etc.) has
     neither here.  The instance is the status address with its
     ``-status.local`` suffix stripped — e.g. ``B4-100-rx888mk2-status.local``
-    → ``radiod@B4-100-rx888mk2.conf``.  Used to default the wall-clock
-    skew monitor: ON for local (direct RX888 clock-wedge), OFF for remote
-    (benign network jitter would false-trip it).
+    → ``radiod@B4-100-rx888mk2.conf``.  (Retained as a general local/remote
+    discriminator; the wall-clock skew monitor it once gated has been
+    replaced by BandRecorder's tier-sourced integrity alarm.)
     """
     addr = (status_address or "").strip()
     if not addr:
@@ -211,47 +211,13 @@ class WsprRecorder:
         from .decode_pool import build_decode_pool
         self.executor = build_decode_pool()
 
-        # Wall-clock WAV-boundary skew monitor (wsprdaemon-v3 loss-of-sync
-        # detector).  Each band checks at every minute boundary that it
-        # reached 720k samples within WSPR_SYNC_SKEW_SEC (deviation from
-        # the band's steady-state baseline) of the predicted UTC minute; a
-        # departure means lost samples / sample-clock drift desynced it
-        # from the WSPR cycle (strong signal, zero decodes — the failure
-        # that silenced B4-100 for ~3 h on 2026-05-30), so the band
-        # discards and re-syncs.
-        #
-        # Default is AUTO: ON for a LOCAL radiod (direct RX888 whose sample
-        # clock can wedge and make WAVs undecodable — the case this
-        # catches) and OFF for a REMOTE receiver (RTP arrives over the
-        # network with benign jitter that would false-trip it and resync-
-        # loop, as bee1 did 2026-05-31).  WSPR_SYNC_MONITOR=1/0 forces it.
-        _mon = os.environ.get("WSPR_SYNC_MONITOR", "").strip().lower()
-        if _mon != "":
-            self._resync_on_skew = _mon not in ("0", "false", "no", "off")
-        else:
-            try:
-                _local = _radiod_is_local(self.config.radiod.status_address)
-            except Exception:
-                _local = False
-            self._resync_on_skew = _local
-            logger.info(
-                "skew monitor: auto-%s (radiod %s)",
-                "ON" if _local else "OFF",
-                "local" if _local else "remote",
-            )
-        try:
-            self._sync_skew_threshold = float(
-                os.environ.get("WSPR_SYNC_SKEW_SEC") or 0.75
-            )
-        except ValueError:
-            self._sync_skew_threshold = 0.75
-        try:
-            self._sync_resync_after = max(
-                1, int(os.environ.get("WSPR_SYNC_RESYNC_AFTER") or 2)
-            )
-        except ValueError:
-            self._sync_resync_after = 2
-        
+        # GPSDO/RTP-ruler integrity alarm (tier-sourced) replaces the old
+        # wall-clock skew monitor.  BandRecorder reads the timing tier from
+        # the authority reader attached to each sync strategy and raises a
+        # fault — never a resync — when it collapses below WSPR_TIER_FLOOR
+        # (default T2).  No per-recorder wiring needed here; tuning is via
+        # WSPR_TIER_FLOOR / WSPR_TIER_ALARM_AFTER, read in BandRecorder.
+
         # State
         self._running = False
         self._shutdown_event: Optional[asyncio.Event] = None
@@ -298,9 +264,6 @@ class WsprRecorder:
             executor=self.executor,
             sync_strategy=sync_strategy,
             rx_source=source_key,
-            resync_on_skew=self._resync_on_skew,
-            sync_skew_threshold_sec=self._sync_skew_threshold,
-            sync_resync_after=self._sync_resync_after,
         )
         self.band_recorders[(source_key, ssrc)] = recorder
 

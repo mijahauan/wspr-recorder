@@ -147,6 +147,20 @@ class RtpSyncStrategy(SyncStrategy):
         counter / snapshot change)."""
         self._channel_info = channel_info
 
+    @property
+    def channel_info(self):
+        """Live ka9q ChannelInfo (or None if not yet provided).
+
+        Read-only public surface so consumers can reach the snapshot via
+        ``getattr(strategy, "channel_info", None)``.  BandRecorder's
+        RTP-referenced timing watchdogs (the absolute-divergence "frozen
+        bad anchor" detector and the radiod RTP↔GPS offset-step monitor
+        in ``_on_minute_boundary``) gate on this; without the property they
+        read ``None`` and both checks silently never run.  Non-RTP
+        strategies legitimately lack the attribute, so the getattr default
+        keeps them disabled there."""
+        return self._channel_info
+
     def _unwrap(self, ts: int) -> int:
         """Convert 32-bit wrapping RTP timestamp to monotonic 64-bit value."""
         if self._last_raw is not None:

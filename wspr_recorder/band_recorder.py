@@ -48,12 +48,11 @@ class GapEvent:
 RING_HEADROOM_SECONDS = 600
 
 
-# EMA weight for tracking a band's steady-state boundary skew (its
-# "baseline" — dominated by delivery latency, which for a remote receiver
-# is a constant ~1 s, not a fault).  Small so a genuine sample-clock drift
-# still pulls away from the baseline faster than the baseline can follow
-# it, while a constant offset is absorbed within a couple of boundaries.
-_SKEW_BASELINE_ALPHA = 0.1
+# Timing-authority tier ranks (FIRST-PRINCIPLES §2).  Higher = better
+# RTP→UTC authority.  The GPSDO/RTP-ruler integrity alarm fires when the
+# active tier drops below the configured floor — see _on_minute_boundary.
+_TIER_RANK = {"T6": 6, "T5": 5, "T4": 4, "T3": 3, "T2": 2, "T1": 1, "T0": 0}
+_TIER_NAME = {rank: name for name, rank in _TIER_RANK.items()}
 
 
 @dataclass
@@ -179,32 +178,24 @@ class BandRecorder:
         # legacy single-source contexts where the value isn't yet
         # threaded through.
         rx_source: str = "",
-        # Wall-clock WAV-boundary skew monitor (wsprdaemon-v3 loss-of-sync
-        # detector).  When True, each minute boundary measures the skew
-        # between ``now()`` and the grid-predicted UTC minute, and trips
-        # when that skew DEVIATES from the band's steady-state baseline by
-        # more than ``sync_skew_threshold_sec``.  Using the deviation (not
-        # the absolute skew) is essential: a remote receiver's RTP arrives
-        # with a constant delivery latency (~1 s) that is NOT a fault, so
-        # the baseline absorbs it; only a sample-clock drift or a lost-
-        # sample jump departs from the baseline and re-syncs.  OFF by
-        # default so the synthetic-clock unit tests (which feed grid
-        # timestamps far from real ``now()``) don't trip; the production
-        # recorder turns it on.  ``now_fn`` is injectable so tests can
-        # drive the monitor with a controlled clock.
-        resync_on_skew: bool = False,
-        sync_skew_threshold_sec: float = 0.75,
-        # Re-sync only after this many CONSECUTIVE boundaries exceed the
-        # skew threshold.  A transient CPU spike (e.g. the top-of-hour
-        # F30 wave) can delay the receiver-thread callback and inflate a
-        # single boundary's measured skew even though the audio is
-        # correctly RTP-timestamped and fine; a genuine sample-clock /
-        # lost-cycle fault skews EVERY boundary (and grows).  Requiring
-        # consecutive strikes keeps a lone late callback from discarding
-        # a good cycle, at the cost of one extra minute of detection
-        # latency.  A lone strike emits its WAV normally.
-        sync_resync_after: int = 2,
-        now_fn: Optional[Callable[[], datetime]] = None,
+        # Authority reader for the GPSDO/RTP-ruler integrity alarm.  When
+        # None, the recorder reaches the one already attached to the sync
+        # strategy (production wiring); tests inject a fake directly.  The
+        # alarm reads the adjudicated timing tier — never the host wall
+        # clock — and raises a fault (not a resync) when the tier collapses
+        # below ``tier_floor``.  Inert when no reader / no authority.
+        authority_reader=None,
+        tier_floor: Optional[str] = None,
+        tier_alarm_after: Optional[int] = None,
+        # Cold-start config check (opt-in).  When the operator declares the
+        # tier this station's hardware SHOULD reach (e.g. "T5" for a local
+        # GPSDO+PPS RX888), the recorder raises a one-shot fault if the best
+        # tier seen within the warmup grace never reaches it — i.e. the
+        # expected GPSDO/PPS authority is missing or misconfigured.  Unset
+        # (the default) disables the check, so standalone / Fusion-only
+        # stations that legitimately run low are never alarmed.
+        expect_tier: Optional[str] = None,
+        tier_warmup_boundaries: Optional[int] = None,
     ):
         self.ssrc = ssrc
         self.frequency_hz = frequency_hz
@@ -216,30 +207,61 @@ class BandRecorder:
         self.sync_strategy = sync_strategy or FallbackSyncStrategy(sample_rate)
         self.rx_source = rx_source
 
-        self._resync_on_skew = resync_on_skew
-        self._sync_skew_threshold = float(sync_skew_threshold_sec)
-        self._sync_resync_after = max(1, int(sync_resync_after))
-        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
-        # Set by _on_minute_boundary when the skew check trips; consumed
-        # by _add_samples, which performs the actual reset() (so the ring
+        # Set by _on_minute_boundary's RTP-referenced detectors (abs-div /
+        # offset-step) when they request a re-sync; consumed by
+        # _add_samples, which performs the actual reset() (so the ring
         # isn't recreated out from under the in-progress write loop).
         self._resync_requested = False
-        # Consecutive over-threshold boundaries; reset to 0 by any
-        # in-tolerance boundary.  A re-sync fires at _sync_resync_after.
-        self._skew_strikes = 0
-        # Per-band steady-state boundary skew (EMA), established at the
-        # first boundary after each (re)sync.  The monitor trips on the
-        # DEVIATION of the current skew from this baseline, not on the
-        # absolute skew — so a remote receiver's constant delivery latency
-        # (a stable ~1 s offset) is absorbed and never resyncs, while a
-        # sample-clock drift or lost-sample jump departs from it and does.
-        self._skew_baseline: Optional[float] = None
-        # Observability: cumulative skew-triggered re-syncs (survives
-        # reset()), the most recent raw boundary skew, and its deviation
-        # from the baseline (both seconds).
-        self._skew_resyncs = 0
-        self._last_skew_sec = 0.0
-        self._last_skew_deviation_sec = 0.0
+        # GPSDO/RTP-ruler integrity alarm (tier-sourced).  Replaces the
+        # wall-clock skew detector: the RTP counter is a calibrated ruler
+        # only while the GPSDO holds the sample rate (FIRST-PRINCIPLES §4).
+        # When the adjudicated timing tier collapses below the floor the
+        # rate is uncalibrated and WSPR windows misalign — we raise a LOUD
+        # fault but do NOT resync (re-anchoring against a broken ruler is
+        # futile; the operator must restore GPSDO/authority).  Sourced from
+        # the authority tier, never from host now().
+        self._authority_reader = (
+            authority_reader
+            if authority_reader is not None
+            else getattr(self.sync_strategy, "authority_reader", None)
+        )
+        self._tier_floor = (
+            tier_floor or os.environ.get("WSPR_TIER_FLOOR", "T2")
+        ).strip().upper()
+        self._tier_floor_rank = _TIER_RANK.get(self._tier_floor, 2)
+        self._tier_alarm_after = max(1, int(
+            tier_alarm_after
+            if tier_alarm_after is not None
+            else os.environ.get("WSPR_TIER_ALARM_AFTER", "2")
+        ))
+        # Consecutive below-floor reads; reset by any at/above-floor read.
+        self._tier_strikes = 0
+        # Armed once a healthy (>= floor) tier is seen this session, so we
+        # alarm on a DEGRADATION rather than on a station that is simply
+        # always low-tier (or standalone with no authority to read).
+        self._tier_seen_ok = False
+        # Observability (survive reset()).
+        self._tier_faults = 0
+        self._last_tier_active: Optional[str] = None
+        # Cold-start "expected GPSDO/authority missing" check (opt-in via
+        # WSPR_EXPECT_TIER).  Distinct from the runtime floor: the floor is
+        # a degradation detector (was healthy, then dropped); this is a
+        # startup config check (the expected hardware never came up).
+        _expect = (expect_tier or os.environ.get("WSPR_EXPECT_TIER") or "").strip().upper()
+        self._expect_tier = _expect or None
+        self._expect_rank = _TIER_RANK.get(_expect) if _expect else None
+        self._tier_warmup = max(1, int(
+            tier_warmup_boundaries
+            if tier_warmup_boundaries is not None
+            else os.environ.get("WSPR_TIER_WARMUP_BOUNDARIES", "5")
+        ))
+        # Monotonic boundary counter + best tier rank seen, for the
+        # one-shot cold-start verdict.  All persist across reset() — the
+        # startup check is assessed once over the session warmup, not
+        # re-armed by a stream restore.
+        self._boundaries_since_start = 0
+        self._best_tier_rank: Optional[int] = None
+        self._coldstart_faulted = False
         # Absolute-divergence detector: compares the grid projection against
         # radiod's FRESH GPS reference (rtp_to_wallclock on the
         # StatusListener-refreshed channel_info).  Unlike the deviation check
@@ -397,11 +419,11 @@ class BandRecorder:
             remaining = remaining[chunk_size:]
             if self._ring.current_minute_sample_count >= self._samples_per_minute:
                 self._on_minute_boundary()
-                # The skew monitor asked for a re-sync: drop the rest of
-                # this batch and reset.  The next packets re-anchor on the
-                # next clean minute boundary via the sync strategy, which
-                # is exactly the wsprdaemon-v3 "wait for the next :59→:00
-                # transition and start there" recovery.
+                # An RTP-referenced detector (abs-divergence / offset-step)
+                # asked for a re-sync: drop the rest of this batch and
+                # reset.  The next packets re-anchor on the next clean
+                # minute boundary via the sync strategy — the wsprdaemon-v3
+                # "wait for the next :59→:00 transition" recovery.
                 if self._resync_requested:
                     self._resync_requested = False
                     self.reset()
@@ -493,66 +515,86 @@ class BandRecorder:
                     self._resync_requested = True
                     return
 
-        # ── Wall-clock boundary skew check (wsprdaemon-v3 loss-of-sync) ──
-        # We just counted a full minute's worth of samples
-        # (``_samples_per_minute`` = 720k @ 12 kHz).  In a real-time,
-        # cycle-aligned stream that 720,000th sample lands at the top of a
-        # UTC minute, so ``now`` should be within a few hundred ms of the
-        # grid-predicted boundary ``minute_wallclock``.  A larger skew
-        # means we accumulated the minute's samples over the WRONG amount
-        # of real time — samples were lost or the sample clock drifted —
-        # so this band is no longer phase-locked to the WSPR cycle.  The
-        # audio still has strong signal (so a noise/zero-spots check would
-        # miss it), but wsprd can't decode a window that doesn't start on
-        # the cycle boundary.  Discard and re-sync on the next clean
-        # :59→:00 transition (reset() clears the anchor; the sync strategy
-        # re-anchors on the next boundary — done in _add_samples so we
-        # don't recreate the ring mid-write).
-        if self._resync_on_skew and self._synced:
-            skew = (self._now_fn() - minute_wallclock).total_seconds()
-            self._last_skew_sec = skew
-            if self._skew_baseline is None:
-                # First boundary after (re)sync: adopt the current skew as
-                # the band's steady-state baseline (delivery latency). No
-                # deviation yet, so never trips here.
-                self._skew_baseline = skew
-                deviation = 0.0
-            else:
-                deviation = skew - self._skew_baseline
-            self._last_skew_deviation_sec = deviation
-            if abs(deviation) > self._sync_skew_threshold:
-                self._skew_strikes += 1
-                logger.warning(
-                    "%s: WAV boundary skew %.3fs deviates %+.3fs from "
-                    "baseline %.3fs (> %.3fs) [strike %d/%d]",
-                    self.band_name, skew, deviation, self._skew_baseline,
-                    self._sync_skew_threshold,
-                    self._skew_strikes, self._sync_resync_after,
+        # ── GPSDO / RTP-ruler integrity alarm (tier-sourced) ──
+        # Replaces the wall-clock skew detector.  The RTP counter is the
+        # ruler ONLY while the GPSDO disciplines the sample rate
+        # (FIRST-PRINCIPLES §4); once the adjudicated timing tier collapses
+        # to T1/T0 the rate is no longer calibrated and WSPR windows
+        # silently misalign even though the audio looks strong (the B4-100
+        # zero-decode failure).  We detect that from the authority tier —
+        # NEVER from host now() — and raise a LOUD fault.  We deliberately
+        # do NOT resync: re-anchoring against a broken ruler fixes nothing;
+        # the operator must restore GPSDO lock / hf-timestd authority.
+        # Standalone (no authority.json) → no tier to read → inert, which
+        # is the operator's documented responsibility at that posture.
+        if self._synced and self._authority_reader is not None:
+            snap = None
+            try:
+                snap = self._authority_reader.read()
+            except Exception as e:  # noqa: BLE001 — detection must not crash
+                logger.debug("%s: tier read raised: %s", self.band_name, e)
+            active = snap.t_level_active if snap is not None else None
+            self._last_tier_active = active
+            rank = _TIER_RANK.get(active) if active is not None else None
+            self._boundaries_since_start += 1
+            if rank is not None and (
+                self._best_tier_rank is None or rank > self._best_tier_rank
+            ):
+                self._best_tier_rank = rank
+
+            # ── Cold-start: expected GPSDO/PPS authority missing? (opt-in) ──
+            # One-shot.  If the operator declared an expected tier and the
+            # best seen across the warmup grace never reaches it (including
+            # "no authority ever published" → best is None), the hardware
+            # that's supposed to be here isn't.  LOUD fault, no resync.
+            if (
+                self._expect_rank is not None
+                and not self._coldstart_faulted
+                and self._boundaries_since_start >= self._tier_warmup
+                and (self._best_tier_rank is None
+                     or self._best_tier_rank < self._expect_rank)
+            ):
+                self._coldstart_faulted = True
+                self._tier_faults += 1
+                best_name = (
+                    _TIER_NAME.get(self._best_tier_rank, "?")
+                    if self._best_tier_rank is not None else "none"
                 )
-                if self._skew_strikes >= self._sync_resync_after:
-                    # Sustained DEPARTURE from the steady-state skew —
-                    # sample loss / sample-clock drift has desynced this
-                    # band from the WSPR cycle (a constant offset would not
-                    # deviate).  Discard and re-sync on the next clean
-                    # :59→:00 boundary; the baseline re-establishes there.
-                    self._skew_resyncs += 1
-                    self._skew_strikes = 0
-                    logger.warning(
-                        "%s: sustained skew deviation — re-syncing this "
-                        "band from the next minute boundary [resync #%d]",
-                        self.band_name, self._skew_resyncs,
+                logger.error(
+                    "TIMING FAULT rx=%s mode=wspr %s: expected timing tier "
+                    ">= %s but best seen in the first %d boundaries was %s — "
+                    "expected GPSDO/PPS authority MISSING or misconfigured at "
+                    "startup; NOT resyncing; INVESTIGATE GPSDO lock / "
+                    "hf-timestd / WSPR_EXPECT_TIER; fault #%d",
+                    self.rx_source, self.band_name, self._expect_tier,
+                    self._tier_warmup, best_name, self._tier_faults,
+                )
+
+            if rank is not None and rank >= self._tier_floor_rank:
+                # Healthy tier — arm the degradation alarm, clear strikes.
+                self._tier_seen_ok = True
+                self._tier_strikes = 0
+            elif rank is not None and self._tier_seen_ok:
+                # Dropped below floor after having been healthy this session.
+                self._tier_strikes += 1
+                logger.warning(
+                    "%s: timing tier degraded to %s (< floor %s) [strike %d/%d]",
+                    self.band_name, active, self._tier_floor,
+                    self._tier_strikes, self._tier_alarm_after,
+                )
+                if self._tier_strikes >= self._tier_alarm_after:
+                    self._tier_strikes = 0
+                    self._tier_faults += 1
+                    logger.error(
+                        "TIMING FAULT rx=%s mode=wspr %s: GPSDO/authority "
+                        "tier collapsed to %s (< floor %s) — RTP sample rate "
+                        "no longer a calibrated ruler; WSPR windows will "
+                        "misalign. NOT resyncing (re-anchoring against a "
+                        "broken ruler is futile); INVESTIGATE GPSDO lock / "
+                        "hf-timestd authority; fault #%d",
+                        self.rx_source, self.band_name, active,
+                        self._tier_floor, self._tier_faults,
                     )
-                    self._resync_requested = True
-                    return
-                # Lone strike: could be a transient callback delay, and
-                # the audio may be fine — emit this minute normally, and
-                # do NOT move the baseline toward this outlier.
-            else:
-                self._skew_strikes = 0
-                # In tolerance: slowly track legitimate drift in the
-                # steady-state latency so it doesn't accumulate into a
-                # false trip, using a small EMA weight.
-                self._skew_baseline += _SKEW_BASELINE_ALPHA * deviation
 
         # Close the minute in the ring buffer
         self._ring.close_minute(minute_wallclock, minute_rtp)
@@ -653,12 +695,14 @@ class BandRecorder:
         stats["sync_tier"] = getattr(self.sync_strategy, 'tier', None)
         stats["decode_modes"] = [m.value for m in self._decode_modes]
         stats["minute_count"] = self._minute_count
-        # Loss-of-sync monitor observability.
-        stats["skew_resyncs"] = self._skew_resyncs
-        stats["last_skew_sec"] = round(self._last_skew_sec, 3)
-        stats["last_skew_deviation_sec"] = round(self._last_skew_deviation_sec, 3)
-        stats["skew_baseline_sec"] = (
-            round(self._skew_baseline, 3) if self._skew_baseline is not None else None
+        # GPSDO/RTP-ruler integrity alarm observability (tier-sourced).
+        stats["timing_tier_active"] = self._last_tier_active
+        stats["timing_tier_floor"] = self._tier_floor
+        stats["timing_tier_faults"] = self._tier_faults
+        stats["timing_tier_expected"] = self._expect_tier
+        stats["timing_tier_best"] = (
+            _TIER_NAME.get(self._best_tier_rank)
+            if self._best_tier_rank is not None else None
         )
         return stats
 
@@ -689,10 +733,9 @@ class BandRecorder:
         # Re-adopt the status anchor_epoch baseline on the next boundary so a
         # restart-driven epoch bump doesn't immediately re-trigger a resync.
         self._anchor_epoch = None
-        self._skew_strikes = 0
-        # Re-establish the steady-state skew baseline at the first boundary
-        # after the upcoming re-sync (latency may have shifted).
-        self._skew_baseline = None
+        # Clear tier strikes; _tier_seen_ok and _tier_faults persist (a
+        # stream restore doesn't change the GPSDO/authority tier).
+        self._tier_strikes = 0
         self._minute_count = 0
         self._first_wallclock = None
         self._first_rtp_timestamp = None
