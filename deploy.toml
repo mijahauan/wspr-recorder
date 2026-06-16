@@ -21,6 +21,11 @@ edit = ["/usr/local/bin/wspr-recorder", "config", "edit"]
 # legacy wsprdaemon hosts (with the bash chain) don't double-decode.
 [contract.instance_env]
 WD_DECODE_VIA_DB = "1"
+# Reporter call for wsprnet / wsprdaemon uploads, derived per-instance by
+# sigmond from the reporter id: {reporter_call} expands to the display form
+# (AC0G=S -> AC0G/S) so the path-safe internal '=' never reaches wsprnet
+# (the upload path sends the receiver call verbatim).
+WD_RECEIVER_CALL = "{reporter_call}"
 
 [build]
 steps = [
