@@ -135,20 +135,3 @@ description  = "WSPR/FST4W sub-band channels"
 per_instance = true
 parser_file  = "wspr_recorder/sigmond_tui.py"
 parser_attr  = "parse_receiver_channels"
-
-# --- Upload-readiness declarations (CONTRACT §20) -------------------------
-[[contract.upload]]
-destination  = "wsprnet.org"
-scope        = "instance"
-enable_flag  = "WSPR_USE_HS_UPLOADER"
-requires     = ["WD_RECEIVER_CALL", "WD_RECEIVER_GRID", "WD_UPLOAD_WSPRNET_DIR"]
-register_url = "wsprnet.org (no account needed; spots are keyed on the reporter callsign)"
-
-[[contract.upload]]
-destination  = "wsprdaemon.org"
-scope        = "instance"
-enable_flag  = "WSPR_USE_HS_UPLOADER"
-requires     = ["WD_RECEIVER_CALL", "WD_RECEIVER_GRID", "WD_SFTP_SERVERS", "WD_SFTP_USER", "WD_UPLOAD_WSPRDAEMON_DIR"]
-credential   = "/etc/hs-uploader/keys/id_ed25519"
-cred_env     = "HS_UPLOADER_SSH_KEY_FILE"
-register_url = "wsprdaemon.org (SFTP account + enrolled key; contact the wsprdaemon.org operators)"
