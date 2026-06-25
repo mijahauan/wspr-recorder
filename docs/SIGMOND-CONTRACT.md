@@ -366,7 +366,7 @@ the top of the canonical doc.
 |---|---|---|
 | 0.1.0 (current) | 0.4 | Greenfield v0.4 adoption, PR #1 merged 2026-04-13 ([`c0f804a`][c0f804a]). Post-merge retrofit added `RADIOD_<ID>_STATUS` override, `RADIOD_<ID>_CHAIN_DELAY_NS` surfacing, §12.5 Pattern A install guard, and §12.6 ka9q-python version-lag check. Not yet deployed to production. |
 
-[contract]: https://github.com/mijahauan/sigmond/blob/main/docs/CLIENT-CONTRACT.md
-[c0f804a]: https://github.com/mijahauan/wspr-recorder/commit/c0f804a
-[80a7f33]: https://github.com/mijahauan/wspr-recorder/commit/80a7f33
-[830cef7]: https://github.com/mijahauan/wspr-recorder/commit/830cef7
+[contract]: https://github.com/HamSCI/sigmond/blob/main/docs/CLIENT-CONTRACT.md
+[c0f804a]: https://github.com/HamSCI/wspr-recorder/commit/c0f804a
+[80a7f33]: https://github.com/HamSCI/wspr-recorder/commit/80a7f33
+[830cef7]: https://github.com/HamSCI/wspr-recorder/commit/830cef7

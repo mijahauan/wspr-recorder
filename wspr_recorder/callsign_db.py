@@ -277,7 +277,7 @@ class CallsignDB:
 
     # ------------------------------------------------------------------
     # Hash algorithms — delegated to the canonical `callhash` library
-    # (github.com/mijahauan/callhash, also used by psk-recorder +
+    # (github.com/HamSCI/callhash, also used by psk-recorder +
     # meteor-scatter) for cross-tool consistency.  The pre-Phase-7
     # in-tree implementation produced DIFFERENT hash22 values from
     # callhash and wsprd's own internal hash — verified KX6H giving

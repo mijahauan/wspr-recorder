@@ -57,8 +57,8 @@ wspr-recorder = "wspr_recorder.cli:main"
 wspr-ctl = "wspr_recorder.wspr_ctl:main"
 
 [project.urls]
-Homepage = "https://github.com/mijahauan/wspr-recorder"
-Repository = "https://github.com/mijahauan/wspr-recorder"
+Homepage = "https://github.com/HamSCI/wspr-recorder"
+Repository = "https://github.com/HamSCI/wspr-recorder"
 
 [tool.setuptools.packages.find]
 where = ["."]

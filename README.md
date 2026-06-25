@@ -61,7 +61,7 @@ variables in the unit's env file (see [docs/CONFIG.md](docs/CONFIG.md)):
 ## Quickstart
 
 ```bash
-git clone https://github.com/mijahauan/wspr-recorder /opt/git/sigmond/wspr-recorder
+git clone https://github.com/HamSCI/wspr-recorder /opt/git/sigmond/wspr-recorder
 sudo /opt/git/sigmond/wspr-recorder/install.sh
 sudoedit /etc/wspr-recorder/config.toml   # set status_address, bands
 sudo systemctl start wspr-recorder@<radiod_id>
@@ -125,4 +125,4 @@ surfaced in `inventory --json` only).
 MIT. See [LICENSE](LICENSE). Author: Michael Hauan, AC0G.
 
 [ka9q]: https://github.com/ka9q/ka9q-radio
-[contract]: https://github.com/mijahauan/sigmond/blob/main/docs/CLIENT-CONTRACT.md
+[contract]: https://github.com/HamSCI/sigmond/blob/main/docs/CLIENT-CONTRACT.md
