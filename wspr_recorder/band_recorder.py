@@ -16,6 +16,7 @@ from typing import Optional, Callable, List, Tuple
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
+from ka9q import rtp_to_utc
 from .sync_strategy import SyncStrategy, FallbackSyncStrategy
 from .decode_mode import (
     DecodeMode, DECODE_MODE_PERIODS,
@@ -419,25 +420,57 @@ class BandRecorder:
         """Called when samples_per_minute samples have been written."""
         self._minute_count += 1
 
-        # Compute this minute's wallclock and RTP timestamp via grid propagation.
-        # The anchor (`_first_wallclock`) is whatever the sync strategy set at
-        # startup — typically rtp+offset via AuthorityReader.  After that, the
-        # grid is GPSDO-disciplined: minute N is anchor + N*60s, full stop.
-        # No wall-clock-now() comparison — METROLOGY.md §4.5 RTP-reference
-        # invariant: timing is hf-timestd's job, not the client's.
-        minute_wallclock = self._first_wallclock + timedelta(seconds=60 * self._minute_count)
+        # Compute this minute's RTP timestamp via grid propagation.  The RTP
+        # grid is sample-accurate by construction: minute N starts exactly
+        # N*720000 samples after the anchor RTP timestamp.  This is the audio
+        # window the ring will slice — it must NOT move.
         minute_rtp = (
             (self._first_rtp_timestamp + self._minute_count * self._samples_per_minute) & 0xFFFFFFFF
         )
 
-        # We deliberately do NOT compare the grid against radiod's live status
-        # feed per boundary.  The grid is anchored once off the RTP timestamp
-        # and is GPSDO-disciplined (minute N = anchor + N*60s); re-reading the
-        # StatusListener-refreshed channel_info and re-correlating on any
-        # divergence merely chases status-feed jitter (a busy radiod's
-        # gps_time/rtp_timesnap pair wanders ~0.45 s and occasionally tears)
-        # into a re-correlate storm.  We defer to radiod's RTP; a genuine
-        # radiod restart re-correlates via on_stream_restored.
+        # ── Slide-follow re-label (psk/meteor fix, ported) ──
+        # The minute's *label* (minute_wallclock) is re-derived every tick from
+        # radiod's CURRENT RTP→UTC mapping of minute_rtp, NOT frozen at the
+        # anchor.  radiod's RTP↔UTC mapping slides slowly (it always has); a
+        # SlotClock-style "anchor once" projection (anchor + N*60s) freezes that
+        # mapping, so over hours the WAV label drifts off the true UTC minute and
+        # wsprd/jt9 reject the cycle (the operator's 0-decode failure).  We pin
+        # each minute's label to radiod's live mapping while the RTP window
+        # (minute_rtp) stays sample-accurate — WSPR's decode window has enough
+        # slack to keep the decoders aligned to an accurate label.
+        #
+        # This is a PURE per-minute re-label off the current mapping: no
+        # comparison against the frozen grid, no divergence threshold, no
+        # re-correlate, no anchor reset, no flush.  (The per-boundary
+        # abs-divergence / offset-step re-correlate detectors were removed for
+        # good reason — they stormed on status-feed jitter; we are NOT
+        # reintroducing them.)  A genuine radiod restart still recovers via
+        # on_stream_restored.
+        frozen_wallclock = self._first_wallclock + timedelta(seconds=60 * self._minute_count)
+        minute_wallclock = frozen_wallclock
+        ci = getattr(self.sync_strategy, "channel_info", None)
+        if ci is not None:
+            cur = rtp_to_utc(
+                minute_rtp, ci,
+                # Use the frozen projection's instant as the wrap-disambiguation
+                # hint so the 32-bit RTP epoch resolves stably across the slide.
+                wallclock_hint_sec=frozen_wallclock.timestamp(),
+            )
+            if cur is not None:
+                # Add the §18 authority offset the same way sync_strategy did
+                # (rtp_to_utc returns radiod's GPS-referenced UTC; the hf-timestd
+                # offset, if usable, is added on top — mirrors acquire_anchor_utc).
+                reader = getattr(self.sync_strategy, "authority_reader", None)
+                if reader is not None:
+                    try:
+                        snap = reader.read()
+                    except Exception as e:  # noqa: BLE001 — labeling must not crash
+                        logger.debug("%s: authority read at re-label raised: %s",
+                                     self.band_name, e)
+                        snap = None
+                    if snap is not None and getattr(snap, "offset_usable", False):
+                        cur += snap.offset_seconds
+                minute_wallclock = datetime.fromtimestamp(cur, tz=timezone.utc)
 
         # ── GPSDO / RTP-ruler integrity alarm (tier-sourced) ──
         # Replaces the wall-clock skew detector.  The RTP counter is the
