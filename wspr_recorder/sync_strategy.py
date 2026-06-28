@@ -17,13 +17,33 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Protocol, TYPE_CHECKING
 
+from ka9q import SlotClock, rtp_to_utc
+from hamsci_dsp.timing import acquire_anchor_utc
+
 logger = logging.getLogger(__name__)
+
+# The minute boundary IS a 60-second epoch-aligned cadence.  We drive it
+# with a shared ka9q.SlotClock so an upstream timing fix (RTP unwrap/wrap
+# arithmetic, anchor handling) lands once across the fleet instead of in
+# wspr's hand-rolled copy.  Each higher decode period (W2/F2=120s, F5=300s,
+# F15=900s, F30=1800s) is an integer multiple of 60 s, so BandRecorder's
+# ``modes_completing_at_minute(abs_minute)`` % check layered on top of this
+# 60 s grid is mathematically identical to one SlotClock per cadence
+# anchored to the same reference:  ``abs_minute % (period//60) == 0`` ⟺
+# ``epoch_seconds % period == 0``, because every boundary this clock yields
+# is itself a multiple of 60 s from the UTC epoch.
+_MINUTE_CADENCE_SEC = 60.0
+# settle of 0 s: the strategy only PROJECTS the next boundary's RTP/UTC from
+# the clock (it does not harvest completed slots via SlotClock.advance), so
+# the settle window — which only affects advance() — is irrelevant here.
+# Kept explicit so the projection is independent of SlotClock's default.
+_MINUTE_SETTLE_SEC = 0.0
 
 
 class _AuthorityReaderProtocol(Protocol):
     """Structural interface of the authority reader that RtpSyncStrategy
     consumes. Defined as a Protocol so sync_strategy.py has no hard
-    dependency on authority_reader.py (and can be tested with a fake
+    dependency on the reader implementation (and can be tested with a fake
     reader)."""
     def read(self): ...  # returns object with offset_usable + rtp_to_utc_offset_ns
 
@@ -67,10 +87,10 @@ class SyncStrategy(ABC):
 
     def set_channel_info(self, channel_info) -> None:
         """Provide ka9q ChannelInfo (gps_time / rtp_timesnap) so an
-        RTP-based strategy can derive UTC from RTP via rtp_to_wallclock
+        RTP-based strategy can derive UTC from RTP via rtp_to_utc
         rather than the client wall clock. No-op for strategies that
         don't use it. Safe to call repeatedly — at provisioning and after
-        a radiod-stream restore (the counter/snapshot change)."""
+        a radiod-stream-restore (the counter/snapshot change)."""
 
     def reset(self) -> None:
         """Reset to fresh-startup state — forget any cached RTP↔UTC
@@ -96,6 +116,13 @@ class RtpSyncStrategy(SyncStrategy):
     which RTP timestamp value corresponds to the next UTC minute boundary.
     After that, all boundaries are derived purely from the GPSDO-clocked
     RTP counter.
+
+    The RTP↔UTC grid arithmetic is provided by the shared
+    ``ka9q.SlotClock`` (cadence 60 s) anchored once via
+    ``hamsci_dsp.timing.acquire_anchor_utc`` — the same primitives every
+    sigmond slot/period recorder uses.  This replaces wspr's former
+    hand-rolled unwrap + offset + correlation ladder, so an upstream
+    timing fix lands once across the fleet.
 
     Correlation source. If an `authority_reader` is attached AND
     /run/hf-timestd/authority.json is available, fresh, and carries a
@@ -127,22 +154,44 @@ class RtpSyncStrategy(SyncStrategy):
         # ka9q ChannelInfo for RTP→UTC derivation. May be supplied at
         # construction (TimingService.create_sync_strategy passes it) or
         # set later via set_channel_info at provisioning / stream-restore.
-        # When present, correlation uses rtp_to_wallclock instead of the
-        # client wall clock — see _acquire_reference_utc.
+        # When present, correlation uses rtp_to_utc (radiod's GPS/RTP
+        # timebase) instead of the client wall clock — see _correlate.
         self._channel_info = channel_info
+        # Shared epoch-aligned 60 s grid.  Holds the RTP↔offset↔UTC
+        # arithmetic (32-bit unwrap, wrap handling) so wspr no longer
+        # carries its own copy.  Anchored once at correlation.
+        self._clock = SlotClock(
+            cadence_sec=_MINUTE_CADENCE_SEC,
+            sample_rate=sample_rate,
+            settle_sec=_MINUTE_SETTLE_SEC,
+        )
         # Correlation state
         self._correlated = False
-        self._correlation_source: Optional[str] = None  # "rtp_to_wallclock[+authority]" | "authority" | "wall_clock"
+        self._correlation_source: Optional[str] = None  # see correlation_source
         self._correlation_offset_ns: Optional[int] = None
-        self._next_boundary: Optional[int] = None  # unwrapped RTP ts of next boundary
+        # Unwrapped sample offset (from the clock's anchor) of the next
+        # minute boundary, and its UTC datetime.  Both projected from the
+        # SlotClock at correlation, then propagated minute-by-minute.
+        self._next_boundary_off: Optional[int] = None
         self._next_minute: Optional[datetime] = None  # UTC wall clock of next boundary
-        # 32-bit unwrap tracking
+        # Back-compat mirror of the unwrap state the hand-rolled
+        # implementation exposed (a few reset() tests read these directly).
+        # The shared SlotClock owns the authoritative unwrap; these just
+        # reflect the latest raw RTP seen and its unwrapped offset so the
+        # observable values (and their post-reset reset to None/0) are
+        # unchanged.
         self._last_raw: Optional[int] = None
         self._unwrapped: int = 0
+        # Raw RTP timestamp the clock was anchored at (the first packet's
+        # value).  The hand-rolled code carried ``_next_boundary`` as an
+        # absolute unwrapped value seeded from this; the back-compat
+        # ``_next_boundary`` property reconstructs that by adding the
+        # anchor-relative offset to this raw base.
+        self._anchor_raw_rtp: Optional[int] = None
 
     def set_channel_info(self, channel_info) -> None:
         """Store ka9q ChannelInfo so the one-time correlation can derive
-        UTC from RTP (rtp_to_wallclock) rather than the client wall clock.
+        UTC from RTP (rtp_to_utc) rather than the client wall clock.
         Called at provisioning and after a radiod-stream restore (the RTP
         counter / snapshot change)."""
         self._channel_info = channel_info
@@ -161,36 +210,51 @@ class RtpSyncStrategy(SyncStrategy):
         keeps them disabled there."""
         return self._channel_info
 
-    def _unwrap(self, ts: int) -> int:
-        """Convert 32-bit wrapping RTP timestamp to monotonic 64-bit value."""
-        if self._last_raw is not None:
-            delta = (ts - self._last_raw) & 0xFFFFFFFF
-            if delta > 0x80000000:  # backward jump
-                delta -= 0x100000000
-            self._unwrapped += delta
-        else:
-            self._unwrapped = ts
-        self._last_raw = ts
-        return self._unwrapped
-
     def _correlate(self, rtp_timestamp: int, wall_clock: datetime) -> None:
-        """One-time correlation: find the RTP timestamp of the next minute
-        boundary.  Prefers RTP-derived UTC (rtp_to_wallclock + authority
-        offset) when channel_info is available, then the authority offset
-        on the wall clock, then the bare wall clock."""
-        unwrapped = self._unwrapped  # already set by caller
+        """One-time correlation: anchor the shared 60 s SlotClock and find
+        the RTP timestamp of the next minute boundary.
 
-        reference_utc, source, offset_ns = self._acquire_reference_utc(
-            rtp_timestamp, wall_clock,
+        The anchor UTC comes from ``acquire_anchor_utc`` (shared), which
+        prefers RTP-derived UTC (rtp_to_utc + authority offset) when
+        channel_info is available, then the authority offset on the wall
+        clock, then the bare wall clock.  ``now_fn`` is bound to this
+        packet's ``wall_clock`` so the wall-clock paths and the wrap-
+        disambiguation hint use the recorder's clock argument (preserving
+        the strategy's testable, caller-supplied time semantics) rather
+        than a free read of the host clock.
+        """
+        anchor = acquire_anchor_utc(
+            first_rtp=rtp_timestamp,
+            channel_info=self._channel_info,
+            rtp_to_utc=rtp_to_utc,
+            authority_reader=self.authority_reader,
+            samples_behind=0,
+            sample_rate=self.sample_rate,
+            now_fn=lambda: wall_clock.timestamp(),
         )
 
-        # Seconds until next minute boundary
+        # Map acquire_anchor_utc's source label onto wspr's historical
+        # vocabulary so existing consumers / logs are unchanged:
+        #   rtp_to_utc+authority    -> rtp_to_wallclock+authority
+        #   rtp_to_utc              -> rtp_to_wallclock
+        #   authority_on_wallclock  -> authority
+        #   wallclock_fallback      -> wall_clock
+        source = _ANCHOR_SOURCE_MAP.get(anchor.source, anchor.source)
+        offset_ns = anchor.offset_ns
+
+        # Anchor the shared grid at this RTP timestamp / UTC instant.  The
+        # SlotClock owns the unwrap + epoch-alignment arithmetic from here.
+        self._clock.anchor(rtp_timestamp, anchor.utc)
+        self._anchor_raw_rtp = rtp_timestamp
+
+        # Project the next minute boundary off the freshly anchored clock.
+        reference_utc = anchor.datetime
         seconds_past = reference_utc.second + reference_utc.microsecond / 1_000_000
         seconds_until = 60.0 - seconds_past if seconds_past > 0 else 0.0
 
-        # RTP timestamp at that boundary
+        anchor_off = self._clock.offset_of_rtp(rtp_timestamp)
         samples_until = round(seconds_until * self.sample_rate)
-        self._next_boundary = unwrapped + samples_until
+        self._next_boundary_off = anchor_off + samples_until
 
         next_minute = (reference_utc.replace(second=0, microsecond=0)
                        + timedelta(minutes=1 if seconds_past > 0 else 0))
@@ -203,88 +267,42 @@ class RtpSyncStrategy(SyncStrategy):
                 f"no hf-timestd authority — standalone fallback; "
                 f"RTP_TIMESNAP staleness is the operator's responsibility), "
                 f"rtp_ts={rtp_timestamp}, wall_clock={wall_clock.isoformat()}, "
-                f"next boundary at unwrapped={self._next_boundary} "
+                f"next boundary at offset={self._next_boundary_off} "
                 f"({next_minute.strftime('%H:%M:%S')}Z, {seconds_until:.3f}s away)"
             )
         else:
             logger.info(
                 f"RtpSync: correlated via {source} (offset={offset_ns} ns), "
-                f"next boundary at unwrapped={self._next_boundary} "
+                f"next boundary at offset={self._next_boundary_off} "
                 f"({next_minute.strftime('%H:%M:%S')}Z, {seconds_until:.3f}s away)"
             )
         self._correlated = True
 
-    def _acquire_reference_utc(
-        self,
-        rtp_timestamp: int,
-        wall_clock: datetime,
-    ) -> tuple:
-        """Return (utc, source, offset_ns) for the one-time correlation.
-
-        Priority (most→least accurate), matching codar/psk/msk144:
-          1. ``rtp_to_wallclock(rtp, channel_info) + authority_offset`` —
-             UTC derived from radiod's GPS/RTP timebase, off the client
-             system clock entirely (source ``rtp_to_wallclock[+authority]``).
-          2. ``wall_clock + authority_offset`` — legacy path when
-             channel_info is absent but an authority offset exists
-             (source ``authority``).
-          3. bare ``wall_clock`` — standalone fallback (source
-             ``wall_clock``).
-
-        The minute-correlation only needs ~30 s accuracy to land on the
-        right boundary, but deriving from RTP removes the residual
-        client-clock dependence of the wall-clock paths.
-        """
-        snap = None
-        if self.authority_reader is not None:
-            try:
-                snap = self.authority_reader.read()
-            except Exception as e:
-                logger.warning("Authority reader raised: %s", e)
-                snap = None
-        usable = snap is not None and snap.offset_usable
-        offset_ns = snap.rtp_to_utc_offset_ns if usable else None
-        offset_sec = (offset_ns / 1_000_000_000) if usable else 0.0
-
-        # Priority 1: RTP-derived UTC via ka9q rtp_to_wallclock.
-        if self._channel_info is not None:
-            try:
-                from ka9q import rtp_to_wallclock
-                import time as _time
-                utc_sec = rtp_to_wallclock(
-                    rtp_timestamp & 0xFFFFFFFF,
-                    self._channel_info,
-                    wallclock_hint_sec=_time.time() + offset_sec,
-                )
-                if utc_sec is not None:
-                    utc = datetime.fromtimestamp(
-                        utc_sec + offset_sec, tz=timezone.utc,
-                    )
-                    source = (
-                        "rtp_to_wallclock+authority" if usable
-                        else "rtp_to_wallclock"
-                    )
-                    return utc, source, offset_ns
-            except Exception as e:
-                logger.warning("rtp_to_wallclock raised at correlation: %s", e)
-
-        # Priority 2: authority offset on the client wall clock (legacy).
-        if usable:
-            utc = wall_clock + timedelta(seconds=offset_sec)
-            return utc, "authority", offset_ns
-
-        # Priority 3: bare wall clock (standalone fallback).
-        return wall_clock, "wall_clock", None
-
     @property
     def correlation_source(self) -> Optional[str]:
-        """'authority' | 'wall_clock' | None (not yet correlated)."""
+        """'rtp_to_wallclock[+authority]' | 'authority' | 'wall_clock' | None
+        (not yet correlated)."""
         return self._correlation_source
 
     @property
     def correlation_offset_ns(self) -> Optional[int]:
-        """Applied RTP→UTC offset in ns when source=='authority'; None otherwise."""
+        """Applied RTP→UTC offset in ns when an authority offset was used;
+        None otherwise."""
         return self._correlation_offset_ns
+
+    @property
+    def _next_boundary(self) -> Optional[int]:
+        """Absolute unwrapped RTP value of the next minute boundary, or None.
+
+        Back-compat surface: the hand-rolled implementation seeded
+        ``_next_boundary`` from the first packet's raw RTP and propagated it
+        by adding samples.  The ``test_reset_*`` cases compare it against the
+        post-restart ``new_rtp_base`` to confirm the boundary moved into the
+        new RTP space.  Reconstructed here as ``anchor_raw + offset`` so that
+        comparison still holds; ``None`` before correlation / after reset."""
+        if self._next_boundary_off is None or self._anchor_raw_rtp is None:
+            return None
+        return self._anchor_raw_rtp + self._next_boundary_off
 
     def should_start_minute(
         self,
@@ -292,20 +310,24 @@ class RtpSyncStrategy(SyncStrategy):
         packet_samples: int,
         wall_clock: datetime,
     ) -> Optional[SyncDecision]:
-        unwrapped = self._unwrap(rtp_timestamp)
-
         if not self._correlated:
             self._correlate(rtp_timestamp, wall_clock)
             # Check if this first packet already spans the boundary
             # (unlikely but possible if we start right at the boundary)
 
-        assert self._next_boundary is not None
+        assert self._next_boundary_off is not None
 
+        # Unwrapped offset of this packet's first sample, projected through
+        # the shared clock (handles 32-bit wrap relative to the high-water).
+        unwrapped = self._clock.offset_of_rtp(rtp_timestamp)
+        # Mirror the unwrap state for the back-compat introspection surface.
+        self._last_raw = rtp_timestamp & 0xFFFFFFFF
+        self._unwrapped = unwrapped
         packet_end = unwrapped + packet_samples
 
         # Does [unwrapped, packet_end) span the boundary?
-        if unwrapped <= self._next_boundary < packet_end:
-            sample_offset = self._next_boundary - unwrapped
+        if unwrapped <= self._next_boundary_off < packet_end:
+            sample_offset = self._next_boundary_off - unwrapped
             minute_utc = self._next_minute or wall_clock.replace(second=0, microsecond=0)
 
             return SyncDecision(
@@ -318,35 +340,36 @@ class RtpSyncStrategy(SyncStrategy):
 
     def on_minute_started(self, rtp_timestamp: int, wall_clock: datetime) -> None:
         """Advance the boundary target by one minute of samples."""
-        if self._next_boundary is not None:
-            self._next_boundary += self.samples_per_minute
+        if self._next_boundary_off is not None:
+            self._next_boundary_off += self.samples_per_minute
         if self._next_minute is not None:
             self._next_minute += timedelta(minutes=1)
             logger.debug(
-                f"RtpSync: next boundary at unwrapped={self._next_boundary} "
+                f"RtpSync: next boundary at offset={self._next_boundary_off} "
                 f"({self._next_minute.strftime('%H:%M')}Z +60s)"
             )
 
     def reset(self) -> None:
         """Forget the RTP↔UTC correlation so it re-runs on the next packet.
 
-        The 32-bit unwrap state (``_last_raw``, ``_unwrapped``) is also
-        cleared.  Critical: radiod reinitializes its RTP counter on
-        restart, so the new RTP space lives in a different absolute
-        range from before — letting the old _unwrapped value persist
-        would treat the new timestamps as a multi-million-sample
-        backward jump, poisoning ``_next_boundary`` math forever.
-        Discovered B4-100 2026-05-14 (commit message that introduced
-        the os._exit(75) workaround); re-rooted 2026-05-19 by inspecting
+        The shared SlotClock is reset too, dropping its anchor and unwrap
+        high-water.  Critical: radiod reinitializes its RTP counter on
+        restart, so the new RTP space lives in a different absolute range
+        from before — letting the old anchor/high-water persist would treat
+        the new timestamps as a multi-million-sample backward jump,
+        poisoning the boundary math forever.  Discovered B4-100 2026-05-14
+        (the os._exit(75) workaround); re-rooted 2026-05-19 by inspecting
         ``_correlated`` left True across BandRecorder.reset().
         """
         self._correlated = False
         self._correlation_source = None
         self._correlation_offset_ns = None
-        self._next_boundary = None
+        self._next_boundary_off = None
         self._next_minute = None
         self._last_raw = None
         self._unwrapped = 0
+        self._anchor_raw_rtp = None
+        self._clock.reset()
 
 
 # =============================================================================
@@ -433,3 +456,12 @@ class FallbackSyncStrategy(SyncStrategy):
             start_rtp_timestamp=rtp_timestamp,
             sample_offset=0,
         )
+
+
+# acquire_anchor_utc → wspr legacy source-label mapping (see _correlate).
+_ANCHOR_SOURCE_MAP = {
+    "rtp_to_utc+authority": "rtp_to_wallclock+authority",
+    "rtp_to_utc": "rtp_to_wallclock",
+    "authority_on_wallclock": "authority",
+    "wallclock_fallback": "wall_clock",
+}
