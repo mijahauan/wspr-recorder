@@ -506,3 +506,34 @@ class TestSlideFollow:
         assert w2 is not None
         assert rec._abs_div_faults == 0
         assert rec._synced is True
+
+    def test_decodes_when_radiod_offset_from_clean_minute(self, monkeypatch):
+        """Regression for the 2026-06-29 deploy failure: when radiod's RTP↔UTC
+        places the anchor a few seconds off a clean minute (it was ~2s behind),
+        slots must still align to clean even-minute UTC boundaries and decode.
+        The first cut used round()-to-nearest-minute, which put the window one
+        minute AHEAD of the recorded leading edge → every slot 'not resident',
+        zero decodes."""
+        import ka9q
+        rate = 1200
+        anchor_wc = datetime(2026, 4, 8, 0, 2, 0, tzinfo=timezone.utc)
+        frozen_ts = anchor_wc.timestamp()
+        OFFSET = -2.0  # radiod 2s behind UTC (the production condition)
+
+        def fake(rtp, ci, wallclock_hint_sec=None):
+            return frozen_ts + OFFSET + (int(rtp) & 0xFFFFFFFF) / rate
+        monkeypatch.setattr(ka9q, "rtp_to_wallclock", fake)
+
+        results = []
+        rec = BandRecorder(
+            ssrc=1, frequency_hz=14095600, band_name="20", sample_rate=rate,
+            decode_modes=[DecodeMode.W2],
+            on_period_complete=lambda r: results.append(r),
+            sync_strategy=_SyncWithCI(sample_rate=rate, minute_wallclock=anchor_wc),
+        )
+        feed_ramp(rec, 8, rate)
+        w2 = [r for r in results if DecodeMode.W2 in r.modes]
+        assert len(w2) >= 3, "radiod-offset anchor must still produce decodes"
+        for r in w2:  # every slot starts on a clean even-minute UTC boundary
+            assert int(round(r.start_wallclock.timestamp())) % 120 == 0
+        assert rec._abs_div_faults == 0

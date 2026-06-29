@@ -9,6 +9,7 @@ Per-band recording logic:
 """
 
 import logging
+import math
 import os
 import numpy as np
 from dataclasses import dataclass, field
@@ -314,6 +315,11 @@ class BandRecorder:
         self._minute_count: int = 0
         self._first_wallclock: Optional[datetime] = None
         self._first_rtp_timestamp: Optional[int] = None
+        # Slide-follow harvest cursor: per decode-period, the next clean UTC
+        # slot-start (a multiple of period_sec) we have NOT yet emitted.  Lazily
+        # seeded from the anchor on first sight; advanced as slots are
+        # harvested.  Cleared on reset() so a re-anchor re-seeds.
+        self._slot_next_utc: dict = {}
 
     def on_samples(self, samples: np.ndarray, quality) -> None:
         """Process samples from ka9q-python MultiStream callback.
@@ -657,106 +663,118 @@ class BandRecorder:
         # Close the minute in the ring buffer
         self._ring.close_minute(minute_wallclock, minute_rtp)
 
-        # Which decode periods complete at this minute.  abs_minute is the
-        # slide-tracked ABSOLUTE UTC minute (round → nearest clean minute), so
-        # a slide that crosses a minute edge moves the trigger parity with
-        # radiod — like psk's absolute cadence boundaries.
-        abs_minute = round(minute_wallclock.timestamp() / 60.0)
-        completing = modes_completing_at_minute(abs_minute, self._decode_modes)
-
-        if not completing:
-            return
-
-        # Group by period (W2+F2 share 120s → one WAV)
-        periods_to_emit = group_modes_by_period(completing)
+        # ── per-period slide-follow harvest (psk SlotWorker pattern) ──────
+        # Harvest every clean UTC period-boundary slot whose audio has fully
+        # arrived, extracting its window by OFFSET re-pinned to radiod's live
+        # mapping (anchor_utc_now).  The slot START is an absolute clean
+        # period-multiple UTC (even minute for W2, :00/:05 for F5, …) — NOT
+        # tied to the recorder's sample-count minute (which is offset from
+        # clean UTC whenever radiod's RTP↔UTC is a few seconds off).  This is
+        # the fix for the round()-to-nearest-minute aliasing that put windows
+        # ahead of the recorded leading edge.
         sr = self.sample_rate
+        leading_off = self._ring.absolute_sample_count
+        periods_to_emit = group_modes_by_period(self._decode_modes)
 
         for period_sec, modes in periods_to_emit.items():
-            num_minutes = period_sec // 60
-            n_samples = num_minutes * self._samples_per_minute
-            # The window ENDS at the absolute clean boundary (abs_minute) and
-            # spans back one period.  Its start offset (anchor-relative sample
-            # space) is re-pinned to radiod's LIVE mapping (anchor_utc_now), so
-            # the extracted audio aligns to true UTC, not the frozen sample
-            # grid.  When the mapping is stable, start_off == the old
-            # extract_slice window exactly.
-            boundary_utc = abs_minute * 60.0
-            start_off = round((boundary_utc - period_sec - anchor_utc_now) * sr)
-            start_wallclock = datetime.fromtimestamp(
-                boundary_utc - period_sec, tz=timezone.utc,
-            )
-            start_rtp = (self._first_rtp_timestamp + start_off) & 0xFFFFFFFF
-            end_rtp = (start_rtp + n_samples) & 0xFFFFFFFF
+            n_samples = period_sec * sr
+            nxt = self._slot_next_utc.get(period_sec)
+            if nxt is None:
+                # First clean slot-start at/after the anchor.
+                nxt = math.ceil(anchor_utc_now / period_sec) * period_sec
 
-            # F15 / F30 slice is HEAVY (43 MB / 86 MB float32).  Defer the copy
-            # until the worker thread has acquired the host-wide decode slot
-            # (host_slot.py).  The offset is LOCKED here, so the deferred
-            # extract pulls the same slide-pinned window; it returns None if
-            # the window has since been evicted, which the consumer skips.
-            if period_sec >= 900:
-                _ring = self._ring
-                _so, _ns, _wc, _rtp = start_off, n_samples, start_wallclock, start_rtp
-                def _extract(_ring=_ring, _s=_so, _n=_ns, _wc=_wc, _rtp=_rtp):
-                    res = _ring.extract_by_offset(_s, _n)
-                    if res is None:
-                        return None
-                    samples, gaps = res
-                    return samples, gaps, _wc, _rtp
-                request = DecodeRequest(
-                    frequency_hz=self.frequency_hz,
-                    band_name=self.band_name,
-                    modes=modes,
-                    period_seconds=period_sec,
-                    samples=None,                  # deferred
-                    gaps=[],                       # filled by extract
-                    start_wallclock=start_wallclock,
-                    start_rtp_timestamp=start_rtp,
-                    end_rtp_timestamp=end_rtp,
-                    rx_source=self.rx_source,
-                    extract=_extract,
-                )
-                self.stats.periods_emitted += 1
-                logger.info(
-                    f"{self.band_name}: Period {period_sec}s complete "
-                    f"({[m.value for m in modes]}), slice deferred until "
-                    f"host-wide decode slot acquired"
-                )
-            else:
-                res = self._ring.extract_by_offset(start_off, n_samples)
-                if res is None:
-                    slide = anchor_utc_now - self._first_wallclock.timestamp()
-                    logger.warning(
-                        f"{self.band_name}: {period_sec}s window not resident "
-                        f"at offset {start_off} (slide {slide:+.2f}s, "
-                        f"{self._ring.minutes_available} min in ring) — skipping"
-                    )
+            while True:
+                start_off = round((nxt - anchor_utc_now) * sr)
+                if start_off < 0:
+                    # Slot started before we anchored — can't recover it.
+                    nxt += period_sec
                     continue
-                samples, gaps = res
-                request = DecodeRequest(
-                    frequency_hz=self.frequency_hz,
-                    band_name=self.band_name,
-                    modes=modes,
-                    period_seconds=period_sec,
-                    samples=samples,
-                    gaps=gaps,
-                    start_wallclock=start_wallclock,
-                    start_rtp_timestamp=start_rtp,
-                    end_rtp_timestamp=end_rtp,
-                    rx_source=self.rx_source,
-                )
-                self.stats.samples_written += len(samples)
-                self.stats.periods_emitted += 1
-                logger.info(
-                    f"{self.band_name}: Period {period_sec}s complete "
-                    f"({[m.value for m in modes]}), {len(samples)} samples, "
-                    f"{len(gaps)} gaps"
-                )
+                if leading_off < start_off + n_samples:
+                    # Slot's audio hasn't fully arrived yet.
+                    break
 
-            if self.on_period_complete:
-                if self.executor:
-                    self.executor.submit(self.on_period_complete, request)
+                start_wallclock = datetime.fromtimestamp(nxt, tz=timezone.utc)
+                start_rtp = (self._first_rtp_timestamp + start_off) & 0xFFFFFFFF
+                end_rtp = (start_rtp + n_samples) & 0xFFFFFFFF
+
+                # F15 / F30 slice is HEAVY (43/86 MB float32) — defer the copy
+                # until the worker thread holds the host-wide decode slot
+                # (host_slot.py).  The offset is LOCKED here, so the deferred
+                # extract pulls the same slide-pinned window; it returns None
+                # (consumer skips) if the window has since been evicted.
+                if period_sec >= 900:
+                    _ring = self._ring
+                    _so, _ns, _wc, _rtp = start_off, n_samples, start_wallclock, start_rtp
+                    def _extract(_ring=_ring, _s=_so, _n=_ns, _wc=_wc, _rtp=_rtp):
+                        res = _ring.extract_by_offset(_s, _n)
+                        if res is None:
+                            return None
+                        samples, gaps = res
+                        return samples, gaps, _wc, _rtp
+                    request = DecodeRequest(
+                        frequency_hz=self.frequency_hz,
+                        band_name=self.band_name,
+                        modes=modes,
+                        period_seconds=period_sec,
+                        samples=None,
+                        gaps=[],
+                        start_wallclock=start_wallclock,
+                        start_rtp_timestamp=start_rtp,
+                        end_rtp_timestamp=end_rtp,
+                        rx_source=self.rx_source,
+                        extract=_extract,
+                    )
+                    self.stats.periods_emitted += 1
+                    logger.info(
+                        f"{self.band_name}: Period {period_sec}s complete "
+                        f"({[m.value for m in modes]}) at {start_wallclock}, "
+                        f"slice deferred until host-wide decode slot acquired"
+                    )
                 else:
-                    self.on_period_complete(request)
+                    res = self._ring.extract_by_offset(start_off, n_samples)
+                    if res is None:
+                        slide = anchor_utc_now - self._first_wallclock.timestamp()
+                        logger.warning(
+                            f"{self.band_name}: {period_sec}s slot at "
+                            f"{start_wallclock} not resident (offset {start_off}, "
+                            f"slide {slide:+.2f}s) — skipping"
+                        )
+                        nxt += period_sec
+                        continue
+                    samples, gaps = res
+                    request = DecodeRequest(
+                        frequency_hz=self.frequency_hz,
+                        band_name=self.band_name,
+                        modes=modes,
+                        period_seconds=period_sec,
+                        samples=samples,
+                        gaps=gaps,
+                        start_wallclock=start_wallclock,
+                        start_rtp_timestamp=start_rtp,
+                        end_rtp_timestamp=end_rtp,
+                        rx_source=self.rx_source,
+                    )
+                    self.stats.samples_written += len(samples)
+                    self.stats.periods_emitted += 1
+                    logger.info(
+                        f"{self.band_name}: Period {period_sec}s complete "
+                        f"({[m.value for m in modes]}) at {start_wallclock}, "
+                        f"{len(samples)} samples, {len(gaps)} gaps"
+                    )
+
+                self._dispatch_request(request)
+                nxt += period_sec
+
+            self._slot_next_utc[period_sec] = nxt
+        return
+
+    def _dispatch_request(self, request: 'DecodeRequest') -> None:
+        """Hand a finished slot to the decode pipeline (thread pool if set)."""
+        if self.on_period_complete:
+            if self.executor:
+                self.executor.submit(self.on_period_complete, request)
+            else:
+                self.on_period_complete(request)
 
     def flush(self) -> None:
         """Force flush any remaining samples (for shutdown)."""
@@ -819,6 +837,8 @@ class BandRecorder:
         self._minute_count = 0
         self._first_wallclock = None
         self._first_rtp_timestamp = None
+        # Re-seed the slide-follow harvest cursor against the fresh anchor.
+        self._slot_next_utc = {}
 
         # Clear the sync strategy's RTP↔UTC correlation cache so the
         # next packet's RTP timestamp re-correlates against the new
