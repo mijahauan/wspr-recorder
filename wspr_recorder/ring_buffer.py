@@ -86,6 +86,17 @@ class RingBuffer:
         return len(self._minute_marks)
 
     @property
+    def absolute_sample_count(self) -> int:
+        """Total samples written since the last sync/clear.
+
+        Offset 0 is the anchor (the first sample written after sync), so this
+        is the leading-edge absolute sample offset used by ``extract_by_offset``
+        — exactly the offset space ``ka9q.SlotClock.offset_of_rtp`` returns,
+        since RTP advances one per sample and gaps are zero-filled in place.
+        """
+        return self._absolute_sample_count
+
+    @property
     def capacity_minutes(self) -> int:
         return self._capacity_minutes
 
@@ -240,6 +251,64 @@ class RingBuffer:
             start_mark.wallclock,
             start_mark.rtp_timestamp,
         )
+
+    def extract_by_offset(
+        self, start_offset: int, n_samples: int,
+    ) -> Optional[Tuple[np.ndarray, List[GapEvent]]]:
+        """Extract ``n_samples`` starting at absolute sample ``start_offset``.
+
+        ``start_offset`` is measured from the anchor (offset 0 == the first
+        sample written after sync), the same space as ``absolute_sample_count``
+        and ``ka9q.SlotClock.offset_of_rtp``.  This is the slide-follow
+        extraction primitive (mirroring psk's ``Ring.extract_by_offset``): the
+        caller re-pins each decode window to radiod's *live* RTP→UTC mapping by
+        computing ``start_offset = round((boundary_utc - anchor_utc_now) * sr)``
+        each tick, so the audio tracks the slide instead of a frozen grid.
+
+        Returns ``(samples_copy, rebased_gaps)`` or ``None`` if the requested
+        window is not fully resident — either past the leading edge (not yet
+        written) or already evicted (older than the ring's oldest sample).
+        Returning ``None`` rather than raising lets the caller skip the slot
+        (like psk's ``slots_empty``) instead of crashing the ingest thread.
+        """
+        if n_samples <= 0:
+            return None
+        end_offset = start_offset + n_samples
+        oldest_resident = max(0, self._absolute_sample_count - self._capacity)
+        if start_offset < oldest_resident or end_offset > self._absolute_sample_count:
+            return None
+
+        ring_start = start_offset % self._capacity
+        if ring_start + n_samples <= self._capacity:
+            samples = self._samples[ring_start:ring_start + n_samples].copy()
+        else:
+            first_chunk = self._capacity - ring_start
+            part1 = self._samples[ring_start:self._capacity].copy()
+            part2 = self._samples[:n_samples - first_chunk].copy()
+            samples = np.concatenate([part1, part2])
+
+        # Collect gaps overlapping [start_offset, end_offset), rebased to the
+        # window start.  Gaps live on completed MinuteMarks plus the current
+        # (not-yet-closed) minute; each gap's absolute position is its minute's
+        # absolute_sample_index + its in-minute position.
+        gaps: List[GapEvent] = []
+        sources: List[Tuple[int, List[GapEvent]]] = [
+            (m.absolute_sample_index, m.gaps) for m in self._minute_marks
+        ]
+        cur_base = self._absolute_sample_count - self._current_minute_sample_count
+        sources.append((cur_base, self._current_minute_gaps))
+        for base, gap_list in sources:
+            for gap in gap_list:
+                abs_pos = base + gap.position_samples
+                if start_offset <= abs_pos < end_offset:
+                    gaps.append(GapEvent(
+                        position_samples=abs_pos - start_offset,
+                        duration_samples=gap.duration_samples,
+                        rtp_sequence_before=gap.rtp_sequence_before,
+                        rtp_sequence_after=gap.rtp_sequence_after,
+                        timestamp_utc=gap.timestamp_utc,
+                    ))
+        return samples, gaps
 
     def to_dict(self) -> dict:
         """Status summary for IPC/JSON."""

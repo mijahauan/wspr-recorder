@@ -422,3 +422,87 @@ class TestBandRecorderReset:
             "the RTP↔UTC correlation cache; otherwise in-place recovery from "
             "a radiod-restart-cascade misaligns WSPR cycles."
         )
+
+
+def feed_ramp(rec, n_minutes, sample_rate, packet_size=240, first_rtp=0):
+    """Feed n_minutes of a per-sample ramp (value == absolute sample index).
+
+    Because each sample's VALUE equals its absolute offset from the anchor, an
+    extracted window's start offset is directly readable as ``samples[0]`` —
+    which is how the slide-follow tests verify the window tracked the slide.
+    """
+    spm = sample_rate * 60
+    total = 0
+    for _ in range(n_minutes):
+        fed = 0
+        while fed < spm:
+            chunk = min(packet_size, spm - fed)
+            ramp = np.arange(total, total + chunk, dtype=np.float32)
+            total += chunk
+            q = MockQuality(
+                first_rtp_timestamp=first_rtp,
+                total_samples_delivered=total,
+            )
+            rec.on_samples(ramp, q)
+            fed += chunk
+    return total
+
+
+class _SyncWithCI(FakeSync):
+    """FakeSync that also exposes channel_info + authority_reader, so
+    BandRecorder._anchor_utc_now() takes the radiod-mapping (slide-follow)
+    path instead of the frozen-anchor fallback."""
+    channel_info = object()
+    authority_reader = None
+
+
+class TestSlideFollow:
+    """Regression: the decode window must FOLLOW radiod's RTP↔UTC slide
+    (re-pin the extraction offset each minute) instead of freezing on the
+    sample-count grid — and do so WITHOUT the threshold reset/re-correlate
+    storm.  The frozen-grid code (pre-slide-follow) would have extracted the
+    same sample offset regardless of the slide, misaligning the audio off the
+    WSPR tx grid (the 0-decode failure)."""
+
+    def _last_w2(self, slide_sec, monkeypatch, n_minutes=6):
+        import ka9q
+        rate = 1200
+        anchor_wc = datetime(2026, 4, 8, 0, 2, 0, tzinfo=timezone.utc)
+        frozen_ts = anchor_wc.timestamp()
+
+        # radiod's mapping: linear in RTP, shifted by a constant slide.  The
+        # anchor (rtp 0) reads as frozen_ts + slide; rtp advances 1/rate s.
+        def fake_rtp_to_wallclock(rtp, ci, wallclock_hint_sec=None):
+            return frozen_ts + slide_sec + (int(rtp) & 0xFFFFFFFF) / rate
+        monkeypatch.setattr(ka9q, "rtp_to_wallclock", fake_rtp_to_wallclock)
+
+        results = []
+        rec = BandRecorder(
+            ssrc=1, frequency_hz=14095600, band_name="20",
+            sample_rate=rate, decode_modes=[DecodeMode.W2],
+            on_period_complete=lambda r: results.append(r),
+            sync_strategy=_SyncWithCI(sample_rate=rate, minute_wallclock=anchor_wc),
+        )
+        feed_ramp(rec, n_minutes, rate)
+        w2 = [r for r in results if DecodeMode.W2 in r.modes]
+        return rec, (w2[-1] if w2 else None), rate
+
+    def test_window_shifts_by_slide(self, monkeypatch):
+        """A +S s slide moves the extracted W2 window S*rate samples EARLIER
+        than the no-slide window (the audio re-pins to true UTC)."""
+        _, w2_0, rate = self._last_w2(0.0, monkeypatch)
+        _, w2_5, _ = self._last_w2(5.0, monkeypatch)
+        assert w2_0 is not None and w2_5 is not None
+        # samples[0] == the window's absolute start offset (ramp value).
+        assert float(w2_5.samples[0]) == float(w2_0.samples[0]) - 5.0 * rate
+        # The label stays the clean UTC boundary (slide absorbed into offset).
+        assert w2_0.start_wallclock == w2_5.start_wallclock
+
+    def test_slide_does_not_trigger_reset_storm(self, monkeypatch):
+        """A sustained multi-second slide must NOT fire the abs-divergence
+        fault / reset (it is inert because the label is slide-followed) — the
+        recorder keeps decoding smoothly instead of re-correlating each cycle."""
+        rec, w2, _ = self._last_w2(5.0, monkeypatch, n_minutes=8)
+        assert w2 is not None
+        assert rec._abs_div_faults == 0
+        assert rec._synced is True

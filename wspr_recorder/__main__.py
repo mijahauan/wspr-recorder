@@ -368,7 +368,19 @@ class WsprRecorder:
                 # only ONE process per slot holds the 86 MB float32
                 # copy at a time across the host.
                 if request.samples is None and request.extract is not None:
-                    samples, gaps, start_wc, start_rtp = request.extract()
+                    extracted = request.extract()
+                    if extracted is None:
+                        # Slide-follow window is no longer resident in the ring
+                        # (evicted while waiting for the host-wide decode slot).
+                        # Skip this cycle rather than decode stale/garbage audio.
+                        request.extract = None
+                        logger.warning(
+                            "%s: deferred %ds slice no longer resident — "
+                            "skipping cycle", request.band_name,
+                            request.period_seconds,
+                        )
+                        return
+                    samples, gaps, start_wc, start_rtp = extracted
                     request.samples = samples
                     request.gaps = gaps
                     request.start_wallclock = start_wc

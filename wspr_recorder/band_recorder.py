@@ -429,6 +429,49 @@ class BandRecorder:
                     self.reset()
                     return
 
+    def _anchor_utc_now(self) -> Optional[float]:
+        """Live UTC of the FIXED anchor sample (``_first_rtp_timestamp``) per
+        radiod's CURRENT RTP→UTC mapping + the §18 authority offset — the
+        slide-follow hook (mirrors psk ``ChannelSink._anchor_utc_now``).
+
+        The anchor RTP never moves (so ring offsets stay valid), but radiod's
+        RTP↔UTC mapping slides; re-reading the anchor's UTC each minute and
+        re-pinning the decode window's offset to it makes the audio track the
+        slide smoothly — no frozen-grid drift, no reset/re-correlate storm.
+        Falls back to the frozen anchor wallclock when there is no
+        ``channel_info`` / ``rtp_to_wallclock`` returns None, so standalone and
+        pre-correlation behave exactly as before.
+        """
+        if self._first_rtp_timestamp is None or self._first_wallclock is None:
+            return None
+        frozen = self._first_wallclock.timestamp()
+        ci = getattr(self.sync_strategy, "channel_info", None)
+        if ci is None:
+            return frozen
+        try:
+            from ka9q import rtp_to_wallclock
+            cur = rtp_to_wallclock(
+                self._first_rtp_timestamp & 0xFFFFFFFF, ci,
+                wallclock_hint_sec=frozen,
+            )
+        except Exception as e:  # noqa: BLE001 — slide-follow must not crash
+            logger.debug("%s: anchor rtp_to_wallclock raised: %s",
+                         self.band_name, e)
+            return frozen
+        if cur is None:
+            return frozen
+        # §18 authority offset (mirror sync_strategy._acquire_reference_utc).
+        reader = getattr(self.sync_strategy, "authority_reader", None)
+        if reader is not None:
+            try:
+                snap = reader.read()
+                if snap is not None and getattr(snap, "offset_usable", False):
+                    cur += snap.rtp_to_utc_offset_ns / 1_000_000_000
+            except Exception as e:  # noqa: BLE001
+                logger.debug("%s: authority read at anchor raised: %s",
+                             self.band_name, e)
+        return cur
+
     def _on_minute_boundary(self) -> None:
         """Called when samples_per_minute samples have been written."""
         self._minute_count += 1
@@ -439,7 +482,22 @@ class BandRecorder:
         # grid is GPSDO-disciplined: minute N is anchor + N*60s, full stop.
         # No wall-clock-now() comparison — METROLOGY.md §4.5 RTP-reference
         # invariant: timing is hf-timestd's job, not the client's.
-        minute_wallclock = self._first_wallclock + timedelta(seconds=60 * self._minute_count)
+        # ── slide-follow (psk pattern) ──────────────────────────────────
+        # minute_rtp (the audio grid) stays sample-accurate; the LABEL and the
+        # decode-window offset (below) are re-pinned to radiod's CURRENT
+        # RTP↔UTC mapping every minute via _anchor_utc_now().  When radiod's
+        # mapping is stable this is identical to the old frozen grid; when it
+        # slides, the window tracks it smoothly instead of drifting off the
+        # WSPR tx grid (the 0-decode failure) and instead of the coarse
+        # threshold reset/re-correlate.  The abs-divergence backstop below now
+        # compares this slide-followed label to radiod's reference, so it is
+        # inert on normal slides and only fires on a genuinely broken anchor.
+        anchor_utc_now = self._anchor_utc_now()
+        if anchor_utc_now is None:
+            anchor_utc_now = self._first_wallclock.timestamp()
+        minute_wallclock = datetime.fromtimestamp(
+            anchor_utc_now + 60 * self._minute_count, tz=timezone.utc,
+        )
         minute_rtp = (
             (self._first_rtp_timestamp + self._minute_count * self._samples_per_minute) & 0xFFFFFFFF
         )
@@ -599,8 +657,11 @@ class BandRecorder:
         # Close the minute in the ring buffer
         self._ring.close_minute(minute_wallclock, minute_rtp)
 
-        # Check which decode periods complete at this minute
-        abs_minute = int(minute_wallclock.timestamp()) // 60
+        # Which decode periods complete at this minute.  abs_minute is the
+        # slide-tracked ABSOLUTE UTC minute (round → nearest clean minute), so
+        # a slide that crosses a minute edge moves the trigger parity with
+        # radiod — like psk's absolute cadence boundaries.
+        abs_minute = round(minute_wallclock.timestamp() / 60.0)
         completing = modes_completing_at_minute(abs_minute, self._decode_modes)
 
         if not completing:
@@ -608,28 +669,39 @@ class BandRecorder:
 
         # Group by period (W2+F2 share 120s → one WAV)
         periods_to_emit = group_modes_by_period(completing)
+        sr = self.sample_rate
 
         for period_sec, modes in periods_to_emit.items():
             num_minutes = period_sec // 60
-            if self._ring.minutes_available < num_minutes:
-                logger.debug(
-                    f"{self.band_name}: {modes[0].value} needs {num_minutes} min "
-                    f"but only {self._ring.minutes_available} available, skipping"
-                )
-                continue
+            n_samples = num_minutes * self._samples_per_minute
+            # The window ENDS at the absolute clean boundary (abs_minute) and
+            # spans back one period.  Its start offset (anchor-relative sample
+            # space) is re-pinned to radiod's LIVE mapping (anchor_utc_now), so
+            # the extracted audio aligns to true UTC, not the frozen sample
+            # grid.  When the mapping is stable, start_off == the old
+            # extract_slice window exactly.
+            boundary_utc = abs_minute * 60.0
+            start_off = round((boundary_utc - period_sec - anchor_utc_now) * sr)
+            start_wallclock = datetime.fromtimestamp(
+                boundary_utc - period_sec, tz=timezone.utc,
+            )
+            start_rtp = (self._first_rtp_timestamp + start_off) & 0xFFFFFFFF
+            end_rtp = (start_rtp + n_samples) & 0xFFFFFFFF
 
-            # F15 / F30 slice is HEAVY (43 MB / 86 MB float32).  Defer
-            # the actual extract_slice copy until the worker thread has
-            # acquired the host-wide decode slot — see host_slot.py.
-            # This keeps multi-receiver fleets from holding N × 86 MB
-            # of slices in the executor queue waiting for the slot.
-            # W2/F2/F5 stay eager: their slices are small (≤14 MB) and
-            # extract_slice in the callback thread is the simplest path.
+            # F15 / F30 slice is HEAVY (43 MB / 86 MB float32).  Defer the copy
+            # until the worker thread has acquired the host-wide decode slot
+            # (host_slot.py).  The offset is LOCKED here, so the deferred
+            # extract pulls the same slide-pinned window; it returns None if
+            # the window has since been evicted, which the consumer skips.
             if period_sec >= 900:
-                _ring_ref = self._ring
-                _num_min = num_minutes
-                def _extract(_ring=_ring_ref, _n=_num_min):
-                    return _ring.extract_slice(_n)
+                _ring = self._ring
+                _so, _ns, _wc, _rtp = start_off, n_samples, start_wallclock, start_rtp
+                def _extract(_ring=_ring, _s=_so, _n=_ns, _wc=_wc, _rtp=_rtp):
+                    res = _ring.extract_by_offset(_s, _n)
+                    if res is None:
+                        return None
+                    samples, gaps = res
+                    return samples, gaps, _wc, _rtp
                 request = DecodeRequest(
                     frequency_hz=self.frequency_hz,
                     band_name=self.band_name,
@@ -637,9 +709,9 @@ class BandRecorder:
                     period_seconds=period_sec,
                     samples=None,                  # deferred
                     gaps=[],                       # filled by extract
-                    start_wallclock=None,          # filled by extract
-                    start_rtp_timestamp=0,         # filled by extract
-                    end_rtp_timestamp=0,           # filled by extract
+                    start_wallclock=start_wallclock,
+                    start_rtp_timestamp=start_rtp,
+                    end_rtp_timestamp=end_rtp,
                     rx_source=self.rx_source,
                     extract=_extract,
                 )
@@ -650,8 +722,16 @@ class BandRecorder:
                     f"host-wide decode slot acquired"
                 )
             else:
-                samples, gaps, start_wc, start_rtp = self._ring.extract_slice(num_minutes)
-                end_rtp = (start_rtp + len(samples)) & 0xFFFFFFFF
+                res = self._ring.extract_by_offset(start_off, n_samples)
+                if res is None:
+                    slide = anchor_utc_now - self._first_wallclock.timestamp()
+                    logger.warning(
+                        f"{self.band_name}: {period_sec}s window not resident "
+                        f"at offset {start_off} (slide {slide:+.2f}s, "
+                        f"{self._ring.minutes_available} min in ring) — skipping"
+                    )
+                    continue
+                samples, gaps = res
                 request = DecodeRequest(
                     frequency_hz=self.frequency_hz,
                     band_name=self.band_name,
@@ -659,7 +739,7 @@ class BandRecorder:
                     period_seconds=period_sec,
                     samples=samples,
                     gaps=gaps,
-                    start_wallclock=start_wc,
+                    start_wallclock=start_wallclock,
                     start_rtp_timestamp=start_rtp,
                     end_rtp_timestamp=end_rtp,
                     rx_source=self.rx_source,
