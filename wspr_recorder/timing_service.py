@@ -446,7 +446,7 @@ class TimingService:
         # sub-fields. (Historically wspr annotated from the fusion HTTP API,
         # which predated authority.json and ignored tier/sigma adjudication;
         # this is the S1 conformance fix.)
-        from hamsci_dsp.timing import (
+        from .authority_reader import (
             AuthorityReader, standalone_timing_authority,
         )
         try:
@@ -705,7 +705,7 @@ class TimingService:
         Each BandRecorder should get its own instance (RtpSyncStrategy
         tracks per-stream RTP timestamp state).
         """
-        from hamsci_dsp.timing import AuthorityReader
+        from .authority_reader import AuthorityReader
         from .sync_strategy import (
             RtpSyncStrategy, ClockSyncStrategy, FallbackSyncStrategy,
         )
