@@ -135,3 +135,57 @@ description  = "WSPR/FST4W sub-band channels"
 per_instance = true
 parser_file  = "wspr_recorder/sigmond_tui.py"
 parser_attr  = "parse_receiver_channels"
+
+# ---------------------------------------------------------------------------
+# Single-host uploader pipelines (Stage 6).  `smd admin uploader manifest`
+# reads these [[hs_uploader.pipeline]] blocks from every enabled client,
+# substitutes per-site identity ({placeholders} resolved from
+# coordination.toml + the wspr reporter id + the host key path), and renders
+# /etc/hs-uploader/pipelines.toml for the single-host daemon.  The block shape
+# IS the [[pipeline]] shape hs_uploader.pipeline_factory consumes.
+# ftp_password is intentionally omitted — the in-code default is identical, so
+# the secret never lands in a repo file.
+# ---------------------------------------------------------------------------
+
+# WSPR: cycle-aligned spots+noise tar -> wsprdaemon.org
+[[hs_uploader.pipeline]]
+name = "wspr-wsprdaemon"
+batch_limit = 10000
+[hs_uploader.pipeline.source]
+type = "wspr_cycle"
+db_path = "{sink_path}"
+start_at = "now"
+include_psk = true
+[hs_uploader.pipeline.transport]
+type = "wsprdaemon_tar"
+servers = ["gw1.wsprdaemon.org", "gw2.wsprdaemon.org"]
+version = "4.0"
+receiver = "{call_pathsafe}"
+compression = "bz2"
+tar_root = "wsprdaemon"
+primary_table_name = "wspr.cycle"
+[hs_uploader.pipeline.transport.ftp_fallback]
+servers = ["gw2.wsprdaemon.org"]
+ftp_user = "noisegraphs"
+remote_path = "upload"
+[hs_uploader.pipeline.retry]
+base = 2.0
+cap_sec = 900.0
+
+# WSPR: individual spot rows -> wsprnet.org (HTTP MEPT)
+[[hs_uploader.pipeline]]
+name = "wspr-wsprnet"
+batch_limit = 900
+[hs_uploader.pipeline.source]
+type = "sqlite"
+database = "wspr"
+table = "spots"
+accepted_schema_versions = [1, 2]
+start_at = "now"
+delete_on_commit = false
+dedup_partition_by = ["time", "callsign", "band"]
+dedup_order_by_desc = "snr_db"
+[hs_uploader.pipeline.transport]
+type = "wsprnet"
+api_base_url = "https://wsprnet.org/api/upload/v1"
+version = "4.0"
