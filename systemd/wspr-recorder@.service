@@ -81,11 +81,22 @@ StandardError=inherit
 SyslogIdentifier=wspr-recorder@%I
 
 Nice=5
-MemoryMax=1G
+# MemoryMax sizing: the cgroup charges the float32 rings (a 17-band
+# config with two F30 bands holds ~394 MB of ring alone), the
+# simultaneous slice copies when all cadences fire at :00/:30
+# (~450 MB transient), the wsprd/jt9 child decoders, AND the tmpfs
+# WAV pages under /dev/shm/wspr-recorder. 1G OOM-killed such a config
+# ~30x/day exactly on the F15/F30 ticks (sigma, 2026-06). 2G covers
+# the worst-case tick with headroom while still backstopping a leak.
+MemoryMax=2G
 MemorySwapMax=0
 
 NoNewPrivileges=true
-PrivateTmp=false
+# PrivateTmp: the in-process uploader (WSPR_USE_HS_UPLOADER=1) stages
+# wsprdaemon .tbz files via tempfile.NamedTemporaryFile, and
+# ProtectSystem=strict makes host /tmp read-only — give the unit a
+# private one (matches hs-uploader.service / wspr-uploader.service).
+PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 # /var/lib/sigmond: the SQLite sink wspr.spots/noise are written to.
